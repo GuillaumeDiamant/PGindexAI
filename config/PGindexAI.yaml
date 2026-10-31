@@ -1,0 +1,81 @@
+# Configuration du daemon PGindexAI
+# Emplacement par défaut : ~/.config/PGindexAI/PGindexAI.yaml
+# Droits recommandés : 0600 (le fichier peut contenir un mot de passe)
+
+postgresql:
+  host: "/var/run/postgresql"  # Socket Unix local — ou "127.0.0.1" / nom d'hôte pour du TCP
+  port: 5432
+  user: "pgindexai"             # Rôle dédié non superutilisateur (voir install.sh)
+  database: "pgindexai_demo"
+  password: ""                 # Requis si pg_hba.conf exige scram-sha-256 / md5
+  ssl_mode: "disable"          # disable | require | verify-ca | verify-full
+                               # (TLS inapplicable sur socket Unix → disable)
+  # ssl_root_cert: ""          # Chemin PEM d'une CA auto-signée (snakeoil, interne)
+                               # pour verify-ca / verify-full. Sans cette clé,
+                               # seules les racines web PKI (Mozilla) sont acceptées.
+
+laya:
+  url: "http://127.0.0.1:8080"
+  timeout_seconds: 30
+
+# Contrôle des actions DDL — mettre false pour désactiver une action
+actions:
+  create_index: true
+  drop_unused: true
+  rebuild_fragmented: true
+
+# Seuils de décision
+thresholds:
+  cycle_seconds: 60        # Fréquence du cycle d'analyse (1..=86400)
+  unused_minutes: 10080    # Fenêtre d'observation (défaut 7 jours) avant DROP
+                           # d'un index inutilisé — les compteurs sont remis à
+                           # zéro au redémarrage de PG : ne pas descendre trop bas.
+  fragmentation_pct: 70    # % de fragmentation déclenchant un REINDEX CONCURRENTLY (1..=100)
+  min_sargable_rows: 100   # Min. d'exécutions (pg_stat_statements.calls) pour qu'une
+                           # requête soit candidate à un index SARGable (>= 1)
+  min_confidence: 0.7      # Confiance minimale de Laya pour appliquer (0.0..=1.0)
+  max_proposals_per_cycle: 20  # Budget de propositions par cycle (1..=1000)
+
+# Périmètre d'analyse (multi-schéma)
+analysis:
+  # Liste des schémas à analyser.
+  # - liste vide = tous les schémas non-système (défaut)
+  # - exemple : ["public", "billing"]
+  schemas: []
+
+# Pool de connexions PostgreSQL
+pg_pool:
+  max_size: 16                # Taille maximale du pool (1..=512)
+  wait_timeout_ms: 30000      # Timeout d'attente d'une connexion (100..=600000)
+
+# Densité cible par type de colonne (tuples/page visés, estimation de taille d'index)
+density_by_type:
+  int4: 200        # integer
+  int8: 200        # bigint
+  float8: 150      # double precision, numeric, real
+  varchar: 30      # character varying
+  text: 20         # text
+  date: 150        # date
+  timestamptz: 150 # timestamp (with/without time zone)
+  uuid: 100        # uuid
+  bool: 300        # boolean
+  default_density: 50  # tout autre type
+
+# Logging
+logging:
+  level: "info"
+  format: "json"   # json | text
+
+# Historisation des opérations d'index (fichier 0640, rotation incluse)
+index_logging:
+  enabled: true
+  # Niveaux de verbosité :
+  #   minimal  → timestamp, type CRUD, durée, schéma, nom objet
+  #   standard → + DDL de l'index modifié
+  #   verbose  → + raison détaillée
+  verbosity: "minimal"
+  # Fichier de log (si vide → stdout uniquement)
+  log_file: "/var/log/pgindexai/index_operations.log"
+  # Rotation (en octets, 0 = désactivé)
+  max_file_size_bytes: 10485760  # 10 MB
+  max_files: 5
