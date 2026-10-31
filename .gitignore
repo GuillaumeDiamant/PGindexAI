@@ -1,0 +1,14 @@
+# Build artifacts
+target/
+# (Cargo.lock EST commité : crate binaire — reproductibilité des dépendances)
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
