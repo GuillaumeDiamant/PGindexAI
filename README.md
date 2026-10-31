@@ -503,8 +503,6 @@ pgindexai/
 │   └── laya/
 │       ├── mod.rs          # Client HTTP Laya (deep_health + décision)
 │       └── types.rs        # Types du protocole Laya
-├── jit_indexer.py          # POC SQL Server (historique, hors daemon)
-├── requirements.txt        # Dépendances du POC Python
 ├── LICENSE                 # Licence MIT
 └── README.md
 ```
