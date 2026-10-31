@@ -17,7 +17,8 @@
 > 11. **TLS vérifié** (rustls) sur la connexion PostgreSQL + **rôle PG dédié
 >     non-superutilisateur** (`pgindexai`)
 > 12. Installateur **durci** (`install.sh` : sans `eval`, pg_hba ciblée, config
->     0600, merge `shared_preload_libraries`) + mode `--dry-run`
+>     0600, merge `shared_preload_libraries`) + mode `--dry-run` +
+>     `uninstall.sh` idempotent (`--purge`, `--clean-legacy`)
 > 13. **Plafond de propositions** par cycle, rotation des logs, **CI**
 >     (fmt / clippy / test / shellcheck), validation de config avec
 >     avertissements clés inconnues

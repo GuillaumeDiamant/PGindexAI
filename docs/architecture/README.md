@@ -12,9 +12,9 @@ Documentation technique complète du daemon PGindexAI : surveillance, analyse et
 >
 > **Renforcement sécurité (audit)** : TLS **vérifié** (rustls, chaîne +
 > hostname) avec `ssl_root_cert` optionnelle, rôle PG dédié non-superutilisateur,
-> installateur durci (`install.sh`), `--dry-run`, plafond de propositions par
-> cycle, rotation des logs d'audit, validation de config avec avertissements,
-> CI (fmt / clippy / test / shellcheck).
+> installateur durci (`install.sh`) + `uninstall.sh` (`--purge`), `--dry-run`,
+> plafond de propositions par cycle, rotation des logs d'audit, validation de
+> config avec avertissements, CI (fmt / clippy / test / shellcheck).
 > Chaque fichier signale ses propres nouveautés.
 
 ## Table des matières

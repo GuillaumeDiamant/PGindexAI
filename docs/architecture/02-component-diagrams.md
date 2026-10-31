@@ -312,6 +312,9 @@ pgindexai/
 ├── install.sh                    # Installateur durci : détection PG (SHOW),
 │                                 # rôle dédié pgindexai, pg_hba ciblée,
 │                                 # config 0600, unité systemd, --dry-run
+├── uninstall.sh                  # Désinstallation : service, binaire, config,
+│                                 # --purge (base + rôle + pg_hba),
+│                                 # --clean-legacy, --dry-run
 ├── config/
 │   ├── PGindexAI.yaml              # Template de configuration (multi-schéma,
 │   │                             # TLS, pool, densités, seuils)
