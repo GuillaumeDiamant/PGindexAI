@@ -443,14 +443,20 @@ setup_config() {
     if [[ -f "$CONFIG_FILE" ]]; then
         if ask "Configuration existante → $CONFIG_FILE. La conserver ? [Y/n]" Y; then
             info "Configuration conservée"
-            # S'assurer du 0600 et du mot de passe cohérent
+            # S'assurer du 0600, de la propriété cible et du mot de passe cohérent
             run chmod 600 "$CONFIG_FILE"
+            if [[ "$(id -u)" -eq 0 ]]; then
+                run chown "$TARGET_USER" "$CONFIG_FILE"
+            fi
             if ! grep -q "password:" "$CONFIG_FILE"; then
                 warn "Aucun 'password:' dans la config existante — requis si pg_hba exige scram."
             fi
             return
         fi
         cp "$CONFIG_FILE" "${CONFIG_FILE}.bak"
+        if [[ "$(id -u)" -eq 0 ]]; then
+            run chown "$TARGET_USER" "${CONFIG_FILE}.bak"
+        fi
         warn "Sauvegarde → ${CONFIG_FILE}.bak"
     fi
 
@@ -540,6 +546,11 @@ index_logging:
   max_files: 5
 EOF
         chmod 600 "$CONFIG_FILE"
+        # Sous root : le fichier écrit est root:root — le rendre à l'utilisateur
+        # cible, sinon le daemon (qui tourne sous ce compte) → EACCES (os error 13).
+        if [[ "$(id -u)" -eq 0 ]]; then
+            run chown "$TARGET_USER" "$CONFIG_FILE"
+        fi
         info "Configuration → $CONFIG_FILE (0600)"
     fi
     warn "Vérifiez le fichier avant de lancer le daemon (URL Laya, schémas, seuils)"
