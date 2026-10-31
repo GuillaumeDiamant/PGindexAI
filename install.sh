@@ -14,7 +14,7 @@
 #
 # Garanties :
 #   - Rôle PostgreSQL dédié NON superutilisateur (pgindexai, auth scram-sha-256)
-#   - pg_hba : ligne CIBLÉE (local pgindexai pgindexai scram-sha-256), jamais
+#   - pg_hba : ligne CIBLÉE (local all pgindexai scram-sha-256), jamais
 #     de 'local all all trust'
 #   - shared_preload_libraries est fUSIONNÉ, jamais écrasé
 #   - Config 0600, mot de passe généré (openssl rand), jamais echo'ed en log

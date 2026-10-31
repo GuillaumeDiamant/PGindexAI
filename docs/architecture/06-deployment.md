@@ -19,7 +19,7 @@
 - détecte le cluster PostgreSQL via `SHOW config_file/hba_file/ssl` ;
 - crée le **rôle dédié non-superutilisateur `pgindexai`** (mot de passe
   `openssl rand -hex 16`, jamais affiché) ;
-- **prépend** la ligne ciblée `local pgindexai pgindexai scram-sha-256` dans
+- **prépend** la ligne ciblée `local all pgindexai scram-sha-256` dans
   `pg_hba.conf` (ne touche jamais aux autres lignes) ;
 - **fusionne** `pg_stat_statements` dans `shared_preload_libraries` (jamais
   d'écrasement) puis redémarre PostgreSQL si besoin ;
@@ -265,12 +265,30 @@ sudo systemctl restart pgindexai
 ### Désinstallation
 
 ```bash
-sudo systemctl stop pgindexai
-sudo systemctl disable pgindexai
-sudo rm /etc/systemd/system/pgindexai.service
-sudo systemctl daemon-reload
-sudo rm /usr/local/bin/pgindexai
+# Par défaut : service + binaire + config + données + logs
+# (CONSERVE la base pgindexai_demo, le rôle pgindexai et la ligne pg_hba)
+sudo ./uninstall.sh
+
+# Simulation complète (aucune modification)
+sudo ./uninstall.sh --dry-run
+
+# Suppression complète : + base, rôle et ligne pg_hba (irréversible)
+sudo ./uninstall.sh --purge
+
+# + vestiges de l'ancien nom (laya-sql : binaire, config, logs, objets PG)
+sudo ./uninstall.sh --clean-legacy
 ```
+
+`uninstall.sh` (shellcheck-clean, sans `eval`, prompts via `/dev/tty`) :
+- arrête et désactive le service, supprime l'unité (et `reset-failed`) ;
+- arrête un éventuel processus orphelin (démarré à la main) ;
+- supprime le binaire, la config (0600), les données et les logs ;
+- avec `--purge` : `DROP DATABASE pgindexai_demo`, `DROP ROLE pgindexai`,
+  retrait de la ligne dédiée de `pg_hba.conf` + reload PostgreSQL ;
+- **ne modifie jamais** `shared_preload_libraries` ni l'extension
+  `pg_stat_statements` (extension partagée — retrait manuel si réellement
+  souhaité : retirer de `shared_preload_libraries` dans `postgresql.conf`,
+  puis `sudo systemctl restart postgresql`).
 
 ## 7. Sécurité
 
