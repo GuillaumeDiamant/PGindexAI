@@ -273,15 +273,27 @@ END
 ensure_hba() {
     step "pg_hba.conf : ligne ciblée pour pgindexai (scram-sha-256)..."
     local hba="${PG_HBA:-/etc/postgresql/16/main/pg_hba.conf}"
-    local line="local   pgindexai   pgindexai   scram-sha-256"
+    # pg_hba.conf : TYPE  DATABASE  USER  METHOD — le daemon se connecte à la
+    # base pgindexai_demo (pas à une base « pgindexai ») → DATABASE = « all ».
+    local line="local   all   pgindexai   scram-sha-256"
 
     if [[ ! -f "$hba" ]]; then
         warn "pg_hba introuvable à '$hba' — ajout manuel requis : $line"
         return 1
     fi
 
-    if sudo grep -Eq "^[[:space:]]*local[[:space:]]+pgindexai[[:space:]]+pgindexai" "$hba"; then
+    local hba_modified=false
+
+    if sudo grep -Eq "^[[:space:]]*local[[:space:]]+(all|pgindexai_demo)[[:space:]]+pgindexai[[:space:]]+" "$hba"; then
         info "Ligne pour pgindexai déjà présente"
+    elif sudo grep -Eq "^[[:space:]]*local[[:space:]]+pgindexai[[:space:]]+pgindexai[[:space:]]+" "$hba"; then
+        # Variante défectueuse : « local pgindexai pgindexai » met pgindexai dans
+        # la colonne DATABASE → le daemon (base pgindexai_demo) ne matche jamais
+        # → « no pg_hba.conf entry for host [local] ».
+        warn "Ligne mal formée (DATABASE=pgindexai) détectée — correction en « local all pgindexai »..."
+        run sudo sed -i -E "s|^([[:space:]]*)local[[:space:]]+pgindexai[[:space:]]+pgindexai([[:space:]]+.*)\$|\1local   all   pgindexai\2|" "$hba"
+        hba_modified=true
+        info "Ligne corrigée : local all pgindexai scram-sha-256"
     else
         # pg_hba est « first match wins » : la ligne dédiée est insérée EN TÊTE
         # pour qu'elle prévale sur toute ligne large ('local all all ...').
@@ -301,6 +313,13 @@ EOF
         else
             info "Ligne insérée en tête de pg_hba.conf (priorité first-match)"
         fi
+        hba_modified=true
+    fi
+
+    # pg_hba.conf est rechargé au SIGHUP (reload) — PAS à chaque connexion.
+    if $hba_modified; then
+        run sudo systemctl reload postgresql
+        info "PostgreSQL rechargé (pg_hba.conf appliqué)"
     fi
 
     if sudo grep -Eq "^[[:space:]]*local[[:space:]]+all[[:space:]]+all[[:space:]]+trust" "$hba"; then
@@ -352,7 +371,7 @@ ensure_pg_stat_statements() {
         info "Ajout : shared_preload_libraries = '$lib'"
     fi
 
-    # Redémarrage (le préfixage de pg_hba n'exige pas de redémarrage : c'est relu à chaque connexion)
+    # Redémarrage si nécessaire (pg_hba.conf est, lui, rechargé par « reload » — géré dans ensure_hba)
     if [[ -z "$(pg_show "SELECT 1 FROM pg_extension WHERE extname = '$lib'")" ]]; then
         warn "Redémarrage de PostgreSQL (shared_preload_libraries modifié)..."
         run sudo systemctl restart postgresql
