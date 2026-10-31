@@ -94,14 +94,16 @@ run() {
 }
 
 # ask "question" [défaut Y|N] — lit /dev/tty (fonctionne même via curl | bash),
-# repli sur la valeur par défaut si aucune TTY n'est disponible.
+# repli sur la valeur par défaut si aucun terminal contrôleur n'est disponible.
+# NB : ne JAMAIS rediriger le stderr de `read` : `read -p` écrit le prompt dessus,
+# et 2>/dev/null rendrait la question invisible pour l'utilisateur.
 ask() {
     local prompt="$1" def="${2:-Y}" answer=""
-    if [[ ! -c /dev/tty ]]; then
+    if ! ( : </dev/tty ) 2>/dev/null; then
         [[ "${def:0:1}" == [yY] ]]
         return
     fi
-    read -r -p "$prompt " answer < /dev/tty 2>/dev/null || answer=""
+    IFS= read -r -p "$prompt " answer </dev/tty || answer=""
     [[ "${answer:-$def}" =~ ^[Yy] ]]
 }
 
