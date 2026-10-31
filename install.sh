@@ -42,8 +42,26 @@ step()  { echo -e "${CYAN}→${NC} $*"; }
 # ─────────────────────────────────────────────
 DRY_RUN=false
 POSTGRES_USER="${POSTGRES_USER:-postgres}"
-PGINDEXAI_DIR="$HOME/.local/share/pgindexai"
-CONFIG_DIR="$HOME/.config/PGindexAI"
+
+# Utilisateur cible : celui qui possède le daemon, la config et le dépôt.
+# - script en non-root → l'utilisateur courant
+# - script via sudo    → $SUDO_USER (sinon : propriétaire du répertoire courant)
+# NB : sous sudo, $HOME/$USER pointent vers root — il faut donc les redériver.
+if [[ "$(id -u)" -ne 0 ]]; then
+    TARGET_USER="${USER:-$(whoami)}"
+elif [[ -n "${SUDO_USER:-}" ]]; then
+    TARGET_USER="$SUDO_USER"
+else
+    TARGET_USER="$(stat -c %U . 2>/dev/null || true)"
+fi
+if [[ -z "${TARGET_USER:-}" ]]; then
+    error "Impossible de déterminer l'utilisateur cible (USER / SUDO_USER absents)."
+    exit 1
+fi
+TARGET_HOME="$(getent passwd "$TARGET_USER" 2>/dev/null | cut -d: -f6 || true)"
+
+PGINDEXAI_DIR="${TARGET_HOME}/.local/share/pgindexai"
+CONFIG_DIR="${TARGET_HOME}/.config/PGindexAI"
 CONFIG_FILE="$CONFIG_DIR/PGindexAI.yaml"
 BIN_PATH="/usr/local/bin/pgindexai"
 SERVICE_NAME="pgindexai"
@@ -135,16 +153,37 @@ check_postgres() {
 
 check_rust() {
     step "Vérification de Rust..."
+    # cargo peut vivre dans le home de l'utilisateur cible (absent du PATH de root)
+    local cargo_bin=""
     if command -v cargo &>/dev/null; then
-        info "Rust toolchain détecté"
-    elif ask "Rust introuvable. Installer via rustup ? [Y/n]" Y; then
+        cargo_bin="$(command -v cargo)"
+    elif [[ -n "${TARGET_HOME:-}" && -x "${TARGET_HOME}/.cargo/bin/cargo" ]]; then
+        cargo_bin="${TARGET_HOME}/.cargo/bin/cargo"
+        export PATH="${TARGET_HOME}/.cargo/bin:${PATH}"
+    fi
+    if [[ -n "$cargo_bin" ]]; then
+        info "Rust toolchain détecté ($cargo_bin)"
+        return 0
+    fi
+
+    if ask "Rust introuvable. Installer via rustup ? [Y/n]" Y; then
         local rustup_script
         rustup_script="$(mktemp)"
         run curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o "$rustup_script"
-        run sh "$rustup_script" -s -- -y
+        # Installer POUR l'utilisateur cible (pas root) : le daemon tourne sous ce compte.
+        # NB : le drapeau « -s » n'existe plus dans rustup-init récent → « -y » suffit.
+        if [[ "$(id -u)" -eq 0 ]]; then
+            run sudo -u "$TARGET_USER" sh "$rustup_script" -y --default-toolchain stable
+        else
+            run sh "$rustup_script" -y --default-toolchain stable
+        fi
         run rm -f "$rustup_script"
-        source "$HOME/.cargo/env" 2>/dev/null || true
-        info "rustup installé"
+        if [[ -n "${TARGET_HOME:-}" && -x "${TARGET_HOME}/.cargo/bin/cargo" ]]; then
+            export PATH="${TARGET_HOME}/.cargo/bin:${PATH}"
+        else
+            source "$HOME/.cargo/env" 2>/dev/null || true
+        fi
+        info "rustup installé (pour l'utilisateur $TARGET_USER)"
     else
         error "Rust est requis pour compiler pgindexai"
         exit 1
@@ -345,7 +384,20 @@ build_and_install() {
     step "Compilation de pgindexai..."
     local repo_dir
     repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    ( cd "$repo_dir" && run cargo build --release )
+    # Sous root : compiler SOUS l'utilisateur cible (cargos de son home, target/ à son nom)
+    if [[ "$(id -u)" -eq 0 ]]; then
+        local cargo_exe
+        if command -v cargo &>/dev/null; then
+            cargo_exe="$(command -v cargo)"
+        elif [[ -n "${TARGET_HOME:-}" && -x "${TARGET_HOME}/.cargo/bin/cargo" ]]; then
+            cargo_exe="${TARGET_HOME}/.cargo/bin/cargo"
+        else
+            cargo_exe="cargo"
+        fi
+        ( cd "$repo_dir" && run sudo -u "$TARGET_USER" "$cargo_exe" build --release )
+    else
+        ( cd "$repo_dir" && run cargo build --release )
+    fi
     info "Compilation terminée"
 
     step "Installation du binaire → $BIN_PATH"
@@ -355,7 +407,9 @@ build_and_install() {
     step "Création des répertoires..."
     run mkdir -p "$PGINDEXAI_DIR" "$CONFIG_DIR"
     run sudo mkdir -p /var/log/pgindexai
-    run sudo chown "$USER:$USER" /var/log/pgindexai
+    if [[ "$(id -u)" -eq 0 ]]; then
+        run chown "$TARGET_USER" "$PGINDEXAI_DIR" "$CONFIG_DIR" /var/log/pgindexai
+    fi
     info "Répertoires prêts"
 }
 
@@ -484,7 +538,7 @@ setup_systemd() {
     fi
 
     if $DRY_RUN; then
-        echo -e "${CYAN}[dry-run]${NC} écrire $service_file (User=$USER, MemoryMax=512M, CPUQuota=100%)"
+        echo -e "${CYAN}[dry-run]${NC} écrire $service_file (User=$TARGET_USER, MemoryMax=512M, CPUQuota=100%)"
         return
     fi
 
@@ -499,13 +553,13 @@ Wants=postgresql.service
 
 [Service]
 Type=simple
-User=$USER
-Group=$USER
+User=$TARGET_USER
+Group=$TARGET_USER
 ExecStart=$BIN_PATH daemon --config $CONFIG_FILE
 Restart=always
 RestartSec=10
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-Environment=HOME=$HOME
+Environment=HOME=$TARGET_HOME
 
 # Ressources
 MemoryMax=512M
