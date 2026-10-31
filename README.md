@@ -20,7 +20,7 @@ PGindexAI surveille en continu vos bases PostgreSQL, détecte les index inutilis
 **Renforcement sécurité (audit)** :
 
 11. **TLS vérifié** (rustls) sur la connexion PostgreSQL — chaîne + hostname **toujours** vérifiées, `ssl_root_cert` (PEM) optionnelle, rôle dédié non-superutilisateur (`pgindexai`)
-12. **Installateur durci** `install.sh` (sans `eval`, pg_hba ciblée, merge `shared_preload_libraries`, config 0600, unité systemd durcie) + mode **`--dry-run`**
+12. **Installateur durci** `install.sh` (sans `eval`, pg_hba ciblée, merge `shared_preload_libraries`, config 0600, unité systemd durcie) + mode **`--dry-run`** + **`uninstall.sh`** idempotent (`--purge`, `--clean-legacy`)
 13. **Plafond de propositions** par cycle (`max_proposals_per_cycle`), rotation des logs d'audit (0640, échecs bruyants), validation de config avec avertissements clés inconnues, **CI** (fmt / clippy `-D warnings` / test / shellcheck)
 
 ---
@@ -247,13 +247,33 @@ curl -fsSL https://raw.githubusercontent.com/GuillaumeDiamant/PGindexAI/main/ins
 ./install.sh --dry-run
 ```
 
+### ♻️ Désinstallation
+
+```bash
+# Par défaut : service + binaire + config + données + logs
+# (CONSERVE la base pgindexai_demo, le rôle pgindexai et la ligne pg_hba)
+sudo ./uninstall.sh
+
+# Simulation complète (aucune modification)
+sudo ./uninstall.sh --dry-run
+
+# Suppression complète : + base, rôle et ligne pg_hba (irréversible, confirmation)
+sudo ./uninstall.sh --purge
+
+# + nettoyage des vestiges de l'ancien nom (laya-sql)
+sudo ./uninstall.sh --clean-legacy
+```
+
+`shared_preload_libraries` et l'extension `pg_stat_statements` ne sont **jamais**
+modifiées (extension partagée — retrait manuel si réellement souhaité).
+
 Le script réalise automatiquement :
 
 | Étape | Action |
 |-------|--------|
 | 1. Prérequis | Vérifie PostgreSQL, Rust, accès sudo |
 | 2. PostgreSQL | Détection via `SHOW config_file/hba_file/ssl` ; **fusion** de `pg_stat_statements` dans `shared_preload_libraries` (jamais d'écrasement) ; redémarre si besoin |
-| 3. Rôle dédié | Crée `pgindexai` (non-superutilisateur, `scram-sha-256`) + mot de passe `openssl rand -hex 16` (jamais affiché) ; **prépend** la ligne ciblée `local pgindexai pgindexai scram-sha-256` dans `pg_hba.conf` |
+| 3. Rôle dédié | Crée `pgindexai` (non-superutilisateur, `scram-sha-256`) + mot de passe `openssl rand -hex 16` (jamais affiché) ; **prépend** la ligne ciblée `local all pgindexai scram-sha-256` dans `pg_hba.conf` |
 | 4. Compilation | `cargo build --release` |
 | 5. Installation | Binaire → `/usr/local/bin/pgindexai` |
 | 6. Configuration | Génère `~/.config/PGindexAI/PGindexAI.yaml` en **0600** avec le mot de passe |
@@ -277,7 +297,7 @@ sudo -u postgres psql -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements;"
 
 # Rôle dédié (recommandé — le daemon ne doit pas tourner avec le superutilisateur)
 sudo -u postgres psql -c "CREATE ROLE pgindexai LOGIN PASSWORD '<mot-de-passe-fort>';"
-# pg_hba.conf — ligne CIBLÉE (prépendre) : local  pgindexai  pgindexai  scram-sha-256
+# pg_hba.conf — ligne CIBLÉE (prépendre) : local  all  pgindexai  scram-sha-256
 ```
 
 ### 2. Laya server
@@ -456,6 +476,8 @@ pgindexai/
 ├── Cargo.lock              # Verrouillé (projet binaire)
 ├── install.sh              # Installateur durci (rôle dédié, pg_hba ciblée,
 │                           # config 0600, unité systemd, --dry-run)
+├── uninstall.sh            # Désinstallation (service, binaire, config,
+│                           # --purge, --clean-legacy, --dry-run)
 ├── config/
 │   ├── PGindexAI.yaml        # Template de configuration
 │   └── pgindexai.service    # Unité systemd (référentielle)
@@ -513,7 +535,7 @@ pgindexai/
 - **Health check profond** de Laya (payload de test réel, réponse validée) avant chaque lot
 - **DDL en ligne** (`CONCURRENTLY`) avec validation post-DDL + nettoyage des index INVALIDE
 - **TLS vérifié** (rustls) sur PostgreSQL — chaîne + hostname toujours vérifiées, CA `ssl_root_cert` optionnelle, rôle dédié non-superutilisateur
-- **Installateur durci** (`install.sh` : sans `eval`, pg_hba ciblée, config 0600) + **`--dry-run`** sans effet de bord
+- **Installateur durci** (`install.sh` : sans `eval`, pg_hba ciblée, config 0600) + **`--dry-run`** sans effet de bord + **`uninstall.sh`** idempotent (`--purge` pour base/rôle/pg_hba, `--clean-legacy`)
 - **Détection SARGable par vrai parseur SQL** (AST, sqlparser-rs) — fin des faux positifs regex
 - **Densité cible par type de colonne** — estimation de taille des index créés
 - **Convention de nommage** `idx_<table>_<col>` validée (63 octets, hash court)

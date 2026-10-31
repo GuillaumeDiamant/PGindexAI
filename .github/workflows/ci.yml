@@ -51,4 +51,4 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y shellcheck
-          shellcheck -S warning install.sh
+          shellcheck -S warning install.sh uninstall.sh
