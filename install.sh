@@ -204,6 +204,56 @@ ensure_demo_db() {
     run sudo -u "$POSTGRES_USER" psql -qc "CREATE DATABASE pgindexai_demo"
 }
 
+# Transfert de propriété des objets de pgindexai_demo vers pgindexai :
+# CREATE INDEX / DROP INDEX / REINDEX exigent la propriété de la table/index.
+# NB : 'pg_toast' est EXCLU — les index TOAST sont des catalogues système ;
+# un ALTER ... OWNER dessus échoue et ABORT le bloc DO entier, annulant
+# tout le transfert (sans cette exclusion, le transfert échouait dès qu'une
+# table possédait une colonne TOAST : text/varchar/jsonb…).
+transfer_ownership() {
+    local sql
+    sql="
+DO \$\$
+DECLARE r RECORD;
+BEGIN
+    FOR r IN
+        SELECT c.oid::regclass AS cls
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.relkind IN ('r','v','m')
+          AND n.nspname NOT IN ('pg_catalog','information_schema','pg_toast')
+          AND c.relowner <> (SELECT oid FROM pg_authid WHERE rolname = 'pgindexai')
+    LOOP
+        EXECUTE format('ALTER TABLE %s OWNER TO pgindexai', r.cls);
+    END LOOP;
+    FOR r IN
+        SELECT ic.oid::regclass AS cls
+        FROM pg_class ic
+        JOIN pg_namespace n ON n.oid = ic.relnamespace
+        WHERE ic.relkind = 'i'
+          AND n.nspname NOT IN ('pg_catalog','information_schema','pg_toast')
+          AND ic.relowner <> (SELECT oid FROM pg_authid WHERE rolname = 'pgindexai')
+    LOOP
+        EXECUTE format('ALTER INDEX %s OWNER TO pgindexai', r.cls);
+    END LOOP;
+END
+\$\$;
+"
+    if $DRY_RUN; then
+        run sudo -u "$POSTGRES_USER" psql -d pgindexai_demo -qc "$sql"
+        return 0
+    fi
+    local err
+    if ! err="$(sudo -u "$POSTGRES_USER" psql -d pgindexai_demo -qc "$sql" 2>&1 >/dev/null)"; then
+        error "Transfert de propriété ÉCHOUÉ — le daemon ne pourra PAS créer/supprimer d'index tant que les objets de pgindexai_demo ne sont pas détenus par 'pgindexai'."
+        if [[ -n "$err" ]]; then
+            error "Détail : $(head -c 300 <<<"$err" | tr '\n' ' ')"
+        fi
+        return 1
+    fi
+    info "Droits de propriété appliqués (tables + index de pgindexai_demo → pgindexai)"
+}
+
 setup_role() {
     step "Configuration du rôle dédié 'pgindexai' (non superutilisateur)..."
 
@@ -215,11 +265,22 @@ setup_role() {
         # Si une config existante contient le mot de passe, le réappliquer
         # (garantie de cohérence rôle ↔ config)
         if [[ -f "$CONFIG_FILE" ]]; then
-            local existing_pw
-            existing_pw="$(sed -n 's/^[[:space:]]*password:[[:space:]]*//p' "$CONFIG_FILE" | head -1 | tr -d '"' | tr -d "'" || true)"
+            local existing_pw pw_sql q
+            existing_pw="$(sed -n 's/^[[:space:]]*password:[[:space:]]*//p' "$CONFIG_FILE" | head -1 || true)"
+            # Retirer UNE paire de guillemets YAML externes éventuels —
+            # les guillemets INTERNES font partie du mot de passe (on ne
+            # les supprime pas : l'ancienne `tr -d` les corrompait).
+            q="'"
+            if [[ ${#existing_pw} -ge 2 && "${existing_pw:0:1}" == "$q" && "${existing_pw: -1}" == "$q" ]]; then
+                existing_pw="${existing_pw:1:${#existing_pw}-2}"
+            fi
+            if [[ ${#existing_pw} -ge 2 && "${existing_pw:0:1}" == '"' && "${existing_pw: -1}" == '"' ]]; then
+                existing_pw="${existing_pw:1:${#existing_pw}-2}"
+            fi
             if [[ -n "$existing_pw" ]]; then
                 PGINDEXAI_PW="$existing_pw"
-                run sudo -u "$POSTGRES_USER" psql -qc "ALTER ROLE pgindexai PASSWORD '${existing_pw}'"
+                pw_sql="${existing_pw//$q/$q$q}"   # échappement SQL : ' → ''
+                run sudo -u "$POSTGRES_USER" psql -qc "ALTER ROLE pgindexai PASSWORD '$pw_sql'"
                 info "Mot de passe existant conservé (re-appliqué au rôle)"
             fi
         fi
@@ -237,37 +298,16 @@ setup_role() {
     fi
 
     run sudo -u "$POSTGRES_USER" psql -qc "GRANT CONNECT ON DATABASE pgindexai_demo TO pgindexai"
+    # PostgreSQL 15+ : CREATE n'est plus accordé à tous sur le schéma public
+    # par défaut — sans ce GRANT, CREATE/DROP INDEX échoue (permission denied
+    # for schema public) même si pgindexai possède les tables.
+    run sudo -u "$POSTGRES_USER" psql -d pgindexai_demo -qc "GRANT CREATE ON SCHEMA public TO pgindexai"
 
-    # Transfert de propriété des objets de démo vers pgindexai :
-    # CREATE INDEX / DROP INDEX / REINDEX exigent la propriété de la table/index.
-    run sudo -u "$POSTGRES_USER" psql -d pgindexai_demo -qc "
-DO \$\$
-DECLARE r RECORD;
-BEGIN
-    FOR r IN
-        SELECT c.oid::regclass AS cls
-        FROM pg_class c
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE c.relkind IN ('r','v','m')
-          AND n.nspname NOT IN ('pg_catalog','information_schema')
-          AND c.relowner <> (SELECT oid FROM pg_authid WHERE rolname = 'pgindexai')
-    LOOP
-        EXECUTE format('ALTER TABLE %s OWNER TO pgindexai', r.cls);
-    END LOOP;
-    FOR r IN
-        SELECT ic.oid::regclass AS cls
-        FROM pg_class ic
-        JOIN pg_namespace n ON n.oid = ic.relnamespace
-        WHERE ic.relkind = 'i'
-          AND n.nspname NOT IN ('pg_catalog','information_schema')
-          AND ic.relowner <> (SELECT oid FROM pg_authid WHERE rolname = 'pgindexai')
-    LOOP
-        EXECUTE format('ALTER INDEX %s OWNER TO pgindexai', r.cls);
-    END LOOP;
-END
-\$\$;
-" 2>/dev/null || warn "Transfert de propriété partiel (objets déjà détenus par pgindexai ?)"
-    info "Droits de propriété appliqués (tables + index de pgindexai_demo → pgindexai)"
+    # Transfert de propriété (tables + index) vers pgindexai.
+    # NB : re-appliqué après setup_demo dans main() — le schéma de démo est
+    # créé PAR postgres et doit être ré-attribué pour que le daemon puisse
+    # y exécuter du DDL (sinon : permission denied sur CREATE/DROP INDEX).
+    transfer_ownership
 }
 
 ensure_hba() {
@@ -643,8 +683,8 @@ start_daemon() {
         sleep 2
     done
 
-    warn "Le daemon n'est pas actif — vérifiez : sudo journalctl -u $SERVICE_NAME -n 30"
-    return 0
+    error "Le daemon n'est pas actif après 30 s — vérifiez : sudo journalctl -u $SERVICE_NAME -n 30"
+    return 1
 }
 
 # ─────────────────────────────────────────────
@@ -721,11 +761,19 @@ main() {
     echo ""
     setup_systemd
     echo ""
-    start_daemon
+    local daemon_ok=true
+    start_daemon || daemon_ok=false
     echo ""
     setup_demo || true
+    # Le schéma de démo est créé PAR postgres (après setup_role) : re-appliquer
+    # le transfert de propriété pour que pgindexai puisse y exécuter du DDL.
+    transfer_ownership
     echo ""
     verify
+    # Si le daemon n'est pas actif, l'installation ne peut pas se déclarer
+    # terminée (précédemment : échec masqué — le script sortait « succès »
+    # alors que le service était en crash loop).
+    $daemon_ok
 }
 
 main "$@"
