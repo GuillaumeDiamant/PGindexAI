@@ -205,7 +205,11 @@ pub struct Thresholds {
     pub max_proposals_per_cycle: u32,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+/// NB : `Default` est implémenté MANUELLEMENT (pas `derive`) : quand la
+/// section `logging:` est absente, `#[serde(default)]` invoque
+/// `Default::default()` — il doit donc produire les MÊMES valeurs que les
+/// defaults serde par champ (un derive donnerait `level: ""` = aucun log).
+#[derive(Debug, Clone, Deserialize)]
 pub struct LoggingConfig {
     #[serde(default = "default_log_level")]
     pub level: String,
@@ -213,8 +217,19 @@ pub struct LoggingConfig {
     pub format: String,
 }
 
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            level: default_log_level(),
+            format: default_log_format(),
+        }
+    }
+}
+
 /// Configuration du logging des opérations d'index (historisation)
-#[derive(Debug, Clone, Default, Deserialize)]
+/// NB : `Default` manuel — idem `LoggingConfig` (section absente = mêmes
+/// valeurs que les defaults serde par champ : audit ENABLED, pas coupé).
+#[derive(Debug, Clone, Deserialize)]
 pub struct IndexLoggingConfig {
     #[serde(default = "default_index_logging_enabled")]
     pub enabled: bool,
@@ -230,6 +245,18 @@ pub struct IndexLoggingConfig {
     /// Nombre max de fichiers rotés
     #[serde(default = "default_index_logging_max_files")]
     pub max_files: u64,
+}
+
+impl Default for IndexLoggingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_index_logging_enabled(),
+            verbosity: default_index_logging_verbosity(),
+            log_file: String::new(),
+            max_file_size_bytes: default_index_logging_max_size(),
+            max_files: default_index_logging_max_files(),
+        }
+    }
 }
 
 /// Configuration du pool de connexions PostgreSQL
@@ -498,4 +525,55 @@ pub enum ConfigError {
     Parse(PathBuf, serde_yaml::Error),
     #[error("Invalid config: {0}")]
     Validation(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Une config MINIMALE (sections `logging` / `index_logging` absentes)
+    /// doit produire les mêmes valeurs que les defaults serde par champ.
+    ///
+    /// Régression : avec `#[derive(Default)]`, l'absence de section invoquait
+    /// `Default::default()` → `level: ""` (daemon SANS aucun log) et
+    /// `index_logging.enabled: false` (audit silencieusement coupé).
+    #[test]
+    fn test_defaults_when_sections_absent() {
+        // NB : `thresholds` est REQUIS par design (fail-fast) — une section
+        // vide vérifie en bonus les defaults serde par champ.
+        let yaml = r#"
+postgresql:
+  host: localhost
+  port: 5432
+  user: pgindexai
+  database: pgindexai_demo
+  ssl_mode: disable
+laya:
+  url: http://127.0.0.1:8080
+actions:
+  create_index: true
+  drop_unused: true
+  rebuild_fragmented: true
+thresholds: {}
+"#;
+        let value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let cfg: Config = serde_yaml::from_value(value).unwrap();
+
+        assert_eq!(cfg.logging.level, "info");
+        assert_eq!(cfg.logging.format, "json");
+        assert!(
+            cfg.index_logging.enabled,
+            "l'audit doit rester ENABLED sans section"
+        );
+        assert_eq!(cfg.index_logging.verbosity, "minimal");
+        assert_eq!(cfg.index_logging.max_file_size_bytes, 10 * 1024 * 1024);
+        assert_eq!(cfg.index_logging.max_files, 5);
+
+        // Cohérence : `Default::default()` = mêmes valeurs que le parse serde
+        assert_eq!(LoggingConfig::default().level, cfg.logging.level);
+        assert_eq!(
+            IndexLoggingConfig::default().enabled,
+            cfg.index_logging.enabled
+        );
+    }
 }
