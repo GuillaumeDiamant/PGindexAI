@@ -19,7 +19,11 @@
 # Garde-fous :
 #   - shared_preload_libraries et pg_stat_statements ne sont JAMAIS modifiés
 #     (extension partagée — retrait manuel si réellement souhaité)
-#   - sans terminal contrôleur, la confirmation --purge passe au défaut (Y)
+#   - sans terminal contrôleur, la confirmation --purge passe au défaut (N)
+#     : une opération irréversible ne s'exécute JAMAIS sans confirmation
+#     explicite
+#   - --purge refuse d'agir si le rôle 'pgindexai' possède des objets dans
+#     d'autres bases (DROP ROLE échouerait sinon, partiellement)
 # ============================================================================
 set -euo pipefail
 
@@ -177,13 +181,47 @@ remove_dirs() {
 # ─────────────────────────────────────────────
 remove_pg_objects() {
     step "Objets PostgreSQL (base + rôle + pg_hba)..."
-    if ! ask "Supprimer DÉFINITIVEMENT la base 'pgindexai_demo' (toutes ses données) ET le rôle 'pgindexai' ? [Y/n]" Y; then
-        warn "Suppression annulée : base et rôle conservés."
+    # Confirmation par défaut NON (N) : sans tty (curl|bash, cron…) la purge
+    # est annulée au lieu de s'exécuter — opération irréversible.
+    if ! ask "Supprimer DÉFINITIVEMENT la base 'pgindexai_demo' (toutes ses données) ET le rôle 'pgindexai' ? (irréversible) [y/N]" N; then
+        warn "Suppression annulée (pas de confirmation explicite) : base et rôle conservés."
         return 0
     fi
+
+    # Garde-fou : si le rôle possède des objets dans d'AUTRES bases, DROP ROLE
+    # échouerait (et partiellement en plus). On refuse AVANT toute suppression
+    # pour garder l'opération atomique — on ne drop jamais « à moitié ».
+    local foreign
+    foreign="$(
+        for db in $(pg_show "SELECT datname FROM pg_database WHERE datallowconn AND datname <> 'pgindexai_demo' ORDER BY 1"); do
+            sudo -u "$POSTGRES_USER" psql -d "$db" -tAc "
+                SELECT n.nspname || '.' || c.relname
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE c.relowner = (SELECT oid FROM pg_authid WHERE rolname = 'pgindexai')
+                  AND n.nspname <> 'information_schema'
+                  AND n.nspname !~ '^pg_'
+            " 2>/dev/null | sed "s|^|  ${db}: |" || true
+        done
+    )"
+    if [[ -n "$foreign" ]]; then
+        error "Le rôle 'pgindexai' possède des objets dans d'AUTRES bases — purge refusée en l'état :"
+        echo "$foreign" | head -10 >&2
+        error "Transférez la propriété ou supprimez ces objets, puis relancez avec --purge."
+        return 1
+    fi
+
     # Ordre : base d'abord (détient les tables/index), puis le rôle.
-    run sudo -u "$POSTGRES_USER" psql -qc "DROP DATABASE IF EXISTS pgindexai_demo"
-    run sudo -u "$POSTGRES_USER" psql -qc "DROP ROLE IF EXISTS pgindexai"
+    # Échec explicite (pas d'abort silencieux en plein purge : DROP ROLE
+    # partiellement appliqué serait un état incohérent).
+    if ! run sudo -u "$POSTGRES_USER" psql -qc "DROP DATABASE IF EXISTS pgindexai_demo"; then
+        error "DROP DATABASE a échoué (connexions actives ?) — purge arrêtée, rôle conservé."
+        return 1
+    fi
+    if ! run sudo -u "$POSTGRES_USER" psql -qc "DROP ROLE IF EXISTS pgindexai"; then
+        error "DROP ROLE a échoué (privilèges résiduels ?) — voir l'erreur ci-dessus."
+        return 1
+    fi
     info "Base et rôle supprimés"
 
     # Ligne dédiée (forme corrigée « local all pgindexai » ET variante

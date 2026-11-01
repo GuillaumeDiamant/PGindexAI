@@ -143,7 +143,7 @@ ORDER BY relname;"
 WARN  Laya deep health FAILED at http://127.0.0.1:8080: Laya not reachable …
 WARN  Decisions will be SKIPPED (no fallback) until Laya is available.
 WARN  Laya unavailable (…): 5 proposals SKIPPED (no fallback policy).
-INFO  Applied: 0 proposals
+INFO  Applied: 0 proposal(s), skipped (no-op): 0
 ```
 
 **Comportement** : le daemon ne décide **jamais** à la place de Laya —

@@ -129,8 +129,12 @@ async fn run_once(
     }
 
     // Appliquer les décisions Laya
-    let applied = analyzer.apply_proposals(&proposals).await?;
-    info!("Applied: {} proposals", applied.len());
+    let result = analyzer.apply_proposals(&proposals).await?;
+    info!(
+        "Applied: {} proposal(s), skipped (no-op): {}",
+        result.applied.len(),
+        result.skipped.len()
+    );
 
     Ok(())
 }
@@ -181,8 +185,12 @@ async fn run_daemon(
         // Appliquer (sauf dry-run)
         if !dry_run {
             match analyzer.apply_proposals(&proposals).await {
-                Ok(applied) => {
-                    info!("Applied: {} proposals", applied.len());
+                Ok(result) => {
+                    info!(
+                        "Applied: {} proposal(s), skipped (no-op): {}",
+                        result.applied.len(),
+                        result.skipped.len()
+                    );
                 }
                 Err(e) => {
                     error!("Apply error: {e}");

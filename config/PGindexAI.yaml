@@ -35,6 +35,10 @@ thresholds:
                            # requête soit candidate à un index SARGable (>= 1)
   min_confidence: 0.7      # Confiance minimale de Laya pour appliquer (0.0..=1.0)
   max_proposals_per_cycle: 20  # Budget de propositions par cycle (1..=1000)
+  ddl_timeout_seconds: 1800  # Timeout des DDL longs CONCURRENTLY, en secondes
+                             # (0 = illimité ; 0..=86400 — garder généreux : un
+                             # timeout trop court sur grosse table créerait une
+                             # boucle build→annulé→retry)
 
 # Périmètre d'analyse (multi-schéma)
 analysis:

@@ -14,6 +14,18 @@ use crate::state::DaemonState;
 /// Limite de longueur des identifiants copiés dans un `reason` (payload Laya)
 const SANITIZED_MAX_LEN: usize = 64;
 
+/// Résultat d'une passe d'application des propositions : les DDL réellement
+/// exécutés (`applied`) sont distingués des no-ops idempotents (`skipped` :
+/// index déjà présent / déjà absent). Précédemment, les no-ops étaient
+/// comptés comme « appliqués » — les deux sont désormais rapportés séparément.
+#[derive(Debug, Clone)]
+pub struct ApplyResult {
+    /// Propositions dont le DDL a été exécuté
+    pub applied: Vec<Proposal>,
+    /// Propositions sans effet (objet déjà présent / déjà absent)
+    pub skipped: Vec<Proposal>,
+}
+
 pub struct Analyzer {
     pool: Pool,
     laya: LayaClient,
@@ -343,12 +355,13 @@ impl Analyzer {
     pub async fn apply_proposals(
         &self,
         proposals: &[Proposal],
-    ) -> Result<Vec<Proposal>, Box<dyn std::error::Error + Sync + Send>> {
-        if proposals.is_empty() {
-            return Ok(Vec::new());
-        }
-
+    ) -> Result<ApplyResult, Box<dyn std::error::Error + Sync + Send>> {
         let mut applied = Vec::new();
+        let mut skipped = Vec::new();
+
+        if proposals.is_empty() {
+            return Ok(ApplyResult { applied, skipped });
+        }
 
         // Vérification unique de la disponibilité Laya (health check profond)
         match self.laya.deep_health().await {
@@ -359,7 +372,7 @@ impl Analyzer {
                     e,
                     proposals.len()
                 );
-                return Ok(applied);
+                return Ok(ApplyResult { applied, skipped });
             }
         }
 
@@ -483,18 +496,23 @@ impl Analyzer {
                                         }
                                         _ => proposal.ddl.clone(),
                                     };
-                                    if let Err(e) = ddl::execute_create_index(
+                                    match ddl::execute_create_index(
                                         &self.pool,
                                         &ddl_to_run,
+                                        self.config.thresholds.ddl_timeout_seconds,
                                         &self.log_writer,
                                         Some(confidence),
                                         Some(proposal.reason.clone()),
                                     )
                                     .await
                                     {
-                                        warn!("Failed to create index: {}", e);
-                                    } else {
-                                        applied.push(proposal.clone());
+                                        Ok(ddl::DdlOutcome::Applied) => {
+                                            applied.push(proposal.clone());
+                                        }
+                                        Ok(ddl::DdlOutcome::Skipped) => {
+                                            skipped.push(proposal.clone());
+                                        }
+                                        Err(e) => warn!("Failed to create index: {}", e),
                                     }
                                 }
                             }
@@ -504,9 +522,10 @@ impl Analyzer {
                                     // Récupérer la taille de l'index avant suppression
                                     let size_bytes =
                                         self.get_index_size(&proposal.ddl).await.unwrap_or(0);
-                                    if let Err(e) = ddl::execute_drop_index(
+                                    match ddl::execute_drop_index(
                                         &self.pool,
                                         &proposal.ddl,
+                                        self.config.thresholds.ddl_timeout_seconds,
                                         &self.log_writer,
                                         Some(confidence),
                                         size_bytes,
@@ -514,9 +533,13 @@ impl Analyzer {
                                     )
                                     .await
                                     {
-                                        warn!("Failed to drop index: {}", e);
-                                    } else {
-                                        applied.push(proposal.clone());
+                                        Ok(ddl::DdlOutcome::Applied) => {
+                                            applied.push(proposal.clone());
+                                        }
+                                        Ok(ddl::DdlOutcome::Skipped) => {
+                                            skipped.push(proposal.clone());
+                                        }
+                                        Err(e) => warn!("Failed to drop index: {}", e),
                                     }
                                 }
                             }
@@ -528,9 +551,10 @@ impl Analyzer {
                                         .get_index_fragmentation(&proposal.ddl)
                                         .await
                                         .unwrap_or(0.0);
-                                    if let Err(e) = ddl::execute_reindex(
+                                    match ddl::execute_reindex(
                                         &self.pool,
                                         &proposal.ddl,
+                                        self.config.thresholds.ddl_timeout_seconds,
                                         &self.log_writer,
                                         Some(confidence),
                                         self.get_index_size(&proposal.ddl).await.unwrap_or(0),
@@ -539,9 +563,15 @@ impl Analyzer {
                                     )
                                     .await
                                     {
-                                        warn!("Failed to rebuild index: {}", e);
-                                    } else {
-                                        applied.push(proposal.clone());
+                                        Ok(ddl::DdlOutcome::Applied) => {
+                                            applied.push(proposal.clone());
+                                        }
+                                        Ok(ddl::DdlOutcome::Skipped) => {
+                                            // REINDEX n'a pas de IF EXISTS : en pratique
+                                            // cette branche n'est jamais atteinte.
+                                            skipped.push(proposal.clone());
+                                        }
+                                        Err(e) => warn!("Failed to rebuild index: {}", e),
                                     }
                                 }
                             }
@@ -557,7 +587,14 @@ impl Analyzer {
             }
         }
 
-        Ok(applied)
+        if !skipped.is_empty() {
+            info!(
+                "Apply summary: {} applied, {} skipped (no-op idempotent)",
+                applied.len(),
+                skipped.len()
+            );
+        }
+        Ok(ApplyResult { applied, skipped })
     }
 
     /// Récupérer la taille d'un index à partir d'un DDL (schéma-qualifié)

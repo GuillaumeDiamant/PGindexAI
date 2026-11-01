@@ -5,20 +5,50 @@ use tracing::{error, info, warn};
 use crate::db::queries;
 use crate::index_log::{CrudOperation, IndexLogWriter, IndexOperationLog};
 
+/// Issue d'une opération DDL :
+/// - `Applied` : le DDL a été exécuté
+/// - `Skipped` : no-op idempotent (index déjà présent / déjà absent) —
+///   compté séparément des « applied » dans les rapports de cycle
+///   (précédemment : les no-ops étaient comptés comme « appliqués »)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DdlOutcome {
+    Applied,
+    Skipped,
+}
+
 /// Exécuter un DDL avec une TRANSACTION EXPLICITE et validation post-commit.
 ///
 /// Règle PostgreSQL : `CREATE INDEX CONCURRENTLY` et `REINDEX CONCURRENTLY`
 /// ne peuvent PAS s'exécuter dans un bloc transactionnel.
 /// - DDL atomique (DROP INDEX) → BEGIN … COMMIT, ROLLBACK en cas d'erreur
 /// - DDL CONCURRENTLY → exécution directe (auto-commit), jamais dans une transaction
+///
+/// `timeout_secs` borne la durée des builds CONCURRENTLY (0 = illimité) :
+/// sans borne, un build sur une grosse table peut bloquer l'intégralité du
+/// cycle d'analyse (le daemon est séquentiel). NB : un timeout trop court sur
+/// une grosse table créerait une boucle build→annulé→retry — d'où le défaut
+/// généreux de 30 min (configurable via `thresholds.ddl_timeout_seconds`).
 pub async fn run_in_transaction(
     pool: &Pool,
     ddl: &str,
+    timeout_secs: u64,
 ) -> Result<u64, Box<dyn std::error::Error + Sync + Send>> {
     if is_concurrent_ddl(ddl) {
         // CONCURRENTLY : interdit dans une transaction, exécution directe
         let client = pool.get().await?;
-        let rows = client.execute(ddl, &[]).await?;
+        // Timeout par session (pas par statement) : SET avant, RESET après —
+        // la connexion retourne au pool dans son état initial.
+        if timeout_secs > 0 {
+            client
+                .simple_query(&format!("SET statement_timeout = {timeout_secs}s"))
+                .await?;
+        }
+        let result = client.execute(ddl, &[]).await;
+        if timeout_secs > 0 {
+            // Even in case of error: reset before propagating (clean pool)
+            let _ = client.simple_query("SET statement_timeout = 0").await;
+        }
+        let rows = result?;
         Ok(rows)
     } else {
         let mut client = pool.get().await?;
@@ -50,16 +80,36 @@ fn is_concurrent_ddl(ddl: &str) -> bool {
 pub async fn execute_create_index(
     pool: &Pool,
     ddl: &str,
+    timeout_secs: u64,
     writer: &IndexLogWriter,
     confidence: Option<f64>,
     reason: Option<String>,
-) -> Result<Option<String>, Box<dyn std::error::Error + Sync + Send>> {
+) -> Result<DdlOutcome, Box<dyn std::error::Error + Sync + Send>> {
     let index_name = extract_index_name(ddl);
     let schema = extract_schema_from_ddl(ddl);
     if let Some(ref name) = index_name {
         if queries::index_exists(pool, &schema, name).await? {
-            info!("Index {} already exists, skipping CREATE", name);
-            return Ok(None);
+            // No-op idempotent : journalisé « skipped » (plus « success »)
+            info!("Index {name} already exists — CREATE skipped (idempotent no-op)");
+            writer.log(
+                IndexOperationLog::new(
+                    CrudOperation::CreateIndex,
+                    schema.clone(),
+                    name.clone(),
+                    std::time::Duration::ZERO,
+                    "skipped (index already exists)",
+                )
+                .with_ddl(ddl.to_string())
+                .with_metadata(
+                    confidence.unwrap_or(0.0),
+                    0,
+                    0.0,
+                    reason
+                        .clone()
+                        .unwrap_or_else(|| "missing index suggestion".to_string()),
+                ),
+            );
+            return Ok(DdlOutcome::Skipped);
         }
     }
 
@@ -68,7 +118,7 @@ pub async fn execute_create_index(
     let object = index_name.clone().unwrap_or_else(|| "unknown".to_string());
     let start = Instant::now();
 
-    let result = run_in_transaction(pool, ddl).await;
+    let result = run_in_transaction(pool, ddl, timeout_secs).await;
     let duration = start.elapsed();
 
     match result {
@@ -130,7 +180,7 @@ pub async fn execute_create_index(
                 ),
             );
 
-            Ok(Some(object))
+            Ok(DdlOutcome::Applied)
         }
         Err(e) => {
             error!("CREATE INDEX failed: {e}");
@@ -170,22 +220,50 @@ pub async fn execute_create_index(
     }
 }
 
-/// Exécuter un DROP INDEX avec transaction explicite et logging structuré
+/// Exécuter un DROP INDEX avec transaction explicite et logging structuré.
+///
+/// Idempotence : si l'index est déjà absent, renvoie `DdlOutcome::Skipped`
+/// (journalisé « skipped ») au lieu de compter un no-op comme « appliqué ».
 pub async fn execute_drop_index(
     pool: &Pool,
     ddl: &str,
+    timeout_secs: u64,
     writer: &IndexLogWriter,
     confidence: Option<f64>,
     size_bytes: u64,
     reason: Option<String>,
-) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
+) -> Result<DdlOutcome, Box<dyn std::error::Error + Sync + Send>> {
+    let index_name = extract_index_name(ddl);
+    let schema = extract_schema_from_ddl(ddl);
+    if let Some(ref name) = index_name {
+        if !queries::index_exists(pool, &schema, name).await? {
+            info!("Index {name} already absent — DROP skipped (idempotent no-op)");
+            writer.log(
+                IndexOperationLog::new(
+                    CrudOperation::DropIndex,
+                    schema.clone(),
+                    name.clone(),
+                    std::time::Duration::ZERO,
+                    "skipped (index already absent)",
+                )
+                .with_ddl(ddl.to_string())
+                .with_metadata(
+                    confidence.unwrap_or(0.0),
+                    0,
+                    0.0,
+                    reason.clone().unwrap_or_else(|| "unused index".to_string()),
+                ),
+            );
+            return Ok(DdlOutcome::Skipped);
+        }
+    }
+
     info!("Executing DROP INDEX (tx): {ddl}");
 
-    let object = extract_index_name(ddl).unwrap_or_else(|| "unknown".to_string());
-    let schema = extract_schema_from_ddl(ddl);
+    let object = index_name.clone().unwrap_or_else(|| "unknown".to_string());
     let start = Instant::now();
 
-    let result = run_in_transaction(pool, ddl).await;
+    let result = run_in_transaction(pool, ddl, timeout_secs).await;
     let duration = start.elapsed();
 
     match result {
@@ -195,6 +273,8 @@ pub async fn execute_drop_index(
                 rows,
                 duration.as_secs_f64() * 1000.0
             );
+            // NB : `rows` vaut 0 pour un DDL (CommandComplete sans count) —
+            // l'absence d'index est détectée par le pré-check ci-dessus, pas ici.
 
             writer.log(
                 IndexOperationLog::new(
@@ -213,7 +293,7 @@ pub async fn execute_drop_index(
                 ),
             );
 
-            Ok(())
+            Ok(DdlOutcome::Applied)
         }
         Err(e) => {
             error!("DROP INDEX failed (rolled back): {e}");
@@ -242,15 +322,17 @@ pub async fn execute_drop_index(
 
 /// Exécuter un REINDEX (CONCURRENTLY → auto-commit ; standard → transaction)
 /// avec validation post-opération et logging structuré
+#[allow(clippy::too_many_arguments)] // signature plate uniforme avec create/drop
 pub async fn execute_reindex(
     pool: &Pool,
     ddl: &str,
+    timeout_secs: u64,
     writer: &IndexLogWriter,
     confidence: Option<f64>,
     size_bytes: u64,
     fragmentation: f64,
     reason: Option<String>,
-) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
+) -> Result<DdlOutcome, Box<dyn std::error::Error + Sync + Send>> {
     if is_concurrent_ddl(ddl) {
         warn!("REINDEX CONCURRENTLY cannot run in a transaction; executing with auto-commit.");
     }
@@ -260,7 +342,7 @@ pub async fn execute_reindex(
     let object = extract_index_name(ddl).unwrap_or_else(|| "unknown".to_string());
     let start = Instant::now();
 
-    let result = run_in_transaction(pool, ddl).await;
+    let result = run_in_transaction(pool, ddl, timeout_secs).await;
     let duration = start.elapsed();
 
     match result {
@@ -344,7 +426,7 @@ pub async fn execute_reindex(
                 ),
             );
 
-            Ok(())
+            Ok(DdlOutcome::Applied)
         }
         Err(e) => {
             error!("REINDEX failed (rolled back): {e}");

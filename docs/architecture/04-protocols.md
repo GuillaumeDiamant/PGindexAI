@@ -473,7 +473,7 @@ JSON par défaut (`logging.format = "json"`), ou texte brut (`"plain"`).
 
 | Niveau | Usage |
 |--------|-------|
-| `INFO` | Démarrage, état du daemon, propositions, DDL exécutées, « Applied: N proposals » |
+| `INFO` | Démarrage, état du daemon, propositions, DDL exécutées, « Applied: N proposal(s), skipped (no-op): M » |
 | `WARN` | Laya injoignable / deep health FAILED (no fallback), mode DEGRADED, skip par action flag, `REINDEX CONCURRENTLY` auto-commit |
 | `ERROR` | Échec DDL, erreur d'analyse, erreur d'application |
 | `DEBUG` | Résultats détecteurs, parsing SQL, fenêtres d'observation sautées, skip par confidence |
@@ -486,7 +486,7 @@ JSON par défaut (`logging.format = "json"`), ou texte brut (`"plain"`).
 {"timestamp":"2026-10-30T21:30:12.102Z","level":"WARN","fields":{"message":"Decisions will be SKIPPED (no fallback) until Laya is available."}}
 {"timestamp":"2026-10-30T21:30:12.250Z","level":"INFO","fields":{"message":"Analysis complete: 5 proposals (147ms)"}}
 {"timestamp":"2026-10-30T21:30:12.251Z","level":"WARN","fields":{"message":"Laya unavailable (Laya not reachable ...): 5 proposals SKIPPED (no fallback policy)."}}
-{"timestamp":"2026-10-30T21:30:12.251Z","level":"INFO","fields":{"message":"Applied: 0 proposals"}}
+{"timestamp":"2026-10-30T21:30:12.251Z","level":"INFO","fields":{"message":"Applied: 0 proposal(s), skipped (no-op): 0"}}
 {"timestamp":"2026-10-30T21:30:12.250Z","level":"DEBUG","fields":{"message":"Server uptime < 10080min (unused threshold): skipping unused-index analysis this cycle"}}
 {"timestamp":"2026-10-30T21:30:12.250Z","level":"DEBUG","fields":{"message":"DEGRADED mode: missing-index detection is DISABLED (pg_stat_statements unavailable)"}}
 ```
