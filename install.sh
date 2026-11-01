@@ -460,12 +460,12 @@ setup_config() {
         warn "Sauvegarde → ${CONFIG_FILE}.bak"
     fi
 
-    # Déterminer le mode TLS par défaut à partir de l'état du serveur
-    local ssl_mode="disable" ssl_cert_comment=""
-    if [[ "$PG_SSL" == "on" ]]; then
-        ssl_mode="require"
-        ssl_cert_comment=$'\n  # Pour un CA auto-signé (snakeoil, interne), passez plutôt :\n  #   ssl_mode: "verify-full"\n  #   ssl_root_cert: "/etc/ssl/certs/votre-ca.pem"  # chemin PEM\n'
-    fi
+    # TLS : la config générée pointe sur le socket Unix local — le daemon
+    # impose ssl_mode=disable sur socket (src/db/mod.rs : le TLS se négocie
+    # sur TCP avec un nom d'hôte, pas sur un IPC local). ssl=on côté serveur
+    # (snakeoil par défaut) n'y change rien pour une connexion IPC locale.
+    # Pour un déploiement TCP distant : host 127.0.0.1 + require/verify-full.
+    local ssl_mode="disable"
 
     run mkdir -p "$CONFIG_DIR"
 
@@ -486,8 +486,7 @@ postgresql:
   database: "pgindexai_demo"
   password: "${PGINDEXAI_PW}"
   ssl_mode: "${ssl_mode}"
-  # ssl_root_cert: "/etc/ssl/certs/votre-ca.pem"   # CA auto-signée (verify-ca/verify-full)
-$ssl_cert_comment
+  # ssl_root_cert: "/etc/ssl/certs/votre-ca.pem"   # CA auto-signée (TCP uniquement : verify-ca/verify-full)
 laya:
   url: "http://127.0.0.1:8080"
   timeout_seconds: 30
