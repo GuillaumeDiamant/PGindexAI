@@ -147,6 +147,9 @@ impl Analyzer {
                 reason,
                 confidence: 0.0, // Sera mis à jour par Laya
                 table: idx.tablename,
+                schema: idx.schemaname,
+                index_name: Some(idx.indexname),
+                column: None,
             });
         }
 
@@ -191,6 +194,9 @@ impl Analyzer {
                     reason,
                     confidence: 0.0,
                     table: idx.tablename,
+                    schema: idx.schemaname,
+                    index_name: Some(idx.indexname),
+                    column: None,
                 });
             }
         }
@@ -278,34 +284,23 @@ impl Analyzer {
                 );
 
                 // Index filtré si la colonne est nullable à > 10%
-                let where_clause = if col.is_nullable && col.null_frac > 0.1 {
-                    format!("WHERE {} IS NOT NULL", col.column_name)
-                } else {
-                    String::new()
-                };
+                // (variante proposée par défaut — LAYA reste libre de choisir
+                // l'autre variante à l'application, cf. apply_proposals)
+                let filtered = col.is_nullable && col.null_frac > 0.1;
 
                 // DDL en ligne : CREATE INDEX CONCURRENTLY (ne bloque pas les écritures)
-                let ddl = if where_clause.is_empty() {
-                    format!(
-                        "CREATE INDEX CONCURRENTLY IF NOT EXISTS {}.{} ON {}.{} ({})",
-                        miss.schemaname, idx_name, miss.schemaname, miss.tablename, col.column_name
-                    )
-                } else {
-                    format!(
-                        "CREATE INDEX CONCURRENTLY IF NOT EXISTS {}.{} ON {}.{} ({}) {}",
-                        miss.schemaname,
-                        idx_name,
-                        miss.schemaname,
-                        miss.tablename,
-                        col.column_name,
-                        where_clause
-                    )
-                };
+                let ddl = ddl::build_create_index_ddl(
+                    &miss.schemaname,
+                    &idx_name,
+                    &miss.tablename,
+                    &col.column_name,
+                    filtered,
+                );
 
-                let action = if where_clause.is_empty() {
-                    DecisionAction::CreateIndex
-                } else {
+                let action = if filtered {
                     DecisionAction::CreateFilteredIndex
+                } else {
+                    DecisionAction::CreateIndex
                 };
 
                 proposals.push(Proposal {
@@ -314,6 +309,9 @@ impl Analyzer {
                     reason,
                     confidence: 0.0,
                     table: miss.tablename.clone(),
+                    schema: miss.schemaname.clone(),
+                    index_name: Some(idx_name),
+                    column: Some(col.column_name.clone()),
                 });
             }
         }
@@ -464,9 +462,30 @@ impl Analyzer {
                             DecisionAction::CreateIndex | DecisionAction::CreateFilteredIndex => {
                                 info!("Laya recommended CREATE INDEX: {}", proposal.reason);
                                 if self.config.actions.create_index {
+                                    // Le CHOIX de Laya (1 = standard, 2 = filtré) détermine la
+                                    // DDL exécutée — pas la variante générée à l'analyse.
+                                    // (Régression corrigée : les deux choix exécutaient la même DDL.)
+                                    let filtered = matches!(d, DecisionAction::CreateFilteredIndex);
+                                    let ddl_to_run = match (
+                                        proposal.index_name.as_deref(),
+                                        proposal.column.as_deref(),
+                                    ) {
+                                        (Some(idx_name), Some(column))
+                                            if !proposal.schema.is_empty() =>
+                                        {
+                                            ddl::build_create_index_ddl(
+                                                &proposal.schema,
+                                                idx_name,
+                                                &proposal.table,
+                                                column,
+                                                filtered,
+                                            )
+                                        }
+                                        _ => proposal.ddl.clone(),
+                                    };
                                     if let Err(e) = ddl::execute_create_index(
                                         &self.pool,
-                                        &proposal.ddl,
+                                        &ddl_to_run,
                                         &self.log_writer,
                                         Some(confidence),
                                         Some(proposal.reason.clone()),

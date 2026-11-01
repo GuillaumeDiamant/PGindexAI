@@ -379,6 +379,30 @@ pub async fn execute_reindex(
     }
 }
 
+/// Construire le DDL de création d'index (CONCURRENTLY, non bloquant),
+/// avec ou sans prédicat de filtre (index filtré `WHERE col IS NOT NULL`).
+///
+/// Utilisé à la GÉNÉRATION de la proposition ET à son APPLICATION : le choix
+/// de LAYA (standard vs filtré) détermine la variante exécutée — pas la
+/// variante simplement générée à l'analyse (les deux chemins doivent
+/// produire des DDL strictement identiques).
+pub fn build_create_index_ddl(
+    schema: &str,
+    index_name: &str,
+    table: &str,
+    column: &str,
+    filtered: bool,
+) -> String {
+    let base = format!(
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS {schema}.{index_name} ON {schema}.{table} ({column})"
+    );
+    if filtered {
+        format!("{base} WHERE {column} IS NOT NULL")
+    } else {
+        base
+    }
+}
+
 /// Extraire le nom de l'index depuis un DDL (CREATE/DROP/REINDEX)
 /// Gère : CREATE INDEX [CONCURRENTLY] [IF NOT EXISTS] [schema.]name ON …,
 ///        DROP INDEX [IF EXISTS] [schema.]name,
@@ -587,5 +611,36 @@ mod tests {
         assert!(!is_concurrent_ddl("CREATE INDEX x ON t (c)"));
         assert!(!is_concurrent_ddl("DROP INDEX x"));
         assert!(!is_concurrent_ddl("REINDEX INDEX x"));
+    }
+
+    #[test]
+    fn test_build_create_index_ddl_standard() {
+        let ddl = build_create_index_ddl("public", "idx_orders_status", "orders", "status", false);
+        assert_eq!(
+            ddl,
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS public.idx_orders_status ON public.orders (status)"
+        );
+    }
+
+    #[test]
+    fn test_build_create_index_ddl_filtered() {
+        let ddl = build_create_index_ddl("public", "idx_orders_status", "orders", "status", true);
+        assert_eq!(
+            ddl,
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS public.idx_orders_status ON public.orders (status) WHERE status IS NOT NULL"
+        );
+    }
+
+    #[test]
+    fn test_build_create_index_ddl_roundtrip_extraction() {
+        // Les DDL produits par le constructeur restent extraisables (nom + schéma)
+        for filtered in [false, true] {
+            let ddl = build_create_index_ddl("billing", "idx_events_ts", "events", "ts", filtered);
+            assert_eq!(extract_index_name(&ddl), Some("idx_events_ts".to_string()));
+            assert_eq!(extract_schema_from_ddl(&ddl), "billing");
+            if filtered {
+                assert!(is_concurrent_ddl(&ddl));
+            }
+        }
     }
 }

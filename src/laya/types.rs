@@ -54,7 +54,7 @@ pub struct Usage {
 // Types internes du daemon
 // ─────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DecisionAction {
     Ignore,
     CreateIndex,
@@ -87,6 +87,16 @@ pub struct Proposal {
     pub reason: String,
     pub confidence: f64,
     pub table: String,
+    /// Schéma de la table concernée (rempli pour CREATE INDEX).
+    #[serde(default)]
+    pub schema: String,
+    /// Nom de l'index (rempli pour CREATE INDEX ; pour DROP/REINDEX il est
+    /// déjà porté par `ddl`).
+    #[serde(default)]
+    pub index_name: Option<String>,
+    /// Colonne indexée (rempli pour CREATE INDEX).
+    #[serde(default)]
+    pub column: Option<String>,
 }
 
 fn serialize_action<S>(action: &DecisionAction, serializer: S) -> Result<S::Ok, S::Error>
