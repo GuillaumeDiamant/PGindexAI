@@ -63,6 +63,12 @@ impl Config {
         if t.min_sargable_rows == 0 {
             errs.push("thresholds.min_sargable_rows doit être >= 1".to_string());
         }
+        if t.ddl_timeout_seconds > 86_400 {
+            errs.push(
+                "thresholds.ddl_timeout_seconds doit être <= 86400 (1 jour ; 0 = illimité)"
+                    .to_string(),
+            );
+        }
 
         if !(1..=512).contains(&self.pg_pool.max_size) {
             errs.push(
@@ -203,6 +209,12 @@ pub struct Thresholds {
     /// Budget de propositions par cycle (limite SQL + troncature totale).
     #[serde(default = "default_max_proposals")]
     pub max_proposals_per_cycle: u32,
+    /// Timeout (secondes) des DDL longs (CREATE/REINDEX CONCURRENTLY).
+    /// 0 = illimité. Défaut : 1800 (30 min).
+    /// NB : un timeout TROP COURT sur une grosse table créerait une boucle
+    /// build→annulé→retry — garder une valeur généreuse.
+    #[serde(default = "default_ddl_timeout")]
+    pub ddl_timeout_seconds: u64,
 }
 
 /// NB : `Default` est implémenté MANUELLEMENT (pas `derive`) : quand la
@@ -352,6 +364,9 @@ fn default_min_confidence() -> f64 {
 fn default_max_proposals() -> u32 {
     20
 }
+fn default_ddl_timeout() -> u64 {
+    1_800
+} // 30 min
 fn default_log_level() -> String {
     "info".to_string()
 }
@@ -568,6 +583,10 @@ thresholds: {}
         assert_eq!(cfg.index_logging.verbosity, "minimal");
         assert_eq!(cfg.index_logging.max_file_size_bytes, 10 * 1024 * 1024);
         assert_eq!(cfg.index_logging.max_files, 5);
+
+        // `thresholds: {}` → les defaults serde par champ doivent s'appliquer
+        assert_eq!(cfg.thresholds.cycle_seconds, 60);
+        assert_eq!(cfg.thresholds.ddl_timeout_seconds, 1800);
 
         // Cohérence : `Default::default()` = mêmes valeurs que le parse serde
         assert_eq!(LoggingConfig::default().level, cfg.logging.level);

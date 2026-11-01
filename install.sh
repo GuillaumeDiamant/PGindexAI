@@ -93,6 +93,21 @@ run() {
     fi
 }
 
+# psql_stdin "SQL" [options psql...] — exécute la SQL via STDIN, pas en
+# argument de commande : une valeur sensible (mot de passe) ne transite
+# JAMAIS par la liste de processus locale (`ps`).
+# (L'ancien `psql -c "…PASSWORD '…'"` restait visible pendant l'exécution ;
+# le dry-run l'affichait même à l'écran/log.)
+psql_stdin() {
+    local sql="$1"
+    shift
+    if $DRY_RUN; then
+        echo -e "${CYAN}[dry-run]${NC} sudo -u $POSTGRES_USER psql -q -v ON_ERROR_STOP=1 $* [SQL via stdin]"
+    else
+        printf '%s\n' "$sql" | sudo -u "$POSTGRES_USER" psql -q -v ON_ERROR_STOP=1 "$@"
+    fi
+}
+
 # ask "question" [défaut Y|N] — lit /dev/tty (fonctionne même via curl | bash),
 # repli sur la valeur par défaut si aucun terminal contrôleur n'est disponible.
 # NB : ne JAMAIS rediriger le stderr de `read` : `read -p` écrit le prompt dessus,
@@ -280,20 +295,20 @@ setup_role() {
             if [[ -n "$existing_pw" ]]; then
                 PGINDEXAI_PW="$existing_pw"
                 pw_sql="${existing_pw//$q/$q$q}"   # échappement SQL : ' → ''
-                run sudo -u "$POSTGRES_USER" psql -qc "ALTER ROLE pgindexai PASSWORD '$pw_sql'"
+                psql_stdin "ALTER ROLE pgindexai PASSWORD '$pw_sql'"
                 info "Mot de passe existant conservé (re-appliqué au rôle)"
             fi
         fi
     else
         PGINDEXAI_PW="$(openssl rand -hex 16)"
-        run sudo -u "$POSTGRES_USER" psql -qc "CREATE ROLE pgindexai LOGIN PASSWORD '${PGINDEXAI_PW}'"
+        psql_stdin "CREATE ROLE pgindexai LOGIN PASSWORD '${PGINDEXAI_PW}'"
         info "Rôle 'pgindexai' créé (mot de passe généré — conservé dans la config 0600)"
     fi
 
     if [[ -z "$PGINDEXAI_PW" ]]; then
         # Rôle existant sans mot de passe connu : en générer un et l'imposer
         PGINDEXAI_PW="$(openssl rand -hex 16)"
-        run sudo -u "$POSTGRES_USER" psql -qc "ALTER ROLE pgindexai PASSWORD '${PGINDEXAI_PW}'"
+        psql_stdin "ALTER ROLE pgindexai PASSWORD '${PGINDEXAI_PW}'"
         warn "Mot de passe régénéré pour 'pgindexai' (aucun trouvé dans la config existante)"
     fi
 
@@ -504,7 +519,10 @@ setup_config() {
     # impose ssl_mode=disable sur socket (src/db/mod.rs : le TLS se négocie
     # sur TCP avec un nom d'hôte, pas sur un IPC local). ssl=on côté serveur
     # (snakeoil par défaut) n'y change rien pour une connexion IPC locale.
-    # Pour un déploiement TCP distant : host 127.0.0.1 + require/verify-full.
+    # Pour un déploiement TCP distant : host = NOM D'HÔTE DNS + ssl_mode
+    # require (ou verify-ca/verify-full) — rustls vérifie chaîne + nom
+    # d'hôte au handshake et REJETTE les littéraux IP (ServerName est
+    # DNS-only) : « 127.0.0.1 » ne marcherait PAS (src/db/mod.rs).
     local ssl_mode="disable"
 
     run mkdir -p "$CONFIG_DIR"

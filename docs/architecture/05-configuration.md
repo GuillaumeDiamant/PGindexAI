@@ -60,6 +60,7 @@ thresholds:
   min_sargable_rows: 100           # Min. d'exécutions (pg_stat_statements.calls)
   min_confidence: 0.7              # Confiance min. de Laya pour APPLY (0.0..=1.0)
   max_proposals_per_cycle: 20      # Budget de propositions par cycle (1..=1000)
+  ddl_timeout_seconds: 1800        # Timeout DDL longs CONCURRENTLY (0 = illimité, 0..=86400)
 
 # ─────────────────────────────────────────────
 # Périmètre d'analyse (multi-schéma)
@@ -131,6 +132,7 @@ index_logging:
 | `thresholds.min_sargable_rows` | `100` | `>= 1` |
 | `thresholds.min_confidence` | `0.7` | `0.0..=1.0` |
 | `thresholds.max_proposals_per_cycle` | `20` | `1..=1000` |
+| `thresholds.ddl_timeout_seconds` | `1800` (30 min) | `0..=86400` (0 = illimité) |
 | `analysis.schemas` | `[]` (tous les schémas non-système) | liste |
 | `pg_pool.max_size` | `16` | `1..=512` |
 | `pg_pool.wait_timeout_ms` | `30000` | `100..=600000` |
@@ -180,6 +182,7 @@ Le client utilise **rustls** (`tokio-postgres-rustls`). Conséquences :
 | `thresholds.unused_minutes` | **Fenêtre minimale d'observation** : si le serveur PG tourne depuis moins de ce délai, l'analyse « index inutilisés » est sautée (les compteurs `pg_stat_*` sont remis à zéro au redémarrage) |
 | `thresholds.min_confidence` | Seuil de confiance Laya ; **en dessous, la proposition est ignorée (aucun fallback heuristique)** |
 | `thresholds.max_proposals_per_cycle` | Chaque détecteur est borné en SQL (`LIMIT`) **et** la liste totale est tronquée à ce budget avec un avertissement (les propositions écartées seront re-détectées au cycle suivant) |
+| `thresholds.ddl_timeout_seconds` | Borne la durée des builds `CONCURRENTLY` (`statement_timeout` par session, remis à zéro après) ; `0` = illimité. Garder généreux : un timeout trop court sur grosse table créerait une boucle build→annulé→retry |
 | clé inconnue dans la config | **Avertissement** au démarrage (ex: `dashboard:`, `idle_seconds:`) — la clé est ignorée mais signalée |
 
 ## 7. Validation
