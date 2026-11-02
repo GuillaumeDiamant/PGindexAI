@@ -1,33 +1,33 @@
-# 01 — Vue d'ensemble du système
+# 01 — System overview
 
-> **Nouveautés (refonte architecturale)** :
-> 1. État de dégradation explicite quand `pg_stat_statements` est absent
-> 2. Politique **« sans fallback »** : Laya injoignable → aucune DDL appliquée
-> 3. Détection SARGable par **vrai parseur SQL** (sqlparser-rs, AST)
-> 4. Exécution DDL **en ligne** (`CONCURRENTLY`) + validation post-DDL et
->    nettoyage des index INVALIDE
-> 5. **Densité cible par type de colonne** (estimation de taille des index)
-> 6. **Convention de nommage explicite** + validation de longueur (63 octets)
-> 7. **Pool de connexions dimensionné** (taille + timeout configurables)
-> 8. **Health check profond** de Laya (payload de test réel, réponse validée)
-> 9. **Support multi-schéma** (périmètre d'analyse configurable)
-> 10. **Seuil temporel** sur les index « inutilisés » (fenêtre d'observation)
+> **New features (architectural rework)**:
+> 1. Explicit degraded state when `pg_stat_statements` is absent
+> 2. **"No fallback"** policy: Laya unreachable → no DDL applied
+> 3. SARGable detection via a **real SQL parser** (sqlparser-rs, AST)
+> 4. **Online** DDL execution (`CONCURRENTLY`) + post-DDL validation and
+>    cleanup of INVALID indexes
+> 5. **Target density per column type** (index size estimation)
+> 6. **Explicit naming convention** + length validation (63 bytes)
+> 7. **Sized connection pool** (configurable size + timeout)
+> 8. Laya **deep health check** (real test payload, validated response)
+> 9. **Multi-schema support** (configurable analysis scope)
+> 10. **Time threshold** on "unused" indexes (observation window)
 >
-> **Renforcement sécurité (audit)** :
-> 11. **TLS vérifié** (rustls) sur la connexion PostgreSQL + **rôle PG dédié
->     non-superutilisateur** (`pgindexai`)
-> 12. Installateur **durci** (`install.sh` : sans `eval`, pg_hba ciblée, config
->     0600, merge `shared_preload_libraries`) + mode `--dry-run` +
->     `uninstall.sh` idempotent (`--purge`, `--clean-legacy`)
-> 13. **Plafond de propositions** par cycle, rotation des logs, **CI**
->     (fmt / clippy / test / shellcheck), validation de config avec
->     avertissements clés inconnues
+> **Security hardening (audit)**:
+> 11. **Validated TLS** (rustls) on the PostgreSQL connection + **dedicated
+>     non-superuser PG role** (`pgindexai`)
+> 12. **Hardened** installer (`install.sh`: no `eval`, targeted pg_hba, config
+>     0600, `shared_preload_libraries` merge) + `--dry-run` mode +
+>     idempotent `uninstall.sh` (`--purge`, `--clean-legacy`)
+> 13. **Proposal cap** per cycle, log rotation, **CI**
+>     (fmt / clippy / test / shellcheck), config validation with
+>     unknown-key warnings
 
-## 1. Objectif
+## 1. Objective
 
-PGindexAI est un **daemon autonome** qui surveille en continu une base PostgreSQL, détecte les anomalies d'index (inutilisés, fragmentés, manquants) et propose des actions correctives **exclusivement** validées par le moteur de décision Laya (IA) — **aucune décision n'est prise à sa place** (pas de fallback heuristique).
+PGindexAI is a **standalone daemon** that continuously monitors a PostgreSQL database, detects index anomalies (unused, fragmented, missing) and proposes corrective actions validated **exclusively** by the Laya (AI) decision engine — **no decision is made on its behalf** (no heuristic fallback).
 
-## 2. Architecture globale
+## 2. Global architecture
 
 ```
 ┌───────────────────────────────────────────────────────────────────────────┐
@@ -36,207 +36,207 @@ PGindexAI est un **daemon autonome** qui surveille en continu une base PostgreSQ
 │  ┌────────────────┐     ┌─────────────────────┐     ┌──────────────────┐ │
 │  │    Analyzer    │────▶│     LayaClient      │────▶│   index_log      │ │
 │  │                │     │  build_payload()    │     │   Writer         │ │
-│  │  3 détecteurs  │     │  deep_health()      │     │  (JSON file)     │ │
+│  │  3 detectors   │     │  deep_health()      │     │  (JSON file)     │ │
 │  │ + DaemonState  │     │  decision()         │     │                  │ │
 │  └───────┬────────┘     │  /v1/systemone      │     └──────────────────┘ │
 │          │              └──────────┬──────────┘                          │
 │          │                         │                                      │
-│          │              health check PROFOND avant chaque lot             │
-│          │              Laya injoignable → AUCUNE DDL (no fallback)       │
+│          │              deep health check before each batch               │
+│          │              Laya unreachable → NO DDL (no fallback)           │
 │  ┌───────▼─────────────────────────────────────────────────────────────┐ │
-│  │   DDL Engine (en ligne : CONCURRENTLY + validation post-DDL)        │ │
+│  │   DDL Engine (online: CONCURRENTLY + post-DDL validation)           │ │
 │  │   CREATE / DROP / REINDEX ─────────────────────────▶  PostgreSQL    │ │
 │  └─────────────────────────────────────────────────────────────────────┘ │
 │                                                                           │
-│  Transverses : state.rs (Healthy/Degraded) · naming.rs (idx_<t>_<c>,     │
-│  63 octets) · config (multi-schéma, pool, densités par type)             │
+│  Cross-cutting: state.rs (Healthy/Degraded) · naming.rs (idx_<t>_<c>,    │
+│  63 bytes) · config (multi-schema, pool, densities by type)              │
 └───────────────────────────────────────────────────────────────────────────┘
                                  │
                        HTTP POST ▼
                  ┌────────────────────────────┐
-                 │      Serveur Laya (IA)      │
+                 │      Laya Server (AI)       │
                  │   http://127.0.0.1:8080     │
                  │   /v1/systemone             │
                  └────────────────────────────┘
 ```
 
-## 3. Composants
+## 3. Components
 
-| Composant | Module | Rôle |
+| Component | Module | Role |
 |-----------|--------|------|
-| **Analyzer** | `src/analyzer.rs` | Moteur central — orchestre les 3 détecteurs, porte le `DaemonState`, applique la politique sans fallback |
-| **DaemonState** | `src/state.rs` | État `Healthy` / `Degraded` (pg_stat_statements) — en dégradé, la détection d'index manquants est désactivée |
-| **Naming** | `src/naming.rs` | Convention `idx_<table>_<col>`, validation d'identifiant, limite 63 octets, hash court (FNV-1a base 36) |
-| **Detector : Unused Indexes** | `src/db/queries.rs::get_unused_indexes` | Index jamais scannés **depuis le redémarrage** (`idx_scan = 0`, `idx_tup_read = 0`) + gate fenêtre d'observation |
-| **Detector : Fragmentation** | `src/db/queries.rs::get_fragmented_indexes` | Index **B-tree uniquement** ; score heuristique (dead 50 %, mod 30 %, bonus non-scanné 20 %) |
-| **Detector : SARGable** | `src/db/queries.rs::get_missing_sargable_indexes` | Vrai parseur AST (sqlparser) + types réels (`information_schema`) + `null_frac` (`pg_stats`) + densités cibles |
-| **LayaClient** | `src/laya/mod.rs` | Client HTTP — **`deep_health()`** (payload de test réel, réponse validée), `decision()`, `build_payload()` |
-| **DDL Engine** | `src/ddl.rs` | Exécution **en ligne** : `CONCURRENTLY` en auto-commit (CREATE/REINDEX), DROP en BEGIN/COMMIT, validation post-DDL + nettoyage des index INVALIDE |
-| **IndexLog Writer** | `src/index_log.rs` | Historisation structurée des opérations (JSON, rotation de fichiers) |
-| **Config** | `src/config.rs` | Chargement YAML — multi-schéma, pool, densités par type, seuils |
-| **db Pool** | `src/db/mod.rs` | Pool deadpool-postgres — **taille max + timeout d'attente configurables** + **TLS rustls** (chaîne + hostname toujours vérifiés, racines web PKI + PEM optionnel) |
+| **Analyzer** | `src/analyzer.rs` | Central engine — orchestrates the 3 detectors, holds the `DaemonState`, applies the no-fallback policy |
+| **DaemonState** | `src/state.rs` | `Healthy` / `Degraded` state (pg_stat_statements) — when degraded, missing-index detection is disabled |
+| **Naming** | `src/naming.rs` | `idx_<table>_<col>` convention, identifier validation, 63-byte limit, short hash (FNV-1a base 36) |
+| **Detector : Unused Indexes** | `src/db/queries.rs::get_unused_indexes` | Indexes never scanned **since the last restart** (`idx_scan = 0`, `idx_tup_read = 0`) + observation-window gate |
+| **Detector : Fragmentation** | `src/db/queries.rs::get_fragmented_indexes` | **B-tree indexes only**; heuristic score (dead 50 %, mod 30 %, unscanned bonus 20 %) |
+| **Detector : SARGable** | `src/db/queries.rs::get_missing_sargable_indexes` | Real AST parser (sqlparser) + real types (`information_schema`) + `null_frac` (`pg_stats`) + target densities |
+| **LayaClient** | `src/laya/mod.rs` | HTTP client — **`deep_health()`** (real test payload, validated response), `decision()`, `build_payload()` |
+| **DDL Engine** | `src/ddl.rs` | **Online** execution: `CONCURRENTLY` in auto-commit (CREATE/REINDEX), DROP in BEGIN/COMMIT, post-DDL validation + cleanup of INVALID indexes |
+| **IndexLog Writer** | `src/index_log.rs` | Structured history of operations (JSON, file rotation) |
+| **Config** | `src/config.rs` | YAML loading — multi-schema, pool, densities by type, thresholds |
+| **db Pool** | `src/db/mod.rs` | deadpool-postgres pool — **configurable max size + wait timeout** + **rustls TLS** (chain + hostname always validated, web PKI roots + optional PEM) |
 
-## 4. Cycle de vie
+## 4. Lifecycle
 
-### Démarrage
+### Startup
 
 ```
 main()
   ├── parse CLI args (--config)
   ├── load config (YAML)
-  ├── init tracing (JSON ou plain)
-  ├── create PostgreSQL pool (taille + timeout configurables)
+  ├── init tracing (JSON or plain)
+  ├── create PostgreSQL pool (configurable size + timeout)
   ├── check pg_stat_statements  →  DaemonState (Healthy | Degraded)
-  │     └── si absent : WARN "DEGRADED mode" (détection d'index manquants OFF)
+  │     └── if absent: WARN "DEGRADED mode" (missing-index detection OFF)
   ├── create LayaClient
-  ├── deep_health()  (payload de test réel envoyé à /v1/systemone)
-  │     └── si FAILED : WARN "Decisions will be SKIPPED (no fallback)"
+  ├── deep_health()  (real test payload sent to /v1/systemone)
+  │     └── if FAILED: WARN "Decisions will be SKIPPED (no fallback)"
   └── match command:
         ├── daemon → loop { analyze_cycle() → apply_proposals() → sleep(cycle_seconds) }
         └── run   → analyze_cycle() → apply_proposals() → exit
 ```
 
-### Cycle d'analyse (itératif en daemon)
+### Analysis cycle (iterative in daemon)
 
 ```
-1. analyze_unused()                     [si actions.drop_unused]
-    ├── observation_window_ok()         ← NOUVEAU (fix #10)
-    │     └── uptime serveur < unused_minutes → SAUT (les compteurs sont
-    │         remis à zéro au redémarrage ; pas de fausse détection)
+1. analyze_unused()                     [if actions.drop_unused]
+    ├── observation_window_ok()         ← NEW (fix #10)
+    │     └── server uptime < unused_minutes → SKIP (the counters are
+    │         reset on restart; no false detection)
     ├── get_unused_indexes()  → pg_stat_user_indexes WHERE idx_scan = 0 AND idx_tup_read = 0
     └── for each unused index:
          └── Proposal { action: DropIndex,
                         ddl: "DROP INDEX IF EXISTS schema.idx",
-                        reason: "… never scanned since <redémarrage>. Size: N bytes." }
+                        reason: "… never scanned since <restart>. Size: N bytes." }
 
-2. analyze_fragmentation()              [si actions.rebuild_fragmented]
+2. analyze_fragmentation()              [if actions.rebuild_fragmented]
     ├── get_fragmented_indexes()  → pg_stat_user_indexes + pg_class + pg_am (btree) + pg_stat_user_tables
-    └── for each index (score ≥ fragmentation_pct, défaut 70%):
+    └── for each index (score ≥ fragmentation_pct, default 70%):
          └── Proposal { action: RebuildIndex, ddl: "REINDEX INDEX CONCURRENTLY schema.idx",
                         reason: "fragmentation at X% (threshold: Y%)" }
 
-3. analyze_missing_sargable()           [DÉSACTIVÉ si DaemonState::Degraded]
+3. analyze_missing_sargable()           [DISABLED if DaemonState::Degraded]
     ├── get_missing_sargable_indexes(schemas)
-    │     ├── pg_stat_statements top 50 (calls > 10, DDL et pg_* exclus)
-    │     ├── parse_query_for_sargable()  ← NOUVEAU : AST sqlparser (fix #3)
-    │     ├── périmètre multi-schéma (fix #9) + exclusion tables pg_*
-    │     ├── filtre colonnes déjà couvertes (pg_indexes)
-    │     └── fetch_column_metadata() : type réel, nullabilité, null_frac (fix #5)
+    │     ├── pg_stat_statements top 50 (calls > 10, DDL and pg_* excluded)
+    │     ├── parse_query_for_sargable()  ← NEW: sqlparser AST (fix #3)
+    │     ├── multi-schema scope (fix #9) + exclusion of pg_* tables
+    │     ├── filter columns already covered (pg_indexes)
+    │     └── fetch_column_metadata(): real type, nullability, null_frac (fix #5)
     └── for each uncovered column (calls ≥ min_sargable_rows):
-         ├── naming::generate_index_name()  ← NOUVEAU (fix #6)
-         ├── densité par bucket de type → taille estimée (fix #5)
-         ├── null_frac > 0.10 → "WHERE col IS NOT NULL" (index filtré)
+         ├── naming::generate_index_name()  ← NEW (fix #6)
+         ├── density per type bucket → estimated size (fix #5)
+         ├── null_frac > 0.10 → "WHERE col IS NOT NULL" (filtered index)
          └── Proposal { action: CreateIndex | CreateFilteredIndex,
                         ddl: "CREATE INDEX CONCURRENTLY IF NOT EXISTS schema.idx ON …",
                         reason: "SARGable query … type: …, density …, est. size …" }
 
 4. apply_proposals()
-    ├── deep_health()  ← NOUVEAU (fix #8) : 1 seul appel par lot
-    │     └── FAILED → TOUTES les propositions SKIPPED (fix #2 : no fallback)
+    ├── deep_health()  ← NEW (fix #8): 1 call per batch
+    │     └── FAILED → ALL proposals SKIPPED (fix #2: no fallback)
     ├── for each proposal:
-    │   ├── build_payload(reason, criteria)  (critères dépendent du type)
+    │   ├── build_payload(reason, criteria)  (criteria depend on the type)
     │   ├── laya.decision(payload) → { choice, confidence }
-    │   ├── confidence ≥ min_confidence (0.7) ?  sinon skip
-    │   ├── choice appliqué ?  sinon skip (debug)
-    │   ├── action flag enabled (actions.*) ?  sinon skip (warn)
+    │   ├── confidence ≥ min_confidence (0.7)?  else skip
+    │   ├── choice applied?  else skip (debug)
+    │   ├── action flag enabled (actions.*)?  else skip (warn)
     │   └── match proposal.action:
     │         ├── DropIndex            → ddl::execute_drop_index()
     │         ├── RebuildIndex         → ddl::execute_reindex()
     │         └── CreateIndex*         → ddl::execute_create_index()
-    │              (exécution en ligne : CONCURRENTLY, fix #4)
+    │              (online execution: CONCURRENTLY, fix #4)
     └── return applied proposals
 ```
 
-## 5. Détection des anomalies
+## 5. Anomaly detection
 
-### 5.1 Index inutilisés
+### 5.1 Unused indexes
 
 **Source** : `pg_stat_user_indexes` + `pg_index`
 
-**Gate préalable (nouveau)** : l'uptime du serveur doit être ≥ `thresholds.unused_minutes`,
-sinon l'analyse est sautée (les compteurs `pg_stat_*` sont remis à zéro au redémarrage).
+**Prerequisite gate (new)**: the server uptime must be ≥ `thresholds.unused_minutes`,
+otherwise the analysis is skipped (the `pg_stat_*` counters are reset on restart).
 
-**Critères** :
-- `idx_scan = 0` ET `idx_tup_read = 0` (jamais scanné **depuis le redémarrage**)
-- `indisvalid = true` (index valide)
-- `indisprimary = false` (pas une clé primaire)
-- `indisunique = false` (pas un index unique)
+**Criteria**:
+- `idx_scan = 0` AND `idx_tup_read = 0` (never scanned **since the last restart**)
+- `indisvalid = true` (valid index)
+- `indisprimary = false` (not a primary key)
+- `indisunique = false` (not a unique index)
 
-**Action proposée** : `DROP INDEX IF EXISTS schema.index`
+**Proposed action**: `DROP INDEX IF EXISTS schema.index`
 
-Le contexte envoyé à Laya inclut la date du redémarrage (`installed_at`) et la
-durée minimale d'observation — le moteur de décision peut pondérer sa confiance
-sur la solidité de l'évidence.
+The context sent to Laya includes the restart date (`installed_at`) and the
+minimum observation duration — the decision engine can weight its confidence
+on the strength of the evidence.
 
-### 5.2 Index fragmentés
+### 5.2 Fragmented indexes
 
 **Source** : `pg_stat_user_indexes` + `pg_index` + `pg_class` + `pg_am` + `pg_stat_user_tables`
 
-**Périmètre (nouveau)** : index **B-tree uniquement** (`amname = 'btree'`) —
-les index GiST/GIN/SP-GiST/BRIN n'ont pas la même notion de fragmentation.
+**Scope (new)**: **B-tree indexes only** (`amname = 'btree'`) —
+GiST/GIN/SP-GiST/BRIN indexes do not have the same notion of fragmentation.
 
-**Score heuristique** (multi-critères pondéré) :
+**Heuristic score** (weighted multi-criteria):
 
-| Critère | Pondération |
+| Criterion | Weight |
 |---------|-------------|
 | `n_dead_tup / (n_live_tup + n_dead_tup)` | 50 % |
-| `n_mod_since_analyze / n_live_tup` (bornée à 1.0) | 30 % |
-| Bonus : index volumineux non scanné (`idx_scan = 0` ET `relpages > 100`) | 20 % |
+| `n_mod_since_analyze / n_live_tup` (capped at 1.0) | 30 % |
+| Bonus: large unscanned index (`idx_scan = 0` AND `relpages > 100`) | 20 % |
 
-**Seuil de décision** : `fragmentation_pct ≥ thresholds.fragmentation_pct` (défaut 70 %)
+**Decision threshold**: `fragmentation_pct ≥ thresholds.fragmentation_pct` (default 70 %)
 
-**avg_leaf_density** : `index_tuples / index_pages / 100` borné à `[0, 1]`
-(proxy de la densité tuples/page ; B-tree PostgreSQL cible ~90 % de remplissage)
+**avg_leaf_density**: `index_tuples / index_pages / 100` bounded to `[0, 1]`
+(proxy for tuples/page density; PostgreSQL B-tree targets ~90 % fill)
 
-**Action proposée** : `REINDEX INDEX CONCURRENTLY schema.index`
+**Proposed action**: `REINDEX INDEX CONCURRENTLY schema.index`
 
-### 5.3 Requêtes SARGable sans index
+### 5.3 SARGable queries without index
 
-**Source** : `pg_stat_statements` + parseur **sqlparser-rs** (nouveau) + `information_schema.columns` + `pg_stats` + `pg_class`
+**Source** : `pg_stat_statements` + **sqlparser-rs** parser (new) + `information_schema.columns` + `pg_stats` + `pg_class`
 
-**Filtres** :
-- `calls > 10` (minimum observé)
-- `calls ≥ min_sargable_rows` (défaut 100)
-- Exclusion DDL, requêtes système, catalogues `pg_*`
-- **Périmètre multi-schéma** : `analysis.schemas` non vide → seules ces tables
+**Filters**:
+- `calls > 10` (minimum observed)
+- `calls ≥ min_sargable_rows` (default 100)
+- Exclusion of DDL, system queries, `pg_*` catalogs
+- **Multi-schema scope**: non-empty `analysis.schemas` → only these tables
 
-**SARGable détecté (AST)** :
-- `col = v`, `col > v`, `col < v`, `col >= v`, `col <= v` (valeur non-colonne)
-- `col IN (v1, …)` (non-négé), `col BETWEEN a AND b` (non-négé)
+**SARGable detected (AST)**:
+- `col = v`, `col > v`, `col < v`, `col >= v`, `col <= v` (value not a column)
+- `col IN (v1, …)` (non-negated), `col BETWEEN a AND b` (non-negated)
 - `col IS [NOT] NULL`
-- `col LIKE 'pref…%'` / `ILIKE` (motif **préfixe** uniquement)
-- `AND` / `OR` / parenthèses imbriquées (parcours récursif)
+- `col LIKE 'pref…%'` / `ILIKE` (**prefix** pattern only)
+- `AND` / `OR` / nested parentheses (recursive traversal)
 
-**Rejeté (non-SARGable)** :
+**Rejected (non-SARGable)**:
 - `NOT ( … )`, `IS [NOT] DISTINCT FROM`
 - `col NOT IN (…)`, `col NOT BETWEEN …`, `col NOT LIKE …`
-- Fonctions sur la colonne (`LOWER(col)`, `UPPER(col)`, `CAST(col …)`)
-- Comparaison colonne-contre-colonne
-- `LIKE`/`ILIKE` avec joker en tête ou motif non littéral
+- Functions on the column (`LOWER(col)`, `UPPER(col)`, `CAST(col …)`)
+- Column-to-column comparison
+- `LIKE`/`ILIKE` with a leading wildcard or non-literal pattern
 
-**Enrichissement (nouveau)** : pour chaque colonne candidate, le daemon charge
-le **type réel** (`information_schema.columns`), la **nullabilité**, la
-**fraction de NULL** (`pg_stats.null_frac`), et la **cardinalité** de la table
-(`pg_class.reltuples`) pour estimer la taille du futur index via la **densité
-cible du bucket de type** (`density_by_type.*`).
+**Enrichment (new)**: for each candidate column, the daemon loads
+the **real type** (`information_schema.columns`), the **nullability**, the
+**NULL fraction** (`pg_stats.null_frac`), and the table **cardinality**
+(`pg_class.reltuples`) to estimate the size of the future index via the
+**target density of the type bucket** (`density_by_type.*`).
 
-**Index existant** : vérification via `pg_indexes` — les colonnes déjà couvertes
-(1re position) sont filtrées.
+**Existing index**: check via `pg_indexes` — columns already covered
+(1st position) are filtered.
 
-**Action proposée** :
-- Standard : `CREATE INDEX CONCURRENTLY IF NOT EXISTS schema.idx_table_col ON schema.table(col)`
-- Filtré (si `null_frac > 0.10`) : `… WHERE col IS NOT NULL`
-- Nom d'index : `idx_<table>_<col>` validé (≤ 63 octets, hash court si nécessaire)
+**Proposed action**:
+- Standard: `CREATE INDEX CONCURRENTLY IF NOT EXISTS schema.idx_table_col ON schema.table(col)`
+- Filtered (if `null_frac > 0.10`): `… WHERE col IS NOT NULL`
+- Index name: `idx_<table>_<col>` validated (≤ 63 bytes, short hash if needed)
 
-## 6. Décision Laya
+## 6. Laya decision
 
-Avant chaque lot : **health check profond** (payload de test réel envoyé à
-`/v1/systemone`, réponse validée structurellement). S'il échoue, **toutes**
-les propositions du lot sont sautées — le daemon ne décide jamais à la place
-de Laya (politique « sans fallback »).
+Before each batch: **deep health check** (a real test payload sent to
+`/v1/systemone`, structurally validated response). If it fails, **all**
+proposals in the batch are skipped — the daemon never decides on behalf
+of Laya ("no fallback" policy).
 
-Pour chaque proposition, le daemon envoie un payload **spécialisé** (le daemon
-sait déjà l'action qu'il propose ; Laya arbitre appliquer / ignorer) :
+For each proposal, the daemon sends a **specialized** payload (the daemon
+already knows the action it proposes; Laya arbitrates apply / ignore):
 
 ```json
 {
@@ -254,13 +254,13 @@ sait déjà l'action qu'il propose ; Laya arbitre appliquer / ignorer) :
 }
 ```
 
-| Proposition | `"0"` | `"1"` | `"2"` |
+| Proposal | `"0"` | `"1"` | `"2"` |
 |-------------|-------|-------|-------|
-| `DROP INDEX` | Keep (ignoré) | **APPLY** | — |
-| `REINDEX` | Keep (ignoré) | **APPLY** | — |
-| `CREATE INDEX` | Ignore | **APPLY** (standard) | **APPLY** (filtré) |
+| `DROP INDEX` | Keep (ignored) | **APPLY** | — |
+| `REINDEX` | Keep (ignored) | **APPLY** | — |
+| `CREATE INDEX` | Ignore | **APPLY** (standard) | **APPLY** (filtered) |
 
-Réponse Laya :
+Laya response:
 
 ```json
 {
@@ -277,25 +277,25 @@ Réponse Laya :
 }
 ```
 
-**Application conditionnelle** :
-- `confidence < min_confidence` (défaut 0.7) → skip (aucune heuristique)
-- `choice` = APPLY pour ce type de proposition → exécution DDL en ligne (CONCURRENTLY)
-- `choice` = Keep/Ignore → log uniquement
-- `choice` inattendu pour ce type de proposition → `Ignore` (skip, log)
+**Conditional application**:
+- `confidence < min_confidence` (default 0.7) → skip (no heuristic)
+- `choice` = APPLY for this proposal type → online DDL execution (CONCURRENTLY)
+- `choice` = Keep/Ignore → log only
+- Unexpected `choice` for this proposal type → `Ignore` (skip, log)
 
-**Sécurité** : chaque action DDL est couplée à un flag `actions.*` dans la
-config. Exemple : `drop_unused: false` bloque tout DROP, `create_index: true`
-autorise les CREATE.
+**Security**: each DDL action is coupled to an `actions.*` flag in the
+config. Example: `drop_unused: false` blocks any DROP, `create_index: true`
+allows CREATEs.
 
 ## 7. Logging
 
 ### 7.1 Daemon logs (tracing)
 
-Format JSON par défaut, niveau configurable via `RUST_LOG` ou `logging.level`.
+JSON format by default, level configurable via `RUST_LOG` or `logging.level`.
 
-### 7.2 Index operation logs (fichier)
+### 7.2 Index operation logs (file)
 
-Fichier JSONL structuré par défaut à `/var/log/pgindexai/index_operations.log` :
+Structured JSONL file, by default at `/var/log/pgindexai/index_operations.log`:
 
 ```json
 {
@@ -313,49 +313,49 @@ Fichier JSONL structuré par défaut à `/var/log/pgindexai/index_operations.log
 }
 ```
 
-**Niveaux de verbosité** :
+**Verbosity levels**:
 
-| Niveau | Contenu |
+| Level | Content |
 |--------|---------|
-| `minimal` | timestamp, type CRUD, durée, schéma, nom objet |
-| `standard` | + DDL de l'index modifié, confiance, raison |
-| `verbose` | + taille, fragmentation, détails techniques |
+| `minimal` | timestamp, CRUD type, duration, schema, object name |
+| `standard` | + DDL of the modified index, confidence, reason |
+| `verbose` | + size, fragmentation, technical details |
 
-**Rotation** : 10 MB par fichier, 5 fichiers max (configurable).
+**Rotation**: 10 MB per file, 5 files max (configurable).
 
-## 8. Dépendances
+## 8. Dependencies
 
-| Crate | Rôle | Version |
+| Crate | Role | Version |
 |-------|------|---------|
-| `tokio` | Runtime asynchrone | 1.x |
-| `tokio-postgres` | Driver PostgreSQL | 0.7 |
-| `deadpool-postgres` | Pool de connexions | 0.14 |
-| `reqwest` | Client HTTP pour Laya | 0.12 |
-| `serde` / `serde_yaml` | Sérialisation config | 1.x / 0.9 |
-| `serde_json` | Sérialisation logs | 1.x |
-| `clap` | Parsing CLI | 4.x |
-| `tracing` / `tracing-subscriber` | Logging structuré | 0.1 / 0.3 |
-| `chrono` | Gestion timestamps | 0.4 |
-| `thiserror` | Gestion erreurs | 2.x |
-| `dirs` | Chemin config par défaut | 6.x |
-| `tokio-postgres-rustls` | Connecteur TLS pour PostgreSQL | 0.14 |
-| `rustls` | Implémentation TLS (provider ring) | 0.23 |
-| `rustls-pemfile` | Lecture des certificats `ssl_root_cert` (PEM) | 2.x |
-| `webpki-roots` | Racines web PKI (Mozilla) par défaut | 0.26 |
-| `sqlparser` | **Vrai parseur SQL (AST) pour la détection SARGable** | 0.52 |
+| `tokio` | Async runtime | 1.x |
+| `tokio-postgres` | PostgreSQL driver | 0.7 |
+| `deadpool-postgres` | Connection pool | 0.14 |
+| `reqwest` | HTTP client for Laya | 0.12 |
+| `serde` / `serde_yaml` | Config serialization | 1.x / 0.9 |
+| `serde_json` | Log serialization | 1.x |
+| `clap` | CLI parsing | 4.x |
+| `tracing` / `tracing-subscriber` | Structured logging | 0.1 / 0.3 |
+| `chrono` | Timestamp handling | 0.4 |
+| `thiserror` | Error handling | 2.x |
+| `dirs` | Default config path | 6.x |
+| `tokio-postgres-rustls` | TLS connector for PostgreSQL | 0.14 |
+| `rustls` | TLS implementation (ring provider) | 0.23 |
+| `rustls-pemfile` | Reading the `ssl_root_cert` certificates (PEM) | 2.x |
+| `webpki-roots` | Default web PKI roots (Mozilla) | 0.26 |
+| `sqlparser` | **Real SQL parser (AST) for SARGable detection** | 0.52 |
 
-## 9. Garanties de comportement (nouveau)
+## 9. Behavioral guarantees (new)
 
-| Situation | Comportement garanti |
+| Situation | Guaranteed behavior |
 |-----------|----------------------|
-| `pg_stat_statements` absent | Daemon `DEGRADED` : unused + fragmentation actifs, détection d'index manquants **désactivée** (pas de source de données) |
-| Laya injoignable / réponse invalide | **Aucune DDL appliquée** — propositions générées et journalisées, application reportée au prochain cycle (no fallback) |
-| Serveur PostgreSQL redémarré depuis < `unused_minutes` | Analyse « index inutilisés » **sautée** pour le cycle (pas de fausse détection) |
-| Index B-tree absent | Les détecteurs de fragmentation ne proposent que des index B-tree |
-| Laya hors ligne au démarrage | `deep_health()` FAILED → warning explicite ; le daemon continue (mode observation) |
-| Nom d'index > 63 octets | Tronqué + suffixe hash court (FNV-1a base 36) — identifiant toujours valide |
-| `ssl_mode ≠ disable` + certificat non vérifiable (chaîne ou hostname) | **Connexion refusée** (rustls vérifie toujours chaîne + hostname) — aucun mode « accept-insecure » |
-| Hôte socket Unix (`/…`) + `ssl_mode ≠ disable` | Erreur explicite au démarrage (TLS impossible sur socket avec ce driver) |
-| Identifiants sortant du catalogue PG (schéma/table/index) | Proposition **rejetée** avant envoi à Laya (aucune injection DDL) |
-| Clé inconnue dans la config YAML | Chargement OK + **avertissement** précisant la clé ignorée |
-| Nombre de propositions > `max_proposals_per_cycle` | Seules les N premières (ordre des détecteurs) sont envoyées à Laya |
+| `pg_stat_statements` absent | Daemon `DEGRADED`: unused + fragmentation active, missing-index detection **disabled** (no data source) |
+| Laya unreachable / invalid response | **No DDL applied** — proposals generated and logged, application deferred to the next cycle (no fallback) |
+| PostgreSQL server restarted less than `unused_minutes` ago | "Unused indexes" analysis **skipped** for the cycle (no false detection) |
+| Non-B-tree index | Fragmentation detectors only propose B-tree indexes |
+| Laya offline at startup | `deep_health()` FAILED → explicit warning; the daemon continues (observation mode) |
+| Index name > 63 bytes | Truncated + short hash suffix (FNV-1a base 36) — identifier always valid |
+| `ssl_mode ≠ disable` + unvalidatable certificate (chain or hostname) | **Connection refused** (rustls always validates chain + hostname) — no "accept-insecure" mode |
+| Unix socket host (`/…`) + `ssl_mode ≠ disable` | Explicit error at startup (TLS not possible on socket with this driver) |
+| Identifiers outside the PG catalog (schema/table/index) | Proposal **rejected** before being sent to Laya (no DDL injection) |
+| Unknown key in the YAML config | Loading OK + **warning** naming the ignored key |
+| Number of proposals > `max_proposals_per_cycle` | Only the first N (detector order) are sent to Laya |

@@ -1,39 +1,39 @@
 # PGindexAI
 
-**Daemon autonome de gestion d'index PostgreSQL, piloté par l'IA Laya.**
+**Standalone PostgreSQL index management daemon, driven by the Laya AI.**
 
-PGindexAI surveille en continu vos bases PostgreSQL, détecte les index inutilisés, fragmentés et les requêtes SARGable sans index — puis propose des actions correctives (DROP, CREATE, REINDEX) validées **exclusivement** par le moteur de décision Laya.
+PGindexAI continuously monitors your PostgreSQL databases, detects unused and fragmented indexes and unindexed SARGable queries — then proposes corrective actions (DROP, CREATE, REINDEX) validated **exclusively** by the Laya decision engine.
 
-## 🆕 Nouveautés (refonte architecturale)
+## 🆕 New features (architectural rework)
 
-1. **Politique « sans fallback »** — Laya injoignable ou réponse invalide ⇒ **aucune DDL appliquée** (le daemon ne décide jamais à la place de Laya)
-2. **Health check profond** de Laya (payload de test réel envoyé à `/v1/systemone`, réponse validée structurellement) avant chaque lot
-3. **Détection SARGable par vrai parseur SQL** (sqlparser-rs, analyse de l'AST — fin des faux positifs des regex)
-4. **DDL en ligne** — `CREATE/REINDEX … CONCURRENTLY` (auto-commit) ; `DROP INDEX` en transaction ; validation post-DDL + nettoyage des index INVALIDE
-5. **Densité cible par type de colonne** (`density_by_type`) — estimation de taille des index créés
-6. **Convention de nommage explicite** (`idx_<table>_<col>`) + validation de longueur (63 octets, hash court)
-7. **Pool de connexions dimensionné** (`pg_pool`) — taille max et timeout d'attente configurables
-8. **État dégradé explicite** — `pg_stat_statements` absent ⇒ détection d'index manquants désactivée, daemon signalé `DEGRADED`
-9. **Support multi-schéma** — périmètre d'analyse configurable (`analysis.schemas`)
-10. **Fenêtre d'observation** — les index « inutilisés » ne sont proposés qu'après un uptime serveur suffisant (compteurs remis à zéro au redémarrage)
+1. **"No fallback" policy** — Laya unreachable or invalid response ⇒ **no DDL applied** (the daemon never decides on behalf of Laya)
+2. **Deep health check** of Laya (real test payload sent to `/v1/systemone`, structurally validated response) before each batch
+3. **SARGable detection via a real SQL parser** (sqlparser-rs, AST analysis — no more regex false positives)
+4. **Online DDL** — `CREATE/REINDEX … CONCURRENTLY` (auto-commit) ; `DROP INDEX` in a transaction; post-DDL validation + cleanup of INVALID indexes
+5. **Per-column-type target density** (`density_by_type`) — size estimation for created indexes
+6. **Explicit naming convention** (`idx_<table>_<col>`) + length validation (63 bytes, short hash)
+7. **Sized connection pool** (`pg_pool`) — configurable max size and wait timeout
+8. **Explicit degraded state** — `pg_stat_statements` absent ⇒ missing-index detection disabled, daemon reported `DEGRADED`
+9. **Multi-schema support** — configurable analysis scope (`analysis.schemas`)
+10. **Observation window** — "unused" indexes are only proposed after sufficient server uptime (counters reset on restart)
 
-**Renforcement sécurité (audit)** :
+**Security hardening (audit)**:
 
-11. **TLS vérifié** (rustls) sur la connexion PostgreSQL — chaîne + hostname **toujours** vérifiées, `ssl_root_cert` (PEM) optionnelle, rôle dédié non-superutilisateur (`pgindexai`)
-12. **Installateur durci** `install.sh` (sans `eval`, pg_hba ciblée, merge `shared_preload_libraries`, config 0600, unité systemd durcie) + mode **`--dry-run`** + **`uninstall.sh`** idempotent (`--purge`, `--clean-legacy`)
-13. **Plafond de propositions** par cycle (`max_proposals_per_cycle`), rotation des logs d'audit (0640, échecs bruyants), validation de config avec avertissements clés inconnues, **CI** (fmt / clippy `-D warnings` / test / shellcheck)
+11. **Validated TLS** (rustls) on the PostgreSQL connection — chain + hostname **always** validated, optional `ssl_root_cert` (PEM), dedicated non-superuser role (`pgindexai`)
+12. **Hardened installer** `install.sh` (no `eval`, targeted pg_hba, `shared_preload_libraries` merge, 0600 config, hardened systemd unit) + **`--dry-run`** mode + idempotent **`uninstall.sh`** (`--purge`, `--clean-legacy`)
+13. **Proposal cap** per cycle (`max_proposals_per_cycle`), audit log rotation (0640, loud failures), config validation with unknown-key warnings, **CI** (fmt / clippy `-D warnings` / test / shellcheck)
 
 ---
 
-## 🎯 Objectif
+## 🎯 Objective
 
-Automatiser le cycle complet d'optimisation d'index PostgreSQL :
+Automate the full PostgreSQL index optimization cycle:
 
-1. **Surveiller** les performances via `pg_stat_statements` et les catalogues système
-2. **Détecter** les anomalies (index inutilisés, fragmentation, index manquants)
-3. **Proposer** des corrections (DROP INDEX, CREATE INDEX, REINDEX)
-4. **Valider** chaque action via le moteur de décision Laya (IA)
-5. **Exécuter** les DDL validés avec traçabilité complète
+1. **Monitor** performance via `pg_stat_statements` and the system catalogs
+2. **Detect** anomalies (unused indexes, fragmentation, missing indexes)
+3. **Propose** fixes (DROP INDEX, CREATE INDEX, REINDEX)
+4. **Validate** each action via the Laya decision engine (AI)
+5. **Execute** the validated DDL with full traceability
 
 ## 🏗️ Architecture
 
@@ -52,7 +52,7 @@ Automatiser le cycle complet d'optimisation d'index PostgreSQL :
 └──────────────┘     │ │ able (AST)│ │           ▼
                      │ └───────────┘ │     ┌───────────────┐
                      │ DaemonState   │     │ DDL Engine    │
-                     │ (Healthy/     │     │ (en ligne :   │
+                     │ (Healthy/     │     │ (online:      │
                      │  Degraded)    │     │  CONCURRENTLY│
                      └───────────────┘     │  + DROP tx)   │
                               │            └───────────────┘
@@ -63,137 +63,137 @@ Automatiser le cycle complet d'optimisation d'index PostgreSQL :
                      └──────────────────┘
 ```
 
-### Composants
+### Components
 
-| Module | Rôle |
+| Module | Role |
 |--------|------|
-| **Analyzer** (`src/analyzer.rs`) | Moteur d'analyse central — orchestre les 3 détecteurs, porte le `DaemonState`, applique la politique sans fallback |
-| **DaemonState** (`src/state.rs`) | État `Healthy` / `Degraded` — dégrade la détection d'index manquants si `pg_stat_statements` est absent |
-| **Naming** (`src/naming.rs`) | Convention `idx_<table>_<col>`, validation d'identifiant, limite 63 octets (hash court) |
-| **Detector : Unused Indexes** | Identifie les index jamais scannés **depuis le redémarrage** + gate fenêtre d'observation (uptime serveur) |
-| **Detector : Fragmentation** | Index **B-tree uniquement** ; score multi-critères (dead tuples 50 %, modifications non analysées 30 %, bonus index inutilisé 20 %) |
-| **Detector : Missing SARGable** | Parseur AST (sqlparser) sur `pg_stat_statements` + types réels (`information_schema`) + `null_frac` (`pg_stats`) + densités cibles |
-| **Laya Client** (`src/laya/`) | Communication HTTP avec le serveur Laya (`/v1/systemone`) — `deep_health()` (payload de test réel), `decision()` |
-| **DDL Engine** (`src/ddl.rs`) | Exécution **en ligne** : `CONCURRENTLY` en auto-commit (CREATE/REINDEX), DROP en BEGIN/COMMIT, validation post-DDL + nettoyage des index INVALIDE |
-| **IndexLog Writer** (`src/index_log.rs`) | Historisation structurée des opérations (timestamp, type, durée, statut, DDL, confiance, taille, fragmentation) avec rotation de fichiers |
-| **Config** (`src/config.rs`) | Chargement YAML — multi-schéma, pool, densités par type, seuils |
-| **db Pool** (`src/db/mod.rs`) | Pool deadpool-postgres — taille max + timeout configurables + **TLS rustls** (chaîne + hostname toujours vérifiées, CA web PKI + PEM optionnel) |
+| **Analyzer** (`src/analyzer.rs`) | Central analysis engine — orchestrates the 3 detectors, holds the `DaemonState`, enforces the no-fallback policy |
+| **DaemonState** (`src/state.rs`) | `Healthy` / `Degraded` state — degrades missing-index detection if `pg_stat_statements` is absent |
+| **Naming** (`src/naming.rs`) | `idx_<table>_<col>` convention, identifier validation, 63-byte limit (short hash) |
+| **Detector : Unused Indexes** | Identifies indexes never scanned **since the last restart** + observation-window gate (server uptime) |
+| **Detector : Fragmentation** | **B-tree indexes only**; multi-criteria score (dead tuples 50%, unanalyzed modifications 30%, unused-index bonus 20%) |
+| **Detector : Missing SARGable** | AST parser (sqlparser) over `pg_stat_statements` + real types (`information_schema`) + `null_frac` (`pg_stats`) + target densities |
+| **Laya Client** (`src/laya/`) | HTTP communication with the Laya server (`/v1/systemone`) — `deep_health()` (real test payload), `decision()` |
+| **DDL Engine** (`src/ddl.rs`) | **Online** execution: `CONCURRENTLY` in auto-commit (CREATE/REINDEX), DROP in BEGIN/COMMIT, post-DDL validation + cleanup of INVALID indexes |
+| **IndexLog Writer** (`src/index_log.rs`) | Structured audit logging of operations (timestamp, type, duration, status, DDL, confidence, size, fragmentation) with file rotation |
+| **Config** (`src/config.rs`) | YAML loading — multi-schema, pool, per-type densities, thresholds |
+| **db Pool** (`src/db/mod.rs`) | deadpool-postgres pool — configurable max size + wait timeout + **rustls TLS** (chain + hostname always validated, web PKI CA + optional PEM) |
 
-## 📊 Détecteurs
+## 📊 Detectors
 
-### 1. Index inutilisés
+### 1. Unused indexes
 
-Détecte les index qui n'ont jamais été scannés ni lus **depuis le dernier redémarrage** de PostgreSQL :
+Detects indexes that have never been scanned or read **since the last PostgreSQL restart**:
 
 ```sql
--- Gate préalable (nouveau) : uptime serveur ≥ thresholds.unused_minutes
+-- Prerequisite gate (new): server uptime >= thresholds.unused_minutes
 SELECT now() - pg_postmaster_start_time() >= make_interval(mins => 10080);
 
--- Critères
+-- Criteria
 idx_scan = 0 AND idx_tup_read = 0
 AND indisvalid = true
 AND indisprimary = false
 AND indisunique = false
 ```
 
-> **Pourquoi le gate ?** Les compteurs `pg_stat_*` sont remis à zéro au
-> redémarrage : sans cette vérification, un serveur fraîchement démarré
-> donnerait de faux positifs de DROP.
+> **Why the gate?** The `pg_stat_*` counters are reset on
+> restart: without this check, a freshly started server
+> would produce DROP false positives.
 
-**Action proposée :** `DROP INDEX IF EXISTS schema.index`
+**Proposed action:** `DROP INDEX IF EXISTS schema.index`
 
-### 2. Index fragmentés
+### 2. Fragmented indexes
 
-PostgreSQL ne fournit pas `avg_leaf_density` directement. PGindexAI utilise un score heuristique multi-critères sur les index **B-tree uniquement** (`pg_am.amname = 'btree'` — les index GiST/GIN/BRIN n'ont pas la même notion de fragmentation) :
+PostgreSQL does not provide `avg_leaf_density` directly. PGindexAI uses a multi-criteria heuristic score on **B-tree indexes only** (`pg_am.amname = 'btree'` — GiST/GIN/BRIN indexes do not have the same notion of fragmentation):
 
-| Critère | Pondération |
+| Criterion | Weight |
 |---------|-------------|
 | `n_dead_tup / (n_live_tup + n_dead_tup)` | 50 % |
-| `n_mod_since_analyze / n_live_tup` (bornée à 1.0) | 30 % |
-| Bonus index volumineux non scanné (`idx_scan = 0` ET `relpages > 100`) | 20 % |
+| `n_mod_since_analyze / n_live_tup` (capped at 1.0) | 30 % |
+| Bonus: large unscanned index (`idx_scan = 0` AND `relpages > 100`) | 20 % |
 
-**Seuil de déclenchement :** `score ≥ thresholds.fragmentation_pct` (défaut 70 %)
+**Trigger threshold:** `score ≥ thresholds.fragmentation_pct` (default 70 %)
 
-**Action proposée :** `REINDEX INDEX CONCURRENTLY schema.index`
+**Proposed action:** `REINDEX INDEX CONCURRENTLY schema.index`
 
-### 3. Requêtes SARGable sans index
+### 3. Unindexed SARGable queries
 
-Analyse `pg_stat_statements` pour identifier les colonnes utilisables dans un index, avec un **vrai parseur SQL** (sqlparser-rs, analyse de l'AST) :
+Analyzes `pg_stat_statements` to identify columns usable in an index, using a **real SQL parser** (sqlparser-rs, AST analysis):
 
 ```
-Filtres :
+Filters:
   - calls ≥ thresholds.min_sargable_rows (100)
   - !~ ^(CREATE|ALTER|DROP|DELETE|INSERT|UPDATE|BEGIN|COMMIT|...)
   - !~ ^(SELECT|WITH).*\bpg_
-  - périmètre multi-schéma (analysis.schemas, nouveau)
+  - multi-schema scope (analysis.schemas, new)
 
-Patterns SARGable détectés (AST) :
-  - col = v, col > v, col < v, col >= v, col <= v   (valeur non-colonne)
-  - col IN (...) / col BETWEEN a AND b              (non-négés)
+Detected SARGable patterns (AST):
+  - col = v, col > v, col < v, col >= v, col <= v   (value is not a column)
+  - col IN (...) / col BETWEEN a AND b              (non-negated)
   - col IS NULL / col IS NOT NULL
-  - col LIKE 'pref…%' / ILIKE                      (motif préfixe)
-  - AND / OR / parenthèses imbriquées (parcours récursif)
+  - col LIKE 'pref…%' / ILIKE                      (prefix pattern)
+  - AND / OR / nested parentheses (recursive traversal)
 
-Rejetés (non-SARGable) :
+Rejected (non-SARGable):
   - NOT (…), IS DISTINCT FROM, col NOT IN/BETWEEN/LIKE
-  - Fonctions sur la colonne (LOWER(col), UPPER(col), CAST(col AS …))
-  - Comparaison colonne-contre-colonne
-  - LIKE/ILIKE avec joker en tête ('%…')
+  - Functions on the column (LOWER(col), UPPER(col), CAST(col AS …))
+  - Column-to-column comparison
+  - LIKE/ILIKE with a leading wildcard ('%…')
 ```
 
-**Enrichissement (nouveau)** : pour chaque colonne candidate, le daemon charge
-le **type réel** (`information_schema.columns`), la **nullabilité**, la
-**fraction de NULL** (`pg_stats.null_frac`) et la **cardinalité** de la table
-(`pg_class.reltuples`) pour estimer la taille du futur index via la
-**densité cible du type** (`density_by_type.*`).
+**Enrichment (new)**: for each candidate column, the daemon loads
+the **real type** (`information_schema.columns`), the **nullability**, the
+**NULL fraction** (`pg_stats.null_frac`) and the table **cardinality**
+(`pg_class.reltuples`) to estimate the size of the future index via the
+**target density of the type** (`density_by_type.*`).
 
-**Action proposée :** `CREATE INDEX idx_table_column ON table(column)`
-Si `null_frac > 0.10` → index filtré : `WHERE column IS NOT NULL`
-Nom d'index validé : ≤ 63 octets (troncation + hash court si nécessaire).
+**Proposed action:** `CREATE INDEX idx_table_column ON table(column)`
+If `null_frac > 0.10` → filtered index: `WHERE column IS NOT NULL`
+Validated index name: ≤ 63 bytes (truncation + short hash if needed).
 
 ## ⚙️ Configuration
 
-Fichier : `~/.config/PGindexAI/PGindexAI.yaml`
+File: `~/.config/PGindexAI/PGindexAI.yaml`
 
 ```yaml
 postgresql:
-  host: "/var/run/postgresql"   # Socket Unix ou IP (le socket ⇒ ssl_mode: disable)
+  host: "/var/run/postgresql"   # Unix socket, or IP (a socket implies ssl_mode: disable)
   port: 5432
-  user: "pgindexai"              # Rôle dédié non-superutilisateur (voir 06)
+  user: "pgindexai"              # Dedicated non-superuser role (see 06)
   database: "pgindexai_demo"
-  password: ""                  # Requis si pg_hba exige scram-sha-256 / md5
+  password: ""                  # Required if pg_hba enforces scram-sha-256 / md5
   ssl_mode: "disable"           # disable | require | verify-ca | verify-full
-  # ssl_root_cert: ""           # PEM d'une CA auto-signée (verify-ca / verify-full)
+  # ssl_root_cert: ""           # PEM of a self-signed CA (verify-ca / verify-full)
 
 laya:
   url: "http://127.0.0.1:8080"
   timeout_seconds: 30
 
-# Contrôle des actions DDL
+# DDL action control
 actions:
-  create_index: true            # Autoriser CREATE INDEX
-  drop_unused: true             # Autoriser DROP INDEX
-  rebuild_fragmented: true      # Autoriser REINDEX
+  create_index: true            # Allow CREATE INDEX
+  drop_unused: true             # Allow DROP INDEX
+  rebuild_fragmented: true      # Allow REINDEX
 
-# Seuils de décision
+# Decision thresholds
 thresholds:
-  cycle_seconds: 60             # Fréquence du cycle d'analyse
-  unused_minutes: 10080         # Fenêtre d'observation avant proposition DROP (7 jours)
-  fragmentation_pct: 70         # % de fragmentation déclenchant REBUILD
-  min_sargable_rows: 100        # Min. d'exécutions (pg_stat_statements.calls)
-  min_confidence: 0.7           # Confiance min. de Laya pour appliquer
-  max_proposals_per_cycle: 20   # Budget de propositions par cycle
+  cycle_seconds: 60             # Analysis cycle frequency
+  unused_minutes: 10080         # Observation window before a DROP proposal (7 days)
+  fragmentation_pct: 70         # Fragmentation % that triggers a REBUILD
+  min_sargable_rows: 100        # Minimum executions (pg_stat_statements.calls)
+  min_confidence: 0.7           # Minimum Laya confidence to apply
+  max_proposals_per_cycle: 20   # Proposal budget per cycle
 
-# Périmètre d'analyse (nouveau)
+# Analysis scope (new)
 analysis:
-  schemas: []                   # [] = tous les schémas non-système
+  schemas: []                   # [] = all non-system schemas
 
-# Pool de connexions (nouveau)
+# Connection pool (new)
 pg_pool:
-  max_size: 16                  # Taille max du pool
-  wait_timeout_ms: 30000        # Timeout d'attente d'une connexion
+  max_size: 16                  # Max pool size
+  wait_timeout_ms: 30000        # Wait timeout for a connection
 
-# Densité cible par type de colonne (nouveau)
+# Target density per column type (new)
 density_by_type:
   int4: 200                     # tuples/page (integer, smallint)
   int8: 200                     # bigint
@@ -204,14 +204,14 @@ density_by_type:
   timestamptz: 150              # timestamp (± time zone)
   uuid: 100
   bool: 300
-  default_density: 50           # tout autre type
+  default_density: 50           # any other type
 
 # Logging
 logging:
   level: "info"
   format: "json"
 
-# Logging des opérations d'index
+# Index operation logging
 index_logging:
   enabled: true
   verbosity: "minimal"          # minimal | standard | verbose
@@ -220,94 +220,94 @@ index_logging:
   max_files: 5
 ```
 
-> Les sections `analysis`, `pg_pool` et `density_by_type` sont **optionnelles**
-> — des valeurs par défaut robustes s'appliquent si elles sont absentes.
-> Voir [05-configuration.md](docs/architecture/05-configuration.md) pour le détail.
+> The `analysis`, `pg_pool` and `density_by_type` sections are **optional**
+> — robust defaults apply when they are absent.
+> See [05-configuration.md](docs/architecture/05-configuration.md) for details.
 
 ## 🚀 Installation
 
-### Prérequis
+### Prerequisites
 
-- **PostgreSQL 16+** (idéalement avec l'extension `pg_stat_statements` activée — sans elle, le daemon passe en mode dégradé : détection d'index manquants désactivée)
-- **Laya server** (`laya`) en mode serveur sur un port local — **requis pour appliquer des DDL** ; sans lui le daemon reste en mode observation (aucune modification de la base)
-- **Rust toolchain** (pour compiler depuis les sources)
+- **PostgreSQL 16+** (ideally with the `pg_stat_statements` extension enabled — without it, the daemon enters degraded mode: missing-index detection disabled)
+- **Laya server** (`laya`) in server mode on a local port — **required to apply DDL**; without it the daemon stays in observation mode (no database modification)
+- **Rust toolchain** (to build from source)
 
-### 🔧 Script d'installation automatique
+### 🔧 Automatic installation script
 
-Un script `install.sh` est fourni pour automatiser l'installation complète :
+An `install.sh` script is provided to automate the full installation:
 
 ```bash
-# Exécution directe
+# Direct execution
 curl -fsSL https://raw.githubusercontent.com/GuillaumeDiamant/PGindexAI/main/install.sh | bash
 
-# Ou en local (après clonage)
+# Or locally (after cloning)
 ./install.sh
 
-# Mode simulation (aucune modification)
+# Simulation mode (no modification)
 ./install.sh --dry-run
 ```
 
-### ♻️ Désinstallation
+### ♻️ Uninstallation
 
 ```bash
-# Par défaut : service + binaire + config + données + logs
-# (CONSERVE la base pgindexai_demo, le rôle pgindexai et la ligne pg_hba)
+# By default: service + binary + config + data + logs
+# (KEEPS the pgindexai_demo database, the pgindexai role and the pg_hba line)
 sudo ./uninstall.sh
 
-# Simulation complète (aucune modification)
+# Full simulation (no modification)
 sudo ./uninstall.sh --dry-run
 
-# Suppression complète : + base, rôle et ligne pg_hba (irréversible, confirmation)
+# Full removal: + database, role and pg_hba line (irreversible, confirmation)
 sudo ./uninstall.sh --purge
 
-# + nettoyage des vestiges de l'ancien nom (laya-sql)
+# + cleanup of leftovers from the old name (laya-sql)
 sudo ./uninstall.sh --clean-legacy
 ```
 
-`shared_preload_libraries` et l'extension `pg_stat_statements` ne sont **jamais**
-modifiées (extension partagée — retrait manuel si réellement souhaité).
+`shared_preload_libraries` and the `pg_stat_statements` extension are **never**
+modified (shared extension — remove manually if truly desired).
 
-Le script réalise automatiquement :
+The script does the following automatically:
 
-| Étape | Action |
+| Step | Action |
 |-------|--------|
-| 1. Prérequis | Vérifie PostgreSQL, Rust, accès sudo |
-| 2. PostgreSQL | Détection via `SHOW config_file/hba_file/ssl` ; **fusion** de `pg_stat_statements` dans `shared_preload_libraries` (jamais d'écrasement) ; redémarre si besoin |
-| 3. Rôle dédié | Crée `pgindexai` (non-superutilisateur, `scram-sha-256`) + mot de passe `openssl rand -hex 16` (jamais affiché) ; **prépend** la ligne ciblée `local all pgindexai scram-sha-256` dans `pg_hba.conf` |
+| 1. Prerequisites | Checks PostgreSQL, Rust, sudo access |
+| 2. PostgreSQL | Detection via `SHOW config_file/hba_file/ssl`; **merges** `pg_stat_statements` into `shared_preload_libraries` (never overwrites); restarts if needed |
+| 3. Dedicated role | Creates `pgindexai` (non-superuser, `scram-sha-256`) + password `openssl rand -hex 16` (never displayed); **prepends** the targeted line `local all pgindexai scram-sha-256` in `pg_hba.conf` |
 | 4. Compilation | `cargo build --release` |
-| 5. Installation | Binaire → `/usr/local/bin/pgindexai` |
-| 6. Configuration | Génère `~/.config/PGindexAI/PGindexAI.yaml` en **0600** avec le mot de passe |
-| 7. Service systemd | Déploie l'unité **durcie** (MemoryMax, NoNewPrivileges, …) et l'active |
-| 8. Démo | Charge le schéma et le workload de démonstration, transfère la propriété vers `pgindexai` |
+| 5. Installation | Binary → `/usr/local/bin/pgindexai` |
+| 6. Configuration | Generates `~/.config/PGindexAI/PGindexAI.yaml` as **0600** with the password |
+| 7. systemd service | Deploys the **hardened** unit (MemoryMax, NoNewPrivileges, …) and enables it |
+| 8. Demo | Loads the demo schema and workload, transfers ownership to `pgindexai` |
 
-### 1. PostgreSQL (manuel)
+### 1. PostgreSQL (manual)
 
 ```bash
-# Ajouter pg_stat_statements à shared_preload_libraries (FUSION — ne pas
-# écraser les bibliothèques déjà listées, cf. install.sh)
+# Add pg_stat_statements to shared_preload_libraries (MERGE — do not
+# overwrite libraries already listed, see install.sh)
 sudo sed -i "s/^shared_preload_libraries *= *'.*'/shared_preload_libraries = 'pg_stat_statements'/" \
   /etc/postgresql/16/main/postgresql.conf
-# (ou : shared_preload_libraries = 'autre_lib, pg_stat_statements')
+# (or: shared_preload_libraries = 'other_lib, pg_stat_statements')
 
-# Redémarrer PostgreSQL
+# Restart PostgreSQL
 sudo systemctl restart postgresql
 
-# Créer l'extension
+# Create the extension
 sudo -u postgres psql -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements;"
 
-# Rôle dédié (recommandé — le daemon ne doit pas tourner avec le superutilisateur)
-sudo -u postgres psql -c "CREATE ROLE pgindexai LOGIN PASSWORD '<mot-de-passe-fort>';"
-# pg_hba.conf — ligne CIBLÉE (prépendre) : local  all  pgindexai  scram-sha-256
+# Dedicated role (recommended — the daemon should not run as the superuser)
+sudo -u postgres psql -c "CREATE ROLE pgindexai LOGIN PASSWORD '<strong-password>';"
+# pg_hba.conf — TARGETED line (prepend): local  all  pgindexai  scram-sha-256
 ```
 
 ### 2. Laya server
 
 ```bash
-# Télécharger le binaire Laya (CUDA 12 ou CPU)
+# Download the Laya binary (CUDA 12 or CPU)
 mkdir -p ~/.local/share/pgindexai/models
-# ... placer le modèle typed-decisions ...
+# ... place the typed-decisions model ...
 
-# Lancer en mode serveur
+# Start in server mode
 laya --model ~/.local/share/pgindexai/models/typed-decisions/ \
      --cpu --server --port 8080
 ```
@@ -315,80 +315,80 @@ laya --model ~/.local/share/pgindexai/models/typed-decisions/ \
 ### 3. PGindexAI
 
 ```bash
-# Depuis les sources
+# From source
 git clone https://github.com/GuillaumeDiamant/PGindexAI.git
 cd pgindexai
 cargo build --release
 
-# Installer le binaire
+# Install the binary
 sudo cp target/release/pgindexai /usr/local/bin/pgindexai
 
 # Configuration
 mkdir -p ~/.config/PGindexAI
 cp config/PGindexAI.yaml ~/.config/PGindexAI/PGindexAI.yaml
-# Éditer ~/.config/PGindexAI/PGindexAI.yaml
+# Edit ~/.config/PGindexAI/PGindexAI.yaml
 ```
 
-### 4. Service systemd (production)
+### 4. systemd service (production)
 
 ```bash
-# Template : config/pgindexai.service (référentielle — remplacer les marqueurs
-# $USER / $HOME par vos valeurs avant copie)
+# Template: config/pgindexai.service (reference — replace the
+# $USER / $HOME markers with your values before copying)
 sudo cp config/pgindexai.service /etc/systemd/system/pgindexai.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now pgindexai
 ```
 
-L'unité contient les durcissements : `MemoryMax=512M`, `CPUQuota=100%`,
+The unit includes the following hardening: `MemoryMax=512M`, `CPUQuota=100%`,
 `NoNewPrivileges=true`, `ProtectSystem=strict`, `PrivateTmp=true`,
 `Restart=always`.
 
-## 💻 Utilisation
+## 💻 Usage
 
 ```bash
-# Mode daemon (boucle continue)
+# Daemon mode (continuous loop)
 pgindexai daemon
 
-# Cycle unique (one-shot)
+# Single cycle (one-shot)
 pgindexai run
 
-# Configuration personnalisée
+# Custom configuration
 pgindexai --config /path/to/PGindexAI.yaml daemon
 
-# Sécuritaire : analyse + affichage des propositions SANS appel Laya ni DDL
+# Safe: analysis + display of proposals WITHOUT any Laya call or DDL
 pgindexai run --dry-run
 ```
 
-### Sous-commandes
+### Subcommands
 
-| Commande | Description |
+| Command | Description |
 |----------|-------------|
-| `daemon` | Boucle d'analyse continue (par défaut, cycle de 60 s) |
-| `run` | Exécute un cycle unique et quitte |
-| `run --dry-run` | Analyse et affichage **seulement** (aucun effet de bord) |
+| `daemon` | Continuous analysis loop (default, 60s cycle) |
+| `run` | Runs a single cycle and exits |
+| `run --dry-run` | Analysis and display **only** (no side effects) |
 
-### Variables d'environnement
+### Environment variables
 
-| Variable | Rôle |
+| Variable | Role |
 |----------|------|
-| `RUST_LOG` | Niveau de log (`debug`, `info`, `warn`, `error`) — prioritaire sur `logging.level` |
+| `RUST_LOG` | Log level (`debug`, `info`, `warn`, `error`) — takes precedence over `logging.level` |
 
 
 ## 📝 Logging
 
-### Journaux du daemon
+### Daemon logs
 
-Par défaut via `journalctl` :
+By default via `journalctl`:
 
 ```bash
 journalctl --unit=pgindexai -f
 ```
 
-Format JSON par défaut, configurable dans `logging.format` (`json` ou `plain`).
+JSON format by default, configurable in `logging.format` (`json` or `plain`).
 
-### Historique des opérations d'index
+### Index operation history
 
-Fichier structuré par défaut à `/var/log/pgindexai/index_operations.log` :
+Structured file, by default at `/var/log/pgindexai/index_operations.log`:
 
 ```json
 {
@@ -404,148 +404,148 @@ Fichier structuré par défaut à `/var/log/pgindexai/index_operations.log` :
 }
 ```
 
-Niveaux de verbosité :
+Verbosity levels:
 
-| Niveau | Contenu |
+| Level | Content |
 |--------|---------|
-| `minimal` | Type d'opération, schéma, objet, durée, statut |
-| `standard` | + DDL exécutée |
-| `verbose` | + confiance, taille de l'index, fragmentation, raison de la proposition |
+| `minimal` | Operation type, schema, object, duration, status |
+| `standard` | + DDL executed |
+| `verbose` | + confidence, index size, fragmentation, proposal reason |
 
-## 🧪 Démo
+## 🧪 Demo
 
-Un schéma de démonstration avec workload est fourni :
+A demo schema with workload is provided:
 
 ```bash
-# Créer la base de démo
+# Create the demo database
 sudo -u postgres psql -c "CREATE DATABASE pgindexai_demo;"
 
-# Charger le schéma
+# Load the schema
 sudo -u postgres psql -d pgindexai_demo -f sql/demo_schema.sql
 
-# Exécuter le workload
+# Run the workload
 sudo -u postgres psql -d pgindexai_demo -f sql/demo_workload.sql
 
-# Vérifier les propositions du daemon
+# Check the daemon's proposals
 journalctl --unit=pgindexai -n 50
 ```
 
-Le workload crée :
-- **5 tables** : `customers` (10k), `products` (5k), `orders` (200k), `order_items` (500k), `users` (2k)
-- **23 index** dont certains inutilisés volontairement
-- **8 phases** de workload incluant des patterns SARGable répétés et de la fragmentation réaliste
+The workload creates:
+- **5 tables**: `customers` (10k), `products` (5k), `orders` (200k), `order_items` (500k), `users` (2k)
+- **23 indexes**, some intentionally unused
+- **8 phases** of workload, including repeated SARGable patterns and realistic fragmentation
 
-## 🔍 Cycle d'analyse
+## 🔍 Analysis cycle
 
-Chaque cycle (par défaut 60 s) :
+Each cycle (default 60s):
 
 ```
-1. [Unused Indexes]  → gate uptime serveur (≥ unused_minutes)
-                      → pg_stat_user_indexes → indexes jamais scannés
+1. [Unused Indexes]  → server uptime gate (≥ unused_minutes)
+                      → pg_stat_user_indexes → indexes never scanned
 
-2. [Fragmentation]   → pg_class + pg_am (btree) → score heuristique multi-critères
+2. [Fragmentation]   → pg_class + pg_am (btree) → multi-criteria heuristic score
 
 3. [SARGable]        → pg_stat_statements → parse AST (sqlparser)
-                      → types réels + null_frac + densité → index manquant
-                      (désactivé si pg_stat_statements absent : mode DEGRADED)
+                      → real types + null_frac + density → missing index
+                      (disabled if pg_stat_statements absent: DEGRADED mode)
                           │
                           ▼
-4. [Laya Health]     → deep_health() : payload de test réel sur /v1/systemone
-                      → FAILED ⇒ TOUTES les propositions SKIPPED (no fallback)
+4. [Laya Health]     → deep_health(): real test payload to /v1/systemone
+                      → FAILED ⇒ ALL proposals SKIPPED (no fallback)
                           │
                           ▼
-5. [Laya Decision]   → HTTP POST /v1/systemone (par proposition)
-                      → choix appliqué (selon le type) + confidence ≥ min_confidence
+5. [Laya Decision]   → HTTP POST /v1/systemone (per proposal)
+                      → choice applied (per type) + confidence ≥ min_confidence
                           │
                           ▼
-6. [DDL Execution]   → EN LIGNE : CREATE/REINDEX CONCURRENTLY (auto-commit),
-                      → DROP INDEX en BEGIN/COMMIT
-                      → validation post-DDL (index_valid) + nettoyage
-                        des index INVALIDE → logging structuré
+6. [DDL Execution]   → ONLINE: CREATE/REINDEX CONCURRENTLY (auto-commit),
+                      → DROP INDEX in BEGIN/COMMIT
+                      → post-DDL validation (index_valid) + cleanup
+                        of INVALID indexes → structured logging
 ```
 
-> **Garantie « sans fallback »** : tant que Laya n'est pas actif et valide,
-> le daemon reste en mode *observation* — il détecte, génère et journalise
-> les propositions, mais n'applique **aucune** DDL.
+> **"No fallback" guarantee**: until Laya is active and valid,
+> the daemon stays in *observation* mode — it detects, generates and logs
+> proposals but applies **no** DDL at all.
 
-## 📁 Structure du projet
+## 📁 Project structure
 
 ```
 pgindexai/
-├── Cargo.toml              # Dépendances Rust (sqlparser 0.52, rustls, …)
-├── Cargo.lock              # Verrouillé (projet binaire)
-├── install.sh              # Installateur durci (rôle dédié, pg_hba ciblée,
-│                           # config 0600, unité systemd, --dry-run)
-├── uninstall.sh            # Désinstallation (service, binaire, config,
+├── Cargo.toml              # Rust dependencies (sqlparser 0.52, rustls, …)
+├── Cargo.lock              # Locked (binary project)
+├── install.sh              # Hardened installer (dedicated role, targeted pg_hba,
+│                           # 0600 config, systemd unit, --dry-run)
+├── uninstall.sh            # Uninstallation (service, binary, config,
 │                           # --purge, --clean-legacy, --dry-run)
 ├── config/
-│   ├── PGindexAI.yaml        # Template de configuration
-│   └── pgindexai.service    # Unité systemd (référentielle)
+│   ├── PGindexAI.yaml        # Configuration template
+│   └── pgindexai.service    # systemd unit (reference)
 ├── sql/
-│   ├── demo_schema.sql     # Schéma de démo (5 tables, 23 index)
-│   └── demo_workload.sql   # Workload de test (8 phases)
+│   ├── demo_schema.sql     # Demo schema (5 tables, 23 indexes)
+│   └── demo_workload.sql   # Test workload (8 phases)
 ├── .github/
 │   └── workflows/
-│       └── ci.yml          # CI : fmt, clippy, test, shellcheck
+│       └── ci.yml          # CI: fmt, clippy, test, shellcheck
 ├── docs/
-│   └── architecture/       # Documentation technique (7 fichiers)
+│   └── architecture/       # Technical documentation (7 files)
 ├── src/
-│   ├── main.rs             # Point d'entrée, CLI, boucle daemon, --dry-run
-│   ├── analyzer.rs         # Moteur d'analyse (3 détecteurs + Laya + no-fallback)
+│   ├── main.rs             # Entry point, CLI, daemon loop, --dry-run
+│   ├── analyzer.rs         # Analysis engine (3 detectors + Laya + no-fallback)
 │   ├── state.rs            # DaemonState (Healthy/Degraded)
-│   ├── naming.rs           # Convention de nommage d'index (63 octets)
-│   ├── config.rs           # Chargement YAML + validation + avertissements
-│   ├── ddl.rs              # Exécution DDL en ligne (CONCURRENTLY)
-│   ├── index_log.rs        # Historisation JSONL + rotation (0640)
+│   ├── naming.rs           # Index naming convention (63 bytes)
+│   ├── config.rs           # YAML loading + validation + warnings
+│   ├── ddl.rs              # Online DDL execution (CONCURRENTLY)
+│   ├── index_log.rs        # JSONL audit logging + rotation (0640)
 │   ├── db/
-│   │   ├── mod.rs          # Pool de connexions + TLS (rustls)
-│   │   └── queries.rs      # Requêtes DMV + parseur AST (sqlparser)
+│   │   ├── mod.rs          # Connection pool + TLS (rustls)
+│   │   └── queries.rs      # DMV queries + AST parser (sqlparser)
 │   └── laya/
-│       ├── mod.rs          # Client HTTP Laya (deep_health + décision)
-│       └── types.rs        # Types du protocole Laya
-├── LICENSE                 # Licence MIT
+│       ├── mod.rs          # Laya HTTP client (deep_health + decision)
+│       └── types.rs        # Laya protocol types
+├── LICENSE                 # MIT license
 └── README.md
 ```
 
-## 🛠️ Dépendances
+## 🛠️ Dependencies
 
-| Crate | Rôle |
+| Crate | Role |
 |-------|------|
-| `tokio` | Runtime asynchrone |
-| `tokio-postgres` | Driver PostgreSQL |
-| `deadpool-postgres` | Pool de connexions (dimensionné) |
-| `reqwest` | Client HTTP pour Laya |
-| `serde` / `serde_yaml` / `serde_json` | Sérialisation config + logs |
-| `clap` | Parsing CLI |
-| `tracing` / `tracing-subscriber` | Logging structuré |
-| `chrono` | Gestion des timestamps |
-| `thiserror` | Gestion d'erreurs |
-| `dirs` | Chemin config par défaut |
-| `tokio-postgres-rustls` | Connecteur TLS pour PostgreSQL |
-| `rustls` | Implémentation TLS (provider ring) — chaîne + hostname toujours vérifiées |
-| `rustls-pemfile` | Lecture des CA `ssl_root_cert` (PEM) |
-| `webpki-roots` | Racines web PKI (Mozilla) par défaut |
-| `sqlparser` | **Vrai parseur SQL (AST) — détection SARGable** |
+| `tokio` | Async runtime |
+| `tokio-postgres` | PostgreSQL driver |
+| `deadpool-postgres` | Connection pool (sized) |
+| `reqwest` | HTTP client for Laya |
+| `serde` / `serde_yaml` / `serde_json` | Config + log serialization |
+| `clap` | CLI parsing |
+| `tracing` / `tracing-subscriber` | Structured logging |
+| `chrono` | Timestamp handling |
+| `thiserror` | Error handling |
+| `dirs` | Default config path |
+| `tokio-postgres-rustls` | TLS connector for PostgreSQL |
+| `rustls` | TLS implementation (ring provider) — chain + hostname always validated |
+| `rustls-pemfile` | Reading the `ssl_root_cert` CA (PEM) |
+| `webpki-roots` | Default web PKI roots (Mozilla) |
+| `sqlparser` | **Real SQL parser (AST) — SARGable detection** |
 
-## 🔑 Points clés
+## 🔑 Key points
 
-- **Sans fallback** — le daemon ne décide jamais à la place de Laya : Laya absent ⇒ aucune DDL
-- **Health check profond** de Laya (payload de test réel, réponse validée) avant chaque lot
-- **DDL en ligne** (`CONCURRENTLY`) avec validation post-DDL + nettoyage des index INVALIDE
-- **TLS vérifié** (rustls) sur PostgreSQL — chaîne + hostname toujours vérifiées, CA `ssl_root_cert` optionnelle, rôle dédié non-superutilisateur
-- **Installateur durci** (`install.sh` : sans `eval`, pg_hba ciblée, config 0600) + **`--dry-run`** sans effet de bord + **`uninstall.sh`** idempotent (`--purge` pour base/rôle/pg_hba, `--clean-legacy`)
-- **Détection SARGable par vrai parseur SQL** (AST, sqlparser-rs) — fin des faux positifs regex
-- **Densité cible par type de colonne** — estimation de taille des index créés
-- **Convention de nommage** `idx_<table>_<col>` validée (63 octets, hash court)
-- **Multi-schéma** — périmètre d'analyse configurable
-- **Mode dégradé explicite** quand `pg_stat_statements` est absent
-- **Zéro dépendance externe** autre que PostgreSQL et Laya server
-- **Configuration YAML** avec valeurs par défaut robustes
-- **Logging structuré** (JSON ou texte) avec rotation de fichiers
-- **Historisation complète** de toutes les opérations d'index
-- **Service systemd** prêt pour la production
+- **No fallback** — the daemon never decides on behalf of Laya: Laya absent ⇒ no DDL
+- **Deep health check** of Laya (real test payload, validated response) before each batch
+- **Online DDL** (`CONCURRENTLY`) with post-DDL validation + cleanup of INVALID indexes
+- **Validated TLS** (rustls) on PostgreSQL — chain + hostname always validated, optional `ssl_root_cert` CA, dedicated non-superuser role
+- **Hardened installer** (`install.sh`: no `eval`, targeted pg_hba, 0600 config) + side-effect-free **`--dry-run`** + idempotent **`uninstall.sh`** (`--purge` for database/role/pg_hba, `--clean-legacy`)
+- **SARGable detection via a real SQL parser** (AST, sqlparser-rs) — no more regex false positives
+- **Per-column-type target density** — size estimation for created indexes
+- **Naming convention** `idx_<table>_<col>` validated (63 bytes, short hash)
+- **Multi-schema** — configurable analysis scope
+- **Explicit degraded mode** when `pg_stat_statements` is absent
+- **Zero external dependencies** other than PostgreSQL and the Laya server
+- **YAML configuration** with robust defaults
+- **Structured logging** (JSON or text) with file rotation
+- **Complete audit trail** of all index operations
+- **Production-ready systemd service**
 - **MIT License**
 
-## 📄 Licence
+## 📄 License
 
-MIT — Voir le fichier [LICENSE](LICENSE)
+MIT — See the [LICENSE](LICENSE) file

@@ -1,74 +1,74 @@
-# Documentation d'architecture — PGindexAI
+# Architecture documentation — PGindexAI
 
-Documentation technique complète du daemon PGindexAI : surveillance, analyse et automatisation de la gestion d'index PostgreSQL pilotée par le moteur de décision Laya.
+Complete technical documentation of the PGindexAI daemon: monitoring, analysis, and automation of PostgreSQL index management driven by the Laya decision engine.
 
-> **Refonte architecturale** — cette documentation couvre la dernière refonte
-> (10 correctifs) : politique **sans fallback**, health check **profond** de
-> Laya, détection SARGable par **vrai parseur AST** (sqlparser-rs), DDL
-> **en ligne** (`CONCURRENTLY`), densité cible par type, convention de
-> nommage (63 octets), pool de connexions dimensionné, état **dégradé**
-> explicite, **multi-schéma** et **fenêtre d'observation** sur les index
-> inutilisés.
+> **Architectural rework** — this documentation covers the latest rework
+> (10 fixes): **no-fallback** policy, Laya **deep** health check,
+> SARGable detection via a **real AST parser** (sqlparser-rs), **online**
+> DDL (`CONCURRENTLY`), target density by column type, naming
+> convention (63 bytes), sized connection pool, explicit **degraded**
+> state, **multi-schema** support, and an **observation window** for unused
+> indexes.
 >
-> **Renforcement sécurité (audit)** : TLS **vérifié** (rustls, chaîne +
-> hostname) avec `ssl_root_cert` optionnelle, rôle PG dédié non-superutilisateur,
-> installateur durci (`install.sh`) + `uninstall.sh` (`--purge`), `--dry-run`,
-> plafond de propositions par cycle, rotation des logs d'audit, validation de
-> config avec avertissements, CI (fmt / clippy / test / shellcheck).
-> Chaque fichier signale ses propres nouveautés.
+> **Security hardening (audit)**: **validated** TLS (rustls, chain +
+> hostname) with an optional `ssl_root_cert`, dedicated non-superuser PG role,
+> hardened installer (`install.sh`) + `uninstall.sh` (`--purge`), `--dry-run`,
+> proposal cap per cycle, audit log rotation, config
+> validation with warnings, CI (fmt / clippy / test / shellcheck).
+> Each file lists its own new features.
 
-## Table des matières
+## Table of contents
 
 | Doc | Description |
 |-----|-------------|
-| [01-system-overview](./01-system-overview.md) | Vue d'ensemble, architecture, composants, cycle de vie |
-| [02-component-diagrams](./02-component-diagrams.md) | Diagrammes de composants, séquence, données, flux |
-| [03-module-reference](./03-module-reference.md) | Référence module par module (API, types, fonctions) |
-| [04-protocols.md](./04-protocols.md) | Protocole Laya `/v1/systemone`, requêtes DMV PostgreSQL |
-| [05-configuration.md](./05-configuration.md) | Configuration YAML complète, valeurs par défaut, variables d'environnement |
-| [06-deployment.md](./06-deployment.md) | Installation, service systemd, monitoring, logging |
+| [01-system-overview](./01-system-overview.md) | Overview, architecture, components, lifecycle |
+| [02-component-diagrams](./02-component-diagrams.md) | Component, sequence, data, and flow diagrams |
+| [03-module-reference](./03-module-reference.md) | Module-by-module reference (API, types, functions) |
+| [04-protocols.md](./04-protocols.md) | Laya `/v1/systemone` protocol, PostgreSQL DMV queries |
+| [05-configuration.md](./05-configuration.md) | Full YAML configuration, defaults, environment variables |
+| [06-deployment.md](./06-deployment.md) | Installation, systemd service, monitoring, logging |
 
-## Vue rapide
+## Quick view
 
 ```
-PostgreSQL             Daemon pgindexai              Serveur Laya
+PostgreSQL             Daemon pgindexai              Laya server
 ──────────             ───────────────              ──────────────
   │                      │                           │
   │── pg_stat_           │                           │
   │   statements         │   (1) deep_health()       │
-  │── pg_class           │──────────────────────────▶│  payload de test
-  │── pg_index           │◀──────────────────────────│  (réponse validée)
-  │── pg_stats           │   FAILED ⇒ AUCUNE DDL     │
+  │── pg_class           │──────────────────────────▶│  test payload
+  │── pg_index           │◀──────────────────────────│  (validated response)
+  │── pg_stats           │   FAILED ⇒ NO DDL         │
   │── information_schema │   (no fallback)           │
   │                      │                           │
   │                      │── cycle 60s ──▶           │
   │                      │                           │
   │                      │  (2) HTTP POST /v1/systemone
-  │                      │──────────────────────────▶│  (contexte + choix)
-  │                      │                           │── IA décide
+  │                      │──────────────────────────▶│  (context + choice)
+  │                      │                           │── AI decides
   │                      │◀──────────────────────────│  (choice + confidence)
   │                      │                           │
   │                      │── APPLY/IGNORE ──▶        │
-  │                      │   DDL en ligne            │
-  │◀── CONCURRENTLY /    │   (validation + nettoyage
-  │   BEGIN-DROP-COMMIT  │    des index INVALIDE)    │
+  │                      │   online DDL              │
+  │◀── CONCURRENTLY /    │   (validation + cleanup
+  │   BEGIN-DROP-COMMIT  │    of INVALID indexes)    │
 ```
 
-## Points d'entrée
+## Entry points
 
-| Commande | Description |
+| Command | Description |
 |----------|-------------|
-| `pgindexai daemon` | Boucle continue (défaut, cycle 60s) |
-| `pgindexai run` | Cycle unique et exit |
-| `pgindexai run --dry-run` | Analyse et affichage **seulement** — aucun appel Laya, aucune DDL |
-| `pgindexai --config /path daemon` | Config personnalisée |
+| `pgindexai daemon` | Continuous loop (default, 60s cycle) |
+| `pgindexai run` | Single cycle, then exit |
+| `pgindexai run --dry-run` | Analysis and display **only** — no Laya call, no DDL |
+| `pgindexai --config /path daemon` | Custom config |
 
-## Prérequis
+## Prerequisites
 
-- **PostgreSQL 16+** (idéalement avec `pg_stat_statements` activé — sans elle, le daemon passe en mode **dégradé** : détection d'index manquants désactivée)
-- **Laya server** (`laya`) en mode serveur sur un port local — **requis pour appliquer des DDL** (politique sans fallback : sans Laya actif, le daemon reste en mode observation)
-- **Rust toolchain** (pour compiler depuis les sources)
+- **PostgreSQL 16+** (ideally with `pg_stat_statements` enabled — without it, the daemon enters **degraded** mode: missing-index detection is disabled)
+- **Laya server** (`laya`) in server mode on a local port — **required to apply DDL** (no-fallback policy: without an active Laya, the daemon stays in observation mode)
+- **Rust toolchain** (to build from source)
 
-## Licence
+## License
 
-MIT — Voir le fichier [LICENSE](../../LICENSE)
+MIT — See the [LICENSE](../../LICENSE) file
