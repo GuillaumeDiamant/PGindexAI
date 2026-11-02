@@ -1,84 +1,84 @@
 # 05 — Configuration
 
-> **Nouveautés (sécurité)** : `postgresql.password` et
-> `postgresql.ssl_root_cert` (CA auto-signée), `thresholds.max_proposals_per_cycle`
-> (budget par cycle), suppression des champs morts (`laya.ready_timeout_seconds`,
+> **New (security)**: `postgresql.password` and
+> `postgresql.ssl_root_cert` (self-signed CA), `thresholds.max_proposals_per_cycle`
+> (budget per cycle), removal of dead fields (`laya.ready_timeout_seconds`,
 > `laya.binary_path`, `laya.model_path`, `laya.variant`, `laya.cpu_mode`,
-> `thresholds.idle_seconds`). Toute clé inconnue déclenche un **avertissement**
-> visible au démarrage (pas une erreur silencieuse).
+> `thresholds.idle_seconds`). Any unknown key triggers a **warning**
+> visible at startup (not a silent error).
 
-## 1. Emplacement
+## 1. Location
 
-| Méthode | Chemin |
+| Method | Path |
 |---------|--------|
-| Défaut | `~/.config/PGindexAI/PGindexAI.yaml` |
+| Default | `~/.config/PGindexAI/PGindexAI.yaml` |
 | CLI | `pgindexai --config /path/to/config.yaml daemon` |
-| Fallback | `./PGindexAI.yaml` (si `config_dir()` est `None`) |
+| Fallback | `./PGindexAI.yaml` (if `config_dir()` is `None`) |
 
-**Droits recommandés : `0600`** — le fichier peut contenir un mot de passe.
+**Recommended permissions: `0600`** — the file may contain a password.
 
-## 2. Configuration complète
+## 2. Full configuration
 
 ```yaml
 # ─────────────────────────────────────────────
 # PostgreSQL
 # ─────────────────────────────────────────────
 postgresql:
-  host: "/var/run/postgresql"     # Socket Unix, ou nom d'hôte/IP pour du TCP
-  port: 5432                       # Port PostgreSQL
-  user: "pgindexai"                 # Rôle dédié non superutilisateur (voir 06)
-  database: "pgindexai_demo"            # Base cible
-  password: ""                     # Requis si pg_hba exige scram-sha-256 / md5
+  host: "/var/run/postgresql"     # Unix socket, or hostname/IP for TCP
+  port: 5432                       # PostgreSQL port
+  user: "pgindexai"                 # Dedicated non-superuser role (see 06)
+  database: "pgindexai_demo"            # Target database
+  password: ""                     # Required if pg_hba requires scram-sha-256 / md5
   ssl_mode: "disable"              # disable | require | verify-ca | verify-full
-  # ssl_root_cert: ""              # Chemin PEM d'une CA auto-signée (snakeoil,
-                                   # interne) pour verify-ca / verify-full.
-                                   # Sans cette clé : racines web PKI (Mozilla)
-                                   # uniquement.
+  # ssl_root_cert: ""              # PEM path of a self-signed CA (snakeoil,
+                                   # internal) for verify-ca / verify-full.
+                                   # Without this key: web PKI (Mozilla) roots
+                                   # only.
 
 # ─────────────────────────────────────────────
-# Serveur Laya (moteur de décision IA)
+# Laya server (AI decision engine)
 # ─────────────────────────────────────────────
 laya:
-  url: "http://127.0.0.1:8080"    # Endpoint HTTP
-  timeout_seconds: 30              # Timeout requête /v1/systemone (1..=600)
+  url: "http://127.0.0.1:8080"    # HTTP endpoint
+  timeout_seconds: 30              # /v1/systemone request timeout (1..=600)
 
 # ─────────────────────────────────────────────
-# Contrôle des actions DDL
+# DDL action control
 # ─────────────────────────────────────────────
 actions:
-  create_index: true               # Autoriser CREATE INDEX
-  drop_unused: true                # Autoriser DROP INDEX
-  rebuild_fragmented: true         # Autoriser REINDEX
+  create_index: true               # Allow CREATE INDEX
+  drop_unused: true                # Allow DROP INDEX
+  rebuild_fragmented: true         # Allow REINDEX
 
 # ─────────────────────────────────────────────
-# Seuils de décision
+# Decision thresholds
 # ─────────────────────────────────────────────
 thresholds:
-  cycle_seconds: 60                # Fréquence du cycle (1..=86400)
-  unused_minutes: 10080            # Fenêtre d'observation (défaut 7 jours)
-  fragmentation_pct: 70            # % de fragmentation (1..=100)
-  min_sargable_rows: 100           # Min. d'exécutions (pg_stat_statements.calls)
-  min_confidence: 0.7              # Confiance min. de Laya pour APPLY (0.0..=1.0)
-  max_proposals_per_cycle: 20      # Budget de propositions par cycle (1..=1000)
-  ddl_timeout_seconds: 1800        # Timeout DDL longs CONCURRENTLY (0 = illimité, 0..=86400)
+  cycle_seconds: 60                # Cycle frequency (1..=86400)
+  unused_minutes: 10080            # Observation window (default 7 days)
+  fragmentation_pct: 70            # Fragmentation % (1..=100)
+  min_sargable_rows: 100           # Min. executions (pg_stat_statements.calls)
+  min_confidence: 0.7              # Min. Laya confidence for APPLY (0.0..=1.0)
+  max_proposals_per_cycle: 20      # Proposal budget per cycle (1..=1000)
+  ddl_timeout_seconds: 1800        # Long CONCURRENTLY DDL timeout (0 = unlimited, 0..=86400)
 
 # ─────────────────────────────────────────────
-# Périmètre d'analyse (multi-schéma)
+# Analysis scope (multi-schema)
 # ─────────────────────────────────────────────
 analysis:
-  schemas: []                      # [] = tous les schémas non-système
+  schemas: []                      # [] = all non-system schemas
 
 # ─────────────────────────────────────────────
-# Pool de connexions PostgreSQL
+# PostgreSQL connection pool
 # ─────────────────────────────────────────────
 pg_pool:
   max_size: 16                     # 1..=512
   wait_timeout_ms: 30000           # 100..=600000
 
 # ─────────────────────────────────────────────
-# Densité cible par type de colonne
-# (tuples/page visés — sert à l'estimation de
-# taille des futurs index envoyée à Laya)
+# Target density per column type
+# (tuples/page targeted — used for the estimated
+# size of future indexes sent to Laya)
 # ─────────────────────────────────────────────
 density_by_type:
   int4: 200
@@ -100,107 +100,107 @@ logging:
   format: "json"                   # json | text
 
 # ─────────────────────────────────────────────
-# Logging des opérations d'index (historisation)
+# Index operation logging (audit trail)
 # ─────────────────────────────────────────────
 index_logging:
   enabled: true
   verbosity: "minimal"             # minimal | standard | verbose
   log_file: "/var/log/pgindexai/index_operations.log"
-  max_file_size_bytes: 10485760    # rotation à 10 MB (0 = désactivé)
+  max_file_size_bytes: 10485760    # rotate at 10 MB (0 = disabled)
   max_files: 5
 ```
 
-## 3. Valeurs par défaut
+## 3. Default values
 
-| Paramètre | Défaut | Contraintes |
+| Parameter | Default | Constraints |
 |-----------|--------|-------------|
-| `postgresql.host` | — (requis) | non vide |
-| `postgresql.port` | — (requis) | port valide |
-| `postgresql.user` | — (requis) | non vide |
-| `postgresql.database` | — (requis) | non vide |
-| `postgresql.password` | `null` | requis si auth scram/md5 |
+| `postgresql.host` | — (required) | non-empty |
+| `postgresql.port` | — (required) | valid port |
+| `postgresql.user` | — (required) | non-empty |
+| `postgresql.database` | — (required) | non-empty |
+| `postgresql.password` | `null` | required if scram/md5 auth |
 | `postgresql.ssl_mode` | `disable` | `disable` \| `require` \| `verify-ca` \| `verify-full` |
-| `postgresql.ssl_root_cert` | `null` | chemin PEM lisible |
-| `laya.url` | — (requis) | non vide |
+| `postgresql.ssl_root_cert` | `null` | readable PEM path |
+| `laya.url` | — (required) | non-empty |
 | `laya.timeout_seconds` | `30` | `1..=600` |
 | `actions.create_index` | `true` | bool |
 | `actions.drop_unused` | `true` | bool |
 | `actions.rebuild_fragmented` | `true` | bool |
 | `thresholds.cycle_seconds` | `60` | `1..=86400` |
-| `thresholds.unused_minutes` | `10080` (7 j) | `>= 1` |
+| `thresholds.unused_minutes` | `10080` (7 d) | `>= 1` |
 | `thresholds.fragmentation_pct` | `70` | `1..=100` |
 | `thresholds.min_sargable_rows` | `100` | `>= 1` |
 | `thresholds.min_confidence` | `0.7` | `0.0..=1.0` |
 | `thresholds.max_proposals_per_cycle` | `20` | `1..=1000` |
-| `thresholds.ddl_timeout_seconds` | `1800` (30 min) | `0..=86400` (0 = illimité) |
-| `analysis.schemas` | `[]` (tous les schémas non-système) | liste |
+| `thresholds.ddl_timeout_seconds` | `1800` (30 min) | `0..=86400` (0 = unlimited) |
+| `analysis.schemas` | `[]` (all non-system schemas) | list |
 | `pg_pool.max_size` | `16` | `1..=512` |
 | `pg_pool.wait_timeout_ms` | `30000` | `100..=600000` |
-| `density_by_type.*` | cf. §2 | `> 0` et finis |
-| `logging.level` | `info` | niveau tracing |
+| `density_by_type.*` | see §2 | `> 0` and finite |
+| `logging.level` | `info` | tracing level |
 | `logging.format` | `json` | `json` \| `text` |
 | `index_logging.enabled` | `true` | bool |
 | `index_logging.verbosity` | `minimal` | `minimal` \| `standard` \| `verbose` |
-| `index_logging.log_file` | `""` (stdout) | chemin |
-| `index_logging.max_file_size_bytes` | `10485760` | octets, `0` = off |
-| `index_logging.max_files` | `5` | entier |
+| `index_logging.log_file` | `""` (stdout) | path |
+| `index_logging.max_file_size_bytes` | `10485760` | bytes, `0` = off |
+| `index_logging.max_files` | `5` | integer |
 
-## 4. Variables d'environnement
+## 4. Environment variables
 
 | Variable | Usage |
 |----------|-------|
-| `RUST_LOG` | Surcharge le niveau de logging (ex: `RUST_LOG=debug`) |
-| `RUST_BACKTRACE` | Active les backtraces (ex: `RUST_BACKTRACE=1`) |
+| `RUST_LOG` | Overrides the logging level (e.g. `RUST_LOG=debug`) |
+| `RUST_BACKTRACE` | Enables backtraces (e.g. `RUST_BACKTRACE=1`) |
 
-## 5. Sémantique TLS (importante)
+## 5. TLS semantics (important)
 
-Le client utilise **rustls** (`tokio-postgres-rustls`). Conséquences :
+The client uses **rustls** (`tokio-postgres-rustls`). Consequences:
 
-| `ssl_mode` | Comportement effectif |
+| `ssl_mode` | Effective behavior |
 |------------|----------------------|
-| `disable` | Pas de TLS. **Seul mode possible sur socket Unix** (erreur claire sinon). |
-| `require` | TLS **avec vérification complète du certificat** (chaîne + nom d'hôte) — au moins aussi strict que libpq `verify-full`. |
-| `verify-ca` | Identique à `require` avec rustls (la vérification est toujours totale). |
-| `verify-full` | Identique à `require` avec rustls. |
+| `disable` | No TLS. **Only possible mode on a Unix socket** (clear error otherwise). |
+| `require` | TLS **with full certificate validation** (chain + hostname) — at least as strict as libpq `verify-full`. |
+| `verify-ca` | Identical to `require` with rustls (validation is always full). |
+| `verify-full` | Identical to `require` with rustls. |
 
-- Les **racines de confiance** : web PKI (Mozilla) **et** le fichier PEM
-  `ssl_root_cert` s'il est fourni. Un certificat auto-signé (snakeoil, CA
-  interne) **sans** `ssl_root_cert` est **refusé** (`InvalidCertificate`).
-- La différence avec libpq : `require` y signifie « chiffrer sans vérifier » ;
-  ici tout mode TLS vérifie. C'est plus strict — c'est volontaire.
-- Le nom d'hôte du certificat (CN/SAN) doit correspondre à `postgresql.host`
-  (ex: `DNS:localhost,IP:127.0.0.1` pour du local).
+- **Trusted roots**: web PKI (Mozilla) **and** the `ssl_root_cert` PEM file
+  if provided. A self-signed certificate (snakeoil, internal CA)
+  **without** `ssl_root_cert` is **rejected** (`InvalidCertificate`).
+- The difference vs libpq: `require` there means "encrypt without validating";
+  here every TLS mode validates. That is stricter — it is intentional.
+- The certificate hostname (CN/SAN) must match `postgresql.host`
+  (e.g. `DNS:localhost,IP:127.0.0.1` for local).
 
-## 6. Comportements induits par la configuration
+## 6. Behavior driven by the configuration
 
-| Configuration | Comportement |
+| Configuration | Behavior |
 |---------------|--------------|
-| `analysis.schemas: []` | Tous les schémas non-système sont analysés |
-| `analysis.schemas: [a, b]` | Uniquement les schémas listés |
-| `pg_pool.wait_timeout_ms` | Si le pool est saturé, l'attente est bornée |
-| `density_by_type.*` | Sert uniquement à l'**estimation de taille** des futurs index envoyée au contexte de décision Laya — aucun effet sur la détection |
-| `thresholds.unused_minutes` | **Fenêtre minimale d'observation** : si le serveur PG tourne depuis moins de ce délai, l'analyse « index inutilisés » est sautée (les compteurs `pg_stat_*` sont remis à zéro au redémarrage) |
-| `thresholds.min_confidence` | Seuil de confiance Laya ; **en dessous, la proposition est ignorée (aucun fallback heuristique)** |
-| `thresholds.max_proposals_per_cycle` | Chaque détecteur est borné en SQL (`LIMIT`) **et** la liste totale est tronquée à ce budget avec un avertissement (les propositions écartées seront re-détectées au cycle suivant) |
-| `thresholds.ddl_timeout_seconds` | Borne la durée des builds `CONCURRENTLY` (`statement_timeout` par session, remis à zéro après) ; `0` = illimité. Garder généreux : un timeout trop court sur grosse table créerait une boucle build→annulé→retry |
-| clé inconnue dans la config | **Avertissement** au démarrage (ex: `dashboard:`, `idle_seconds:`) — la clé est ignorée mais signalée |
+| `analysis.schemas: []` | All non-system schemas are analyzed |
+| `analysis.schemas: [a, b]` | Only the listed schemas |
+| `pg_pool.wait_timeout_ms` | If the pool is saturated, the wait is bounded |
+| `density_by_type.*` | Used only for the **size estimation** of future indexes sent to the Laya decision context — no effect on detection |
+| `thresholds.unused_minutes` | **Minimum observation window**: if the PG server has been up for less than this delay, the "unused indexes" analysis is skipped (the `pg_stat_*` counters are reset at restart) |
+| `thresholds.min_confidence` | Laya confidence threshold; **below it, the proposal is ignored (no heuristic fallback)** |
+| `thresholds.max_proposals_per_cycle` | Each detector is bounded in SQL (`LIMIT`) **and** the total list is truncated to this budget with a warning (dropped proposals will be re-detected on the next cycle) |
+| `thresholds.ddl_timeout_seconds` | Bounds the duration of `CONCURRENTLY` builds (`statement_timeout` per session, reset afterwards); `0` = unlimited. Keep it generous: a too-short timeout on a large table would create a build→cancelled→retry loop |
+| unknown key in the config | **Warning** at startup (e.g. `dashboard:`, `idle_seconds:`) — the key is ignored but reported |
 
 ## 7. Validation
 
-Le chargement de config échoue avec :
+Config loading fails with:
 
-| Erreur | Cause |
+| Error | Cause |
 |--------|-------|
-| `Read(path, err)` | Fichier inexistant ou inaccessible |
-| `Parse(path, err)` | YAML invalide (indentation, syntaxe) ou type inattendu |
-| `Validation("...")` | Incohérence de valeurs (liste des erreurs concaténées) — ex: `cycle_seconds = 0`, `min_confidence = 1.5`, `ssl_mode` non supporté |
+| `Read(path, err)` | File missing or inaccessible |
+| `Parse(path, err)` | Invalid YAML (indentation, syntax) or unexpected type |
+| `Validation("...")` | Value inconsistency (list of errors concatenated) — e.g. `cycle_seconds = 0`, `min_confidence = 1.5`, unsupported `ssl_mode` |
 
-Les erreurs de validation sont **cumulées** : toutes les incohérences sont
-rapportées d'un coup, pas la première rencontrée.
+Validation errors are **accumulated**: all inconsistencies are
+reported at once, not just the first one encountered.
 
-## 8. Exemples de configuration
+## 8. Configuration examples
 
-### Production (Laya actif, TLS vérifié)
+### Production (Laya active, TLS validated)
 
 ```yaml
 postgresql:
@@ -208,9 +208,9 @@ postgresql:
   port: 5432
   user: "pgindexai"
   database: "production"
-  password: "…"                      # ou via pg_hba peer + socket
+  password: "…"                      # or via pg_hba peer + socket
   ssl_mode: "verify-full"
-  ssl_root_cert: "/etc/ssl/private/pgindexai-ca.pem"  # CA interne
+  ssl_root_cert: "/etc/ssl/private/pgindexai-ca.pem"  # Internal CA
 
 laya:
   url: "http://127.0.0.1:8080"
@@ -218,13 +218,13 @@ laya:
 
 actions:
   create_index: true
-  drop_unused: false    # DROP désactivé en production
+  drop_unused: false    # DROP disabled in production
   rebuild_fragmented: true
 
 thresholds:
   min_confidence: 0.9
   min_sargable_rows: 500
-  max_proposals_per_cycle: 10   # budget prudent en prod
+  max_proposals_per_cycle: 10   # conservative budget in prod
 
 analysis:
   schemas: ["public", "billing", "crm"]
@@ -234,7 +234,7 @@ pg_pool:
   wait_timeout_ms: 15000
 ```
 
-### Safe mode (aucune action automatique)
+### Safe mode (no automatic action)
 
 ```yaml
 actions:
@@ -243,14 +243,14 @@ actions:
   rebuild_fragmented: false
 ```
 
-### Dev mode (local, log détaillé)
+### Dev mode (local, detailed log)
 
 ```yaml
 postgresql:
   host: "/var/run/postgresql"
   user: "pgindexai"
   database: "pgindexai_demo"
-  ssl_mode: "disable"    # socket Unix → TLS inapplicable
+  ssl_mode: "disable"    # Unix socket → TLS not applicable
 
 laya:
   url: "http://127.0.0.1:8080"

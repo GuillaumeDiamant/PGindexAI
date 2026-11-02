@@ -1,17 +1,17 @@
-# 02 — Diagrammes
+# 02 — Diagrams
 
-## 1. Diagramme de composants
+## 1. Component diagram
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
-│                         pgindexai (binaire Rust)                          │
+│                         pgindexai (Rust binary)                           │
 │                                                                          │
 │  ┌───────────────────────────────────────────────────────────────────┐  │
 │  │                          main.rs                                   │  │
 │  │                                                                    │  │
-│  │  Cli (clap) → Config (YAML) → Pool (deadpool, taille+timeout)     │  │
+│  │  Cli (clap) → Config (YAML) → Pool (deadpool, size+timeout)       │  │
 │  │       → check_pg_stat_statements → DaemonState (Healthy|Degraded)  │  │
-│  │       → LayaClient (reqwest) → deep_health() (payload de test)     │  │
+│  │       → LayaClient (reqwest) → deep_health() (test payload)        │  │
 │  │                                                                    │  │
 │  │  ┌──────────────┐   ┌──────────────┐                               │  │
 │  │  │  run_daemon()│   │   run_once() │                               │  │
@@ -33,16 +33,16 @@
 │  │    ├── analyze_fragmentation()    → Vec<Proposal>  (btree only)    │  │
 │  │    └── analyze_missing_sargable() → Vec<Proposal> (si Healthy)     │  │
 │  │          ├── parse AST (sqlparser)                                  │  │
-│  │          ├── types réels + null_frac                                │  │
+│  │          ├── real types + null_frac                                 │  │
 │  │          ├── naming::generate_index_name()                          │  │
-│  │          └── densité par bucket → taille estimée                    │  │
+│  │          └── density per bucket → estimated size                    │  │
 │  │                                                                    │  │
 │  │  apply_proposals():                                                │  │
-│  │    ├── deep_health()  → FAILED ? → TOUTES SKIPPED (no fallback)    │  │
+│  │    ├── deep_health()  → FAILED ? → ALL SKIPPED (no fallback)       │  │
 │  │    ├── Laya decision HTTP POST /v1/systemone                       │  │
 │  │    ├── confidence ≥ min_confidence ?                               │  │
-│  │    └── match decision → ddl::execute_*()   (en ligne :             │  │
-│  │         CREATE/REINDEX CONCURRENTLY, DROP en transaction)          │  │
+│  │    └── match decision → ddl::execute_*()   (online:                │  │
+│  │         CREATE/REINDEX CONCURRENTLY, DROP in transaction)          │  │
 │  └───────────────────────────────────────────────────────────────────┘  │
 │                                                                          │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐          │
@@ -68,7 +68,7 @@
 │  │                       config.rs                                    │  │
 │  │                                                                    │  │
 │  │  Config { postgresql, laya, actions, thresholds,                  │  │
-│  │           analysis (multi-schéma), pg_pool,                       │  │
+│  │           analysis (multi-schema), pg_pool,                       │  │
 │  │           logging, index_logging, density_by_type }               │  │
 │  │                                                                    │  │
 │  │  AnalysisConfig { schemas: Vec<String> }                          │  │
@@ -81,7 +81,7 @@
 │  │                     laya/ (HTTP client)                            │  │
 │  │                                                                    │  │
 │  │  LayaClient { client (reqwest + timeout), base_url }              │  │
-│  │    ├── deep_health() → POST /v1/systemone (payload test réel)     │  │
+│  │    ├── deep_health() → POST /v1/systemone (real test payload)     │  │
 │  │    │     └── valide choice ∈ {0,1} + confidence ∈ [0,1]           │  │
 │  │    ├── decision(payload) → POST /v1/systemone                     │  │
 │  │    └── build_payload(state, criteria) → LayaPayload               │  │
@@ -97,7 +97,7 @@
                                │
                      HTTP POST ▼
                ┌────────────────────────────┐
-               │      Serveur Laya (IA)      │
+               │      Laya Server (AI)       │
                │   http://127.0.0.1:8080     │
                │   /v1/systemone             │
                └────────────────────────────┘
@@ -109,11 +109,11 @@
                │  pg_stat_statements        │
                │  information_schema        │
                │  pg_stats                  │
-               │  pg_stat_ssl (vérif. TLS)  │
+               │  pg_stat_ssl (TLS check)   │
                └────────────────────────────┘
 ```
 
-## 2. Diagramme de séquence — cycle d'analyse
+## 2. Sequence diagram — analysis cycle
 
 ```
 ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐
@@ -121,10 +121,10 @@
 │          │  │          │  │ Server   │  │ Engine   │  │ Writer   │
 └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘
      │              │             │              │              │
-     │  0. Gate fenêtre d'observation (index inutilisés)        │
+     │  0. Observation window gate (unused indexes)             │
      │─── observation_window_ok() ▶│             │              │
      │◀── true (uptime OK) ───────│             │              │
-     │   (false → analyse unused sautée)                │       │
+     │   (false → unused analysis skipped)              │       │
      │              │             │              │              │
      │  1. Unused Indexes        │              │              │
      │─── get_unused_indexes() ▶│              │              │
@@ -134,50 +134,50 @@
      │─── get_fragmented_indexes()▶│             │              │
      │◀── Vec<FragmentationInfo>─│              │              │
      │              │             │              │              │
-     │  3. SARGable (si DaemonState = Healthy)        │         │
+     │  3. SARGable (if DaemonState = Healthy)        │         │
      │─── pg_stat_statements top50▶│             │              │
-     │─── parse AST (sqlparser)  [côté Rust]          │         │
+     │─── parse AST (sqlparser)  [Rust side]          │         │
      │─── get_existing_indexes() ▶│             │              │
      │─── fetch_column_metadata()▶│             │              │
      │─── get_table_cardinality()▶│             │              │
      │◀── Vec<MissingSargable>───│              │              │
      │              │             │              │              │
-     │  4. Vec<Proposal> (3 types)  [naming + densité]          │
+     │  4. Vec<Proposal> (3 types)  [naming + density]          │
      │              │             │              │              │
-     │  5. deep_health()   [NOUVEAU : 1x par lot]              │
+     │  5. deep_health()   [NEW: 1x per batch]                 │
      │─── POST /v1/systemone (test)▶│          │              │
-     │◀── response validée ───────│             │              │
-     │   (FAILED → TOUTES les propositions SKIPPED, no fallback)│
+     │◀── validated response ─────│             │              │
+     │   (FAILED → ALL proposals SKIPPED, no fallback)          │
      │              │             │              │              │
      │  6. for each proposal :                                  │
      │              │             │              │              │
      │  │  6a. Decision request        │              │         │
      │  │─── POST /v1/systemone ──────▶│              │         │
-     │  │  (LayaPayload spécialisé)   │              │         │
+     │  │  (specialized LayaPayload)  │              │         │
      │  │◀── LayaResponse (choice, confidence) ──────│         │
      │  │                              │              │         │
-     │  │  6b. confidence ≥ min_confidence ? (non → skip)       │
-     │  │  6c. choice appliqué ? (non → skip)                  │
-     │  │  6d. action flag enabled ? (non → skip)              │
+     │  │  6b. confidence ≥ min_confidence ? (no → skip)        │
+     │  │  6c. choice applied? (no → skip)                     │
+     │  │  6d. action flag enabled ? (no → skip)               │
      │  │                              │              │         │
-     │  │  6e. DDL en ligne           │              │         │
+     │  │  6e. Online DDL             │              │         │
      │  │─── execute_*() ─────────────▶│              │         │
      │  │   CONCURRENTLY → auto-commit│              │         │
      │  │   DROP INDEX → BEGIN/COMMIT │              │         │
      │  │─── DDL query ───────────────▶│              │         │
      │  │◀── Ok ──────────────────────│              │         │
-     │  │   (validation post-DDL : index_valid,            │
-     │  │    nettoyage index INVALIDE si build interrompu) │
+     │  │   (post-DDL validation: index_valid,             │
+     │  │    cleanup INVALID indexes if build interrupted) │
      │  │                              │              │         │
-     │  │  6f. Log résultat           │              │         │
+     │  │  6f. Log result             │              │         │
      │  │─────────────────────────────────────────▶│           │
      │  │                              │              │         │
      │              │             │              │              │
-     │  7. Vec<Proposal> appliquées                                   │
+     │  7. Vec<Proposal> applied                                      │
      │              │             │              │              │
 ```
 
-## 3. Diagramme de données
+## 3. Data diagram
 
 ```
 ┌───────────────────────────────────────────────────────────────────────────┐
@@ -188,63 +188,63 @@
 │  ├── idx_scan, idx_tup_read, idx_tup_fetch                               │
 │  ├── schemaname, relname (table), indexrelname (index)                   │
 │  ├── pg_get_indexdef() → CREATE INDEX ... ON ... (col1, col2)            │
-│  └── pg_relation_size() → taille en octets                               │
+│  └── pg_relation_size() → size in bytes                                  │
 │                                                                           │
 │  pg_index                                                                 │
-│  ├── indisvalid, indisprimary, indisunique (filtres unused)              │
-│  └── indrelid → table ciblée                                             │
+│  ├── indisvalid, indisprimary, indisunique (unused filters)              │
+│  └── indrelid → target table                                             │
 │                                                                           │
-│  pg_am  (NOUVEAU)                                                         │
-│  └── amname = 'btree' → périmètre fragmentation                          │
+│  pg_am  (NEW)                                                             │
+│  └── amname = 'btree' → fragmentation scope                              │
 │                                                                           │
 │  pg_stat_user_tables                                                      │
 │  ├── n_live_tup, n_dead_tup, n_mod_since_analyze                         │
-│  └── relid → jointure avec pg_class                                      │
+│  └── relid → join with pg_class                                          │
 │                                                                           │
 │  pg_stat_statements                                                       │
-│  ├── queryid, query (requête textuelle → parse AST sqlparser)            │
+│  ├── queryid, query (text query → parse AST sqlparser)                   │
 │  └── calls, mean/max/min_exec_time, rows                                 │
 │                                                                           │
 │  pg_indexes                                                               │
 │  ├── schemaname, tablename, indexname, indexdef                          │
-│  └── source pour get_existing_indexes() (SARGable filter)                │
+│  └── source for get_existing_indexes() (SARGable filter)                 │
 │                                                                           │
 │  pg_class                                                                 │
 │  ├── relname, relkind ('r'=table, 'i'=index)                             │
-│  ├── relpages::bigint, reltuples::float8 (estimation cardinalité)        │
-│  └── pg_relation_size() → taille des index                               │
+│  ├── relpages::bigint, reltuples::float8 (cardinality estimate)          │
+│  └── pg_relation_size() → index size                                     │
 │                                                                           │
-│  information_schema.columns  (NOUVEAU)                                    │
+│  information_schema.columns  (NEW)                                        │
 │  ├── table_schema, table_name, column_name                               │
-│  ├── data_type (ex: "character varying") → bucket de densité             │
-│  └── is_nullable (YES/NO) → décision index filtré                        │
+│  ├── data_type (e.g.: "character varying") → density bucket              │
+│  └── is_nullable (YES/NO) → filtered index decision                      │
 │                                                                           │
-│  pg_stats  (NOUVEAU)                                                      │
-│  ├── attname, null_frac::float8 → seuil 0.10 pour "WHERE IS NOT NULL"    │
-│  └── schemaname + tablename → par table                                  │
+│  pg_stats  (NEW)                                                          │
+│  ├── attname, null_frac::float8 → threshold 0.10 for "WHERE IS NOT NULL" │
+│  └── schemaname + tablename → per table                                  │
 │                                                                           │
-│  pg_postmaster_start_time()  (NOUVEAU)                                    │
-│  └── début de la fenêtre d'observation (gate index inutilisés)           │
+│  pg_postmaster_start_time()  (NEW)                                        │
+│  └── start of the observation window (unused-index gate)                 │
 │                                                                           │
 │  pg_extension                                                             │
 │  ├── extname, extversion                                                 │
-│  └── vérification pg_stat_statements (DaemonState Healthy|Degraded)      │
+│  └── check pg_stat_statements (DaemonState Healthy|Degraded)             │
 │                                                                           │
 └───────────────────────────────────────────────────────────────────────────┘
 ```
 
-## 4. Flux de décision
+## 4. Decision flow
 
 ```
    Vec<Proposal> { action, ddl, reason, confidence, table }
          │
          ▼
    ┌────────────────────────────────────────┐
-   │ deep_health() OK ?  [NOUVEAU]          │
-   │  (payload de test réel, réponse        │
-   │   validée structurellement)            │
+   │ deep_health() OK ?  [NEW]              │
+   │  (real test payload, response          │
+   │   structurally validated)              │
    └──────┬─────────────────────────────────┘
-   no ────┴──▶ TOUTES les propositions SKIPPED (no fallback, warn log)
+   no ────┴──▶ ALL proposals SKIPPED (no fallback, warn log)
    yes
          │
          ▼
@@ -255,8 +255,8 @@
          ▼
    ┌──────────────────┐
    │ build_payload()  │──▶ POST /v1/systemone
-   │ (critères        │    (spécialisés par type de proposition)
-   │  par type)       │
+   │ (criteria        │    (specialized by proposal type)
+   │  by type)        │
    └──────┬───────────┘
          │
          ▼
@@ -271,12 +271,12 @@
    │ confidence ≥     │
    │ min_confidence?  │
    └──────┬───────────┘
-    no ───┴──▶ skip (debug log, aucune heuristique)
+    no ───┴──▶ skip (debug log, no heuristic)
     yes
          │
          ▼
    ┌──────────────────┐
-   │ choice appliqué  │──▶ sinon skip (Ignore)
+   │ choice applied   │──▶ else skip (Ignore)
    └──────┬───────────┘
          │
          ▼
@@ -288,8 +288,8 @@
          │
          ▼
    ┌──────────────────────────────┐
-   │ DDL en ligne [NOUVEAU]       │
-   │ index_exists() → skip si OK  │
+   │ Online DDL [NEW]             │
+   │ index_exists() → skip if OK  │
    │ CONCURRENTLY → auto-commit   │
    │ DROP INDEX → BEGIN/COMMIT    │
    │ validation + cleanup INVALID │
@@ -298,55 +298,55 @@
          ▼
    ┌──────────────────┐
    │ IndexLogWriter   │
-   │ .log(log)        │──▶ stdout + fichier JSONL
+   │ .log(log)        │──▶ stdout + JSONL file
    └──────────────────┘
 ```
 
-## 5. Structure du projet
+## 5. Project structure
 
 ```
 pgindexai/
-├── Cargo.toml                    # Dépendances Rust (sqlparser 0.52, rustls,
+├── Cargo.toml                    # Rust dependencies (sqlparser 0.52, rustls,
 │                                 # tokio-postgres-rustls, deadpool-postgres)
-├── Cargo.lock                    # Verrouillé (projet binaire)
-├── install.sh                    # Installateur durci : détection PG (SHOW),
-│                                 # rôle dédié pgindexai, pg_hba ciblée,
-│                                 # config 0600, unité systemd, --dry-run
-├── uninstall.sh                  # Désinstallation : service, binaire, config,
-│                                 # --purge (base + rôle + pg_hba),
+├── Cargo.lock                    # Locked (binary project)
+├── install.sh                    # Hardened installer: PG detection (SHOW),
+│                                 # dedicated pgindexai role, targeted pg_hba,
+│                                 # config 0600, systemd unit, --dry-run
+├── uninstall.sh                  # Uninstallation: service, binary, config,
+│                                 # --purge (database + role + pg_hba),
 │                                 # --clean-legacy, --dry-run
 ├── config/
-│   ├── PGindexAI.yaml              # Template de configuration (multi-schéma,
-│   │                             # TLS, pool, densités, seuils)
-│   └── pgindexai.service          # Unité systemd (référentielle)
+│   ├── PGindexAI.yaml              # Configuration template (multi-schema,
+│   │                             # TLS, pool, densities, thresholds)
+│   └── pgindexai.service          # systemd unit (reference)
 ├── sql/
-│   ├── demo_schema.sql           # Schéma de démo (5 tables, 23 index)
-│   └── demo_workload.sql         # Workload de test (8 phases)
+│   ├── demo_schema.sql           # Demo schema (5 tables, 23 indexes)
+│   └── demo_workload.sql         # Test workload (8 phases)
 ├── .github/
 │   └── workflows/
-│       └── ci.yml                # CI : fmt, clippy, test, shellcheck
+│       └── ci.yml                # CI: fmt, clippy, test, shellcheck
 ├── docs/
 │   └── architecture/
-│       ├── README.md             # Table des matières
-│       ├── 01-system-overview.md # Vue d'ensemble, architecture
-│       ├── 02-component-diagrams.md # Diagrammes
-│       ├── 03-module-reference.md # Référence modules
-│       ├── 04-protocols.md       # Protocoles
+│       ├── README.md             # Table of contents
+│       ├── 01-system-overview.md # Overview, architecture
+│       ├── 02-component-diagrams.md # Diagrams
+│       ├── 03-module-reference.md # Module reference
+│       ├── 04-protocols.md       # Protocols
 │       ├── 05-configuration.md   # Configuration
-│       └── 06-deployment.md      # Déploiement
+│       └── 06-deployment.md      # Deployment
 ├── src/
-│   ├── main.rs                   # Point d'entrée, CLI, daemon/run, --dry-run
-│   ├── analyzer.rs               # Moteur d'analyse (3 détecteurs + Laya)
+│   ├── main.rs                   # Entry point, CLI, daemon/run, --dry-run
+│   ├── analyzer.rs               # Analysis engine (3 detectors + Laya)
 │   ├── state.rs                  # DaemonState (Healthy/Degraded)
-│   ├── naming.rs                 # Convention de nommage d'index (63 octets)
-│   ├── config.rs                 # Chargement YAML + validation + avertissements
-│   ├── ddl.rs                    # Exécution DDL en ligne (CONCURRENTLY)
-│   ├── index_log.rs              # Historisation JSONL + rotation de fichiers
+│   ├── naming.rs                 # Index naming convention (63 bytes)
+│   ├── config.rs                 # YAML loading + validation + warnings
+│   ├── ddl.rs                    # Online DDL execution (CONCURRENTLY)
+│   ├── index_log.rs              # JSONL history + file rotation
 │   ├── db/
-│   │   ├── mod.rs                # Pool de connexions + TLS (rustls)
-│   │   └── queries.rs            # Requêtes DMV + parseur AST (sqlparser)
+│   │   ├── mod.rs                # Connection pool + TLS (rustls)
+│   │   └── queries.rs            # DMV queries + AST parser (sqlparser)
 │   └── laya/
-│       ├── mod.rs                # Client HTTP Laya (deep_health + décision)
-│       └── types.rs              # Types du protocole Laya
+│       ├── mod.rs                # Laya HTTP client (deep_health + decision)
+│       └── types.rs              # Laya protocol types
 └── README.md
 ```

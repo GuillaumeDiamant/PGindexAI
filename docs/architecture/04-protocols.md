@@ -1,17 +1,17 @@
-# 04 — Protocoles
+# 04 — Protocols
 
-> **Nouveautés** : health check **profond** (payload de test réel vers
-> `/v1/systemone`, validation structurelle de la réponse), politique
-> **sans fallback** (Laya injoignable → aucune DDL appliquée), détection
-> SARGable par **vrai parseur AST** (sqlparser-rs), types de colonnes
-> réels + densités cibles dans le contexte de décision.
+> **New features**: **deep** health check (real test payload to
+> `/v1/systemone`, structural validation of the response), **no-fallback**
+> policy (Laya unreachable → no DDL applied), SARGable detection via a
+> **real AST parser** (sqlparser-rs), real column types + target densities
+> in the decision context.
 
-## 1. Protocole Laya `/v1/systemone`
+## 1. Laya protocol `/v1/systemone`
 
-### 1.1 Health check profond (nouveau)
+### 1.1 Deep health check (new)
 
-Au démarrage **et** avant chaque lot de propositions, le daemon envoie un
-payload de test réel au serveur Laya — pas une simple sonde de connectivité :
+At startup **and** before each batch of proposals, the daemon sends a
+real test payload to the Laya server — not just a connectivity probe:
 
 ```json
 {
@@ -29,24 +29,24 @@ payload de test réel au serveur Laya — pas une simple sonde de connectivité 
 }
 ```
 
-La réponse est **validée structurellement** :
+The response is **structurally validated**:
 
-| Vérification | Échec → |
+| Check | Failure → |
 |--------------|---------|
 | `answers.action.choice` ∈ `{"0", "1"}` | `LayaError::InvalidResponse` |
 | `answers.action.confidence` ∈ `[0, 1]` | `LayaError::InvalidResponse` |
-| Connexion + HTTP 2xx + JSON parsable | `LayaError::Unreachable` / `Http` / `Deserialize` |
+| Connection + HTTP 2xx + parseable JSON | `LayaError::Unreachable` / `Http` / `Deserialize` |
 
-Cela détecte les cas où la connectivité HTTP fonctionne mais que le pipeline
-de décision (modèle, variante, parsing de réponse) est cassé.
+This detects cases where HTTP connectivity works but the decision pipeline
+(model, variant, response parsing) is broken.
 
-### 1.2 Request de décision
+### 1.2 Decision request
 
 **POST** `http://127.0.0.1:8080/v1/systemone`
 
-Le payload est **spécialisé par proposition** : le daemon connaît déjà
-l'action qu'il propose ; Laya arbitre entre *appliquer* et *ignorer* (et,
-pour les CREATE, entre variante standard et filtrée) :
+The payload is **specialized per proposal**: the daemon already knows
+the action it proposes; Laya arbitrates between *apply* and *ignore* (and,
+for CREATEs, between the standard and filtered variants):
 
 ```json
 {
@@ -64,18 +64,18 @@ pour les CREATE, entre variante standard et filtrée) :
 }
 ```
 
-**Critères envoyés selon le type de proposition** :
+**Criteria sent depending on the proposal type**:
 
-| Proposition du daemon | `"0"` | `"1"` | `"2"` |
+| Daemon proposal | `"0"` | `"1"` | `"2"` |
 |-----------------------|-------|-------|-------|
-| `DROP INDEX` | Keep (l'index pourra servir plus tard) | Drop | — |
+| `DROP INDEX` | Keep (the index may be needed later) | Drop | — |
 | `REINDEX` | Keep (fragmentation acceptable) | Rebuild | — |
-| `CREATE INDEX` | Ignore (pas d'index nécessaire) | Créer (standard) | Créer (filtré `WHERE … IS NOT NULL`) |
+| `CREATE INDEX` | Ignore (no index needed) | Create (standard) | Create (filtered `WHERE … IS NOT NULL`) |
 
-**Contexte enrichi** (nouveau) : pour les CREATE INDEX, le contexte de
-décision inclut le **type réel de la colonne**, la fraction de NULL
-(`null_frac`), la **densité cible** du bucket de type et la **taille
-estimée** de l'index (`reltuples / density × 8192` octets) :
+**Enriched context** (new): for CREATE INDEX, the decision context includes
+the **real column type**, the NULL fraction (`null_frac`), the **target
+density** of the type bucket and the **estimated size** of the index
+(`reltuples / density × 8192` bytes):
 
 ```
 SARGable query on public.orders: shipping_method (type: character varying,
@@ -106,73 +106,73 @@ for varchar: 30 tuples/page, estimated index size: 163848192 bytes.
 }
 ```
 
-Le daemon exige que :
-- `choice` soit une **chaîne** (`"0"`, `"1"`, `"2"` — un entier brut provoque
-  une erreur de deserialisation `LayaError::Deserialize`) ;
-- `confidence` soit un flottant ∈ `[0, 1]` (vérifié par `deep_health()`).
+The daemon requires that:
+- `choice` is a **string** (`"0"`, `"1"`, `"2"` — a bare integer triggers
+  a deserialization error `LayaError::Deserialize`);
+- `confidence` is a float ∈ `[0, 1]` (checked by `deep_health()`).
 
-Toute réponse malformée est traitée comme Laya indisponible : la
-proposition (ou le lot, selon le contexte) est simplement sautée.
+Any malformed response is treated as Laya unavailable: the
+proposal (or the batch, depending on context) is simply skipped.
 
 ### Mapping `choice` → action
 
-Le mapping dépend du **type de proposition** (le daemon sait déjà ce qu'il propose) :
+The mapping depends on the **proposal type** (the daemon already knows what it proposes):
 
-| Proposition | `"0"` | `"1"` | `"2"` |
+| Proposal | `"0"` | `"1"` | `"2"` |
 |------------|-------|-------|-------|
-| `DropIndex` | Keep (ignoré) | **APPLY** `DROP INDEX IF EXISTS {schema}.{index}` | invalide |
-| `RebuildIndex` | Keep (ignoré) | **APPLY** `REINDEX INDEX CONCURRENTLY {schema}.{index}` | invalide |
-| `CreateIndex` / `CreateFilteredIndex` | Ignore | **APPLY** (variante standard) | **APPLY** (variante filtrée) |
+| `DropIndex` | Keep (ignored) | **APPLY** `DROP INDEX IF EXISTS {schema}.{index}` | invalid |
+| `RebuildIndex` | Keep (ignored) | **APPLY** `REINDEX INDEX CONCURRENTLY {schema}.{index}` | invalid |
+| `CreateIndex` / `CreateFilteredIndex` | Ignore | **APPLY** (standard variant) | **APPLY** (filtered variant) |
 
-> La DDL exécutée est toujours celle générée par le daemon (calculée à partir
-> de `null_frac` : colonne nullable > 10 % → `WHERE col IS NOT NULL`). Les
-> choix `"1"`/`"2"` sur une proposition CREATE signent tous deux « appliquer » ;
-> ils ne modifient pas la DDL.
+> The DDL executed is always the one generated by the daemon (computed from
+> `null_frac`: nullable column > 10 % → `WHERE col IS NOT NULL`). The
+> `"1"`/`"2"` choices on a CREATE proposal both mean "apply";
+> they do not change the DDL.
 
-### Règles d'application (nouvelle politique « sans fallback »)
+### Application rules (new "no-fallback" policy)
 
 ```
-1. deep_health() FAILED (Laya injoignable / réponse invalide)
-      → TOUTES les propositions du lot sont SKIPPED (aucune DDL)
-        (1 seul appel par cycle, pas par proposition)
+1. deep_health() FAILED (Laya unreachable / invalid response)
+      → ALL proposals in the batch are SKIPPED (no DDL)
+        (1 call per cycle, not per proposal)
 
 2. decision() OK :
-   confidence ≥ min_confidence (0.7)  →  DDL exécutée en ligne (CONCURRENTLY)
-   confidence < min_confidence        →  skip (debug log, aucune heuristique)
+   confidence ≥ min_confidence (0.7)  →  DDL executed online (CONCURRENTLY)
+   confidence < min_confidence        →  skip (debug log, no heuristic)
 
-3. Erreur sur une décision individuelle (timeout, HTTP, JSON)
-      →  seule cette proposition est skip (pas de fallback heuristique)
+3. Error on an individual decision (timeout, HTTP, JSON)
+      →  only this proposal is skipped (no heuristic fallback)
 
-4. action flag désactivé en config (actions.*)  →  skip (warn log)
+4. action flag disabled in config (actions.*)  →  skip (warn log)
 ```
 
-**Conséquence opérationnelle** : le daemon reste en mode « observation »
-(les propositions sont générées et journalisées) tant que Laya n'est pas
-actif et valide. Aucune décision n'est jamais prise à la place de Laya.
+**Operational consequence**: the daemon stays in "observation" mode
+(proposals are generated and logged) as long as Laya is not
+active and valid. No decision is ever made on behalf of Laya.
 
 ---
 
-## 2. Requêtes DMV PostgreSQL
+## 2. PostgreSQL DMV queries
 
-### 2.1 Index inutilisés
+### 2.1 Unused indexes
 
-> **Nouveauté (fix #10)** : les compteurs `pg_stat_user_indexes` sont
-> **remis à zéro à chaque redémarrage** de PostgreSQL. Prononcer un DROP
-> sur un serveur fraîchement démarré serait une fausse détection. Le daemon
-> vérifie donc d'abord la **fenêtre d'observation** (uptime serveur) avant
-> même de lancer la requête.
+> **New (fix #10)**: the `pg_stat_user_indexes` counters are
+> **reset to zero on every restart** of PostgreSQL. Pronouncing a DROP
+> on a freshly started server would be a false detection. The daemon
+> therefore first checks the **observation window** (server uptime) before
+> even issuing the query.
 
-**Gate préliminaire** :
+**Preliminary gate**:
 
 ```sql
 SELECT now() - pg_postmaster_start_time() >= make_interval(mins => $1)
--- $1 = thresholds.unused_minutes (défaut 10080 = 7 jours)
+-- $1 = thresholds.unused_minutes (default 10080 = 7 days)
 ```
 
-Si `false` → l'analyse « index inutilisés » est **entièrement sautée** pour
-ce cycle (debug log), pas d'erreur.
+If `false` → the "unused indexes" analysis is **entirely skipped** for
+this cycle (debug log), no error.
 
-**Requête** : `pg_stat_user_indexes` + `pg_index`
+**Query**: `pg_stat_user_indexes` + `pg_index`
 
 ```sql
 SELECT
@@ -184,7 +184,7 @@ SELECT
     COALESCE(s.idx_tup_read, 0) AS idx_tup_read,
     COALESCE(s.idx_tup_fetch, 0) AS idx_tup_fetch,
     pg_relation_size(s.indexrelid) AS size_bytes,
-    pg_postmaster_start_time() AS installed_at   -- début de la fenêtre d'observation
+    pg_postmaster_start_time() AS installed_at   -- start of the observation window
 FROM pg_stat_user_indexes s
 JOIN pg_index i ON s.indexrelid = i.indexrelid
 WHERE s.idx_scan = 0
@@ -193,31 +193,31 @@ WHERE s.idx_scan = 0
   AND i.indisprimary = false
   AND i.indisunique = false
 ORDER BY pg_relation_size(s.indexrelid) DESC
-LIMIT $1;   -- max_proposals_per_cycle (budget côté SQL, défaut 20)
+LIMIT $1;   -- max_proposals_per_cycle (SQL-side budget, default 20)
 ```
 
-**Filtres** :
-- `idx_scan = 0` ET `idx_tup_read = 0` (jamais scanné **depuis le redémarrage**)
-- `indisvalid = true` (index valide)
-- `indisprimary = false` (pas une clé primaire)
-- `indisunique = false` (pas un index unique)
-- Uptime serveur ≥ `thresholds.unused_minutes` (gate ci-dessus)
+**Filters**:
+- `idx_scan = 0` AND `idx_tup_read = 0` (never scanned **since the restart**)
+- `indisvalid = true` (valid index)
+- `indisprimary = false` (not a primary key)
+- `indisunique = false` (not a unique index)
+- Server uptime ≥ `thresholds.unused_minutes` (gate above)
 
-Le contexte envoyé à Laya inclut la **date du redémarrage** (`installed_at`)
-et la durée minimale d'observation — le moteur de décision peut ainsi
-pondérer sa confiance sur la solidité de l'évidence.
+The context sent to Laya includes the **restart date** (`installed_at`)
+and the minimum observation duration — the decision engine can thus
+weigh its confidence on the strength of the evidence.
 
 ---
 
-### 2.2 Index fragmentés
+### 2.2 Fragmented indexes
 
-> **Nouveauté** : seuls les index **B-tree** sont considérés
-> (`JOIN pg_am ON … WHERE amname = 'btree'`) — les index GiST/GIN/SP-GiST/BRIN
-> n'ont pas la même notion de fragmentation. Les lectures depuis `pg_class`
-> sont castées (`relpages::bigint`, `reltuples::float8`) car le pilote
-> postgres-types exige des types stricts (INT4/FLOAT4 ne sont pas élargis).
+> **New**: only **B-tree** indexes are considered
+> (`JOIN pg_am ON … WHERE amname = 'btree'`) — GiST/GIN/SP-GiST/BRIN indexes
+> do not have the same notion of fragmentation. Reads from `pg_class`
+> are cast (`relpages::bigint`, `reltuples::float8`) because the
+> postgres-types driver requires strict types (INT4/FLOAT4 are not widened).
 
-**Sources** : `pg_stat_user_indexes` + `pg_index` + `pg_class` + `pg_am` + `pg_stat_user_tables`
+**Sources**: `pg_stat_user_indexes` + `pg_index` + `pg_class` + `pg_am` + `pg_stat_user_tables`
 
 ```sql
 WITH index_info AS (
@@ -261,28 +261,28 @@ SELECT
 FROM index_info ii
 LEFT JOIN table_stats ts ON ts.oid = ii.table_oid
 ORDER BY ii.relpages DESC
-LIMIT $1;   -- max_proposals_per_cycle (budget côté SQL, défaut 20)
+LIMIT $1;   -- max_proposals_per_cycle (SQL-side budget, default 20)
 ```
 
-**Score de fragmentation** (heuristique multi-critères) :
+**Fragmentation score** (multi-criteria heuristic):
 
 ```
 frag_score = dead_ratio * 0.5
-           + min(mod_ratio, 1.0) * 0.3
-           + (idx_scan == 0 AND relpages > 100 ? 0.2 : 0.0)
+            + min(mod_ratio, 1.0) * 0.3
+            + (idx_scan == 0 AND relpages > 100 ? 0.2 : 0.0)
 
 fragmentation_pct = min(frag_score * 100, 100)
 ```
 
-| Critère | Formule | Pondération |
+| Criterion | Formula | Weight |
 |---------|---------|-------------|
 | Dead tuples | `n_dead_tup / (n_live_tup + n_dead_tup)` | 50% |
-| Modifications non-analysées | `n_mod_since_analyze / n_live_tup` | 30% |
-| Bonus non-scanné | `idx_scan == 0 AND relpages > 100` | 20% |
+| Non-analyzed modifications | `n_mod_since_analyze / n_live_tup` | 30% |
+| Non-scanned bonus | `idx_scan == 0 AND relpages > 100` | 20% |
 
-Un index est proposé en REINDEX si `fragmentation_pct ≥ thresholds.fragmentation_pct` (défaut 70 %).
+An index is proposed for REINDEX if `fragmentation_pct ≥ thresholds.fragmentation_pct` (default 70 %).
 
-**Densité moyenne estimée** (contexte envoyé à Laya) :
+**Estimated average density** (context sent to Laya):
 
 ```
 avg_leaf_density = min(max(index_tuples / index_pages / 100, 0.0), 1.0)
@@ -290,15 +290,15 @@ avg_leaf_density = min(max(index_tuples / index_pages / 100, 0.0), 1.0)
 
 ---
 
-### 2.3 Requêtes SARGable sans index
+### 2.3 SARGable queries without index
 
-> **Nouveauté (fix #3, #5, #9)** : la détection SARGable utilise désormais un
-> **vrai parseur SQL** (sqlparser-rs, dialecte PostgreSQL) — analyse de
-> l'AST, pas des regex. Les types de colonnes réels (`information_schema`)
-> et la fraction de NULL (`pg_stats`) enrichissent le contexte de décision,
-> et le périmètre multi-schéma s'applique côté Rust.
+> **New (fix #3, #5, #9)**: SARGable detection now uses a
+> **real SQL parser** (sqlparser-rs, PostgreSQL dialect) — AST analysis,
+> not regexes. Real column types (`information_schema`)
+> and the NULL fraction (`pg_stats`) enrich the decision context,
+> and the multi-schema scope is applied on the Rust side.
 
-**Requête de candidates** : `pg_stat_statements` (top N par poids `calls × time`, N = plafond de propositions)
+**Candidate query**: `pg_stat_statements` (top N by weight `calls × time`, N = proposal cap)
 
 ```sql
 SELECT
@@ -312,75 +312,75 @@ SELECT
 FROM pg_stat_statements s
 WHERE s.calls >= $3   -- thresholds.min_sargable_rows
   AND s.query !~* $1  -- ^(CREATE|ALTER|DROP|DELETE|INSERT|UPDATE|BEGIN|COMMIT|ROLLBACK|EXPLAIN|ANALYZE|VACUUM|GRANT|REVOKE|SET|SHOW)
-  AND s.query !~* $2  -- ^(SELECT|WITH).*\bpg_   (catalogues système exclus)
+  AND s.query !~* $2  -- ^(SELECT|WITH).*\bpg_   (system catalogs excluded)
 ORDER BY (s.calls * GREATEST(s.mean_exec_time, 0.1)) DESC
-LIMIT $4             -- max_proposals_per_cycle (budget côté SQL)
+LIMIT $4             -- max_proposals_per_cycle (SQL-side budget)
 ```
 
-**Filtres** :
-- `calls ≥ thresholds.min_sargable_rows` (défaut 100)
-- `LIMIT max_proposals_per_cycle` (budget côté SQL, défaut 20)
-- Exclusion des DDL, des requêtes système et des catalogues `pg_*`
-- **Périmètre multi-schéma** : si `analysis.schemas` est non vide, les
-  tables hors liste sont ignorées (fix #9)
+**Filters**:
+- `calls ≥ thresholds.min_sargable_rows` (default 100)
+- `LIMIT max_proposals_per_cycle` (SQL-side budget, default 20)
+- Exclusion of DDL, system queries and `pg_*` catalogs
+- **Multi-schema scope**: if `analysis.schemas` is non-empty,
+  tables outside the list are ignored (fix #9)
 
-#### 2.3.1 Analyse AST (sqlparser-rs)
+#### 2.3.1 AST analysis (sqlparser-rs)
 
-Chaque candidate est parsée (`PostgreSqlDialect`) ; si le parsing échoue,
-la requête est écartée (debug log). Le daemon identifie la table cible
-(`FROM schema.table`, défaut `public`) puis parcourt l'arbre de la clause
-`WHERE` pour collecter les colonnes SARGable.
+Each candidate is parsed (`PostgreSqlDialect`); if parsing fails,
+the query is dropped (debug log). The daemon identifies the target table
+(`FROM schema.table`, default `public`) then walks the tree of the
+`WHERE` clause to collect SARGable columns.
 
-**JOIN (nouveau)** : les colonnes sont attribuées à leur table via les
-alias (`a.status` → table de l'alias `a`). Une colonne **non qualifiée**
-n'est acceptée que si la requête ne référence qu'UNE table — comportement
-conservateur qui évite les faux positifs (colonne ambiguë écartée, debug log).
+**JOIN (new)**: columns are assigned to their table via the
+alias (`a.status` → the table of alias `a`). A **non-qualified** column
+is accepted only if the query references only ONE table — conservative
+behavior that avoids false positives (ambiguous column dropped, debug log).
 
-**Opérateurs reconnus (SARGable)** :
+**Recognized operators (SARGable)**:
 
 | Pattern | Condition |
 |---------|-----------|
-| `col = v`, `col > v`, `col < v`, `col >= v`, `col <= v` | côté colonne : référence de colonne ; côté valeur : **pas** une colonne |
-| `col IN (v1, …, vn)` (non-négé) | tous les éléments non colonnes |
-| `col BETWEEN a AND b` (non-négé) | bornes non colonnes |
+| `col = v`, `col > v`, `col < v`, `col >= v`, `col <= v` | column side: column reference; value side: **not** a column |
+| `col IN (v1, …, vn)` (non-negated) | all elements non-columns |
+| `col BETWEEN a AND b` (non-negated) | bounds non-columns |
 | `col IS NULL` / `col IS NOT NULL` | — |
-| `col LIKE 'pref…%'` / `col ILIKE 'pref…%'` | motif **préfixe** (pas de `%` en tête) |
-| `AND` / `OR` / parenthèses imbriquées | parcours récursif |
+| `col LIKE 'pref…%'` / `col ILIKE 'pref…%'` | **prefix** pattern (no leading `%`) |
+| `AND` / `OR` / nested parentheses | recursive traversal |
 
-**Rejetés (non-SARGable)** :
-- `NOT ( … )`, `col IS DISTINCT FROM …` (négation / sémantique non bornable)
+**Rejected (non-SARGable)**:
+- `NOT ( … )`, `col IS DISTINCT FROM …` (negation / unboundable semantics)
 - `col NOT IN (…)`, `col NOT BETWEEN …`
-- Fonctions sur la colonne : `LOWER(col)`, `UPPER(col)`, `CAST(col AS …)`
-- Comparaison colonne-contre-colonne : `a.col = b.col`
-- `LIKE`/`ILIKE` avec jocker en tête (`'%…'`) ou motif non littéral
+- Functions on the column: `LOWER(col)`, `UPPER(col)`, `CAST(col AS …)`
+- Column-vs-column comparison: `a.col = b.col`
+- `LIKE`/`ILIKE` with a wildcard at the start (`'%…'`) or a non-literal pattern
 - `col NOT LIKE …`
 
-#### 2.3.2 Filtrage des colonnes couvertes
+#### 2.3.2 Filtering of covered columns
 
 ```
-Pour chaque requête SARGable détectée :
-    1. extraire table + schéma depuis l'AST (FROM)
-    2. vérifier le périmètre multi-schéma
-    3. charger les index existants (pg_indexes, filtrés côté Rust)
-    4. pour chaque colonne SARGable :
-        si is_column_covered_by_index(indexdef, column) → skip
-    5. si colonnes restantes > 0 → proposal
+For each detected SARGable query:
+    1. extract table + schema from the AST (FROM)
+    2. check the multi-schema scope
+    3. load existing indexes (pg_indexes, filtered on the Rust side)
+    4. for each SARGable column:
+        if is_column_covered_by_index(indexdef, column) → skip
+    5. if remaining columns > 0 → proposal
 ```
 
-#### 2.3.3 Enrichissement métadonnées (nouveau)
+#### 2.3.3 Metadata enrichment (new)
 
-Pour les colonnes candidates restantes, le daemon charge :
+For the remaining candidate columns, the daemon loads:
 
-| Donnée | Source | Usage |
+| Data | Source | Use |
 |--------|--------|-------|
-| `data_type` réel (ex: `character varying`) | `information_schema.columns` | Contexte Laya + bucket de densité |
-| `is_nullable` | `information_schema.columns` | Décision index filtré |
-| `null_frac` | `pg_stats` (`null_frac::float8`) | Si > 0.10 → `WHERE col IS NOT NULL` |
-| `reltuples` / `relpages` de la table | `pg_class` (`to_regclass`) | Estimation de taille du futur index |
+| real `data_type` (e.g. `character varying`) | `information_schema.columns` | Laya context + density bucket |
+| `is_nullable` | `information_schema.columns` | Filtered index decision |
+| `null_frac` | `pg_stats` (`null_frac::float8`) | If > 0.10 → `WHERE col IS NOT NULL` |
+| table `reltuples` / `relpages` | `pg_class` (`to_regclass`) | Estimated size of the future index |
 
-**Buckets de densité** (`map_pg_type_to_bucket`) :
+**Density buckets** (`map_pg_type_to_bucket`):
 
-| Type PostgreSQL | Bucket | Densité défaut |
+| PostgreSQL type | Bucket | Default density |
 |-----------------|--------|----------------|
 | `integer`, `smallint` | `int4` | 200 tuples/page |
 | `bigint` | `int8` | 200 |
@@ -391,11 +391,11 @@ Pour les colonnes candidates restantes, le daemon charge :
 | `timestamp (with/without time zone)`, `time (…)` | `timestamptz` | 150 |
 | `uuid` | `uuid` | 100 |
 | `boolean` | `bool` | 300 |
-| tout autre type | `default` | 50 |
+| any other type | `default` | 50 |
 
-Toutes les densités sont configurables (`density_by_type.*`).
+All densities are configurable (`density_by_type.*`).
 
-**Estimation de taille du futur index** (envoyée au contexte de décision) :
+**Estimated size of the future index** (sent to the decision context):
 
 ```
 est_pages = ceil(reltuples / density_bucket)
@@ -404,7 +404,7 @@ est_bytes = est_pages × 8192
 
 ---
 
-### 2.4 Vérification pg_stat_statements
+### 2.4 pg_stat_statements check
 
 ```sql
 SELECT extname, extversion
@@ -414,7 +414,7 @@ WHERE extname = 'pg_stat_statements';
 
 ---
 
-### 2.5 Vérification pré-existence index
+### 2.5 Index pre-existence check
 
 ```sql
 SELECT 1
@@ -425,9 +425,9 @@ WHERE schemaname = $1
 
 ---
 
-## 3. Format de log des opérations d'index
+## 3. Index operation log format
 
-### JSONL (fichier)
+### JSONL (file)
 
 ```json
 {
@@ -445,9 +445,9 @@ WHERE schemaname = $1
 }
 ```
 
-### Contenu par niveau de verbosité
+### Content per verbosity level
 
-| Champ | `minimal` | `standard` | `verbose` |
+| Field | `minimal` | `standard` | `verbose` |
 |-------|:---------:|:----------:|:---------:|
 | `timestamp` | ✅ | ✅ | ✅ |
 | `operation` | ✅ | ✅ | ✅ |
@@ -467,18 +467,18 @@ WHERE schemaname = $1
 
 ### Format
 
-JSON par défaut (`logging.format = "json"`), ou texte brut (`"plain"`).
+JSON by default (`logging.format = "json"`), or plain text (`"plain"`).
 
-### Niveaux
+### Levels
 
-| Niveau | Usage |
+| Level | Use |
 |--------|-------|
-| `INFO` | Démarrage, état du daemon, propositions, DDL exécutées, « Applied: N proposal(s), skipped (no-op): M » |
-| `WARN` | Laya injoignable / deep health FAILED (no fallback), mode DEGRADED, skip par action flag, `REINDEX CONCURRENTLY` auto-commit |
-| `ERROR` | Échec DDL, erreur d'analyse, erreur d'application |
-| `DEBUG` | Résultats détecteurs, parsing SQL, fenêtres d'observation sautées, skip par confidence |
+| `INFO` | Startup, daemon state, proposals, executed DDL, "Applied: N proposal(s), skipped (no-op): M" |
+| `WARN` | Laya unreachable / deep health FAILED (no fallback), DEGRADED mode, skip by action flag, `REINDEX CONCURRENTLY` auto-commit |
+| `ERROR` | DDL failure, analysis error, application error |
+| `DEBUG` | Detector results, SQL parsing, skipped observation windows, skip by confidence |
 
-### Exemples
+### Examples
 
 ```json
 {"timestamp":"2026-10-30T21:30:12.101Z","level":"INFO","fields":{"message":"Daemon started. Cycle: 60s, state: Healthy"}}
