@@ -1,34 +1,34 @@
 #!/usr/bin/env bash
 # ============================================================================
-# uninstall.sh — Désinstallation de PGindexAI
+# uninstall.sh — Uninstallation of PGindexAI
 #
-# Usage :
+# Usage:
 #   sudo ./uninstall.sh [--dry-run] [--purge] [--clean-legacy]
 #
-# Par défaut : arrête et désactive le service, supprime l'unité systemd, le
-# binaire, la config, les données et les logs de l'utilisateur. CONSERVE la
-# base pgindexai_demo, le rôle pgindexai et la ligne pg_hba (réinstallable,
-# données préservées).
+# By default: stops and disables the service, removes the systemd unit, the
+# binary, the config, the user's data and logs. PRESERVES the
+# pgindexai_demo database, the pgindexai role and the pg_hba line (reinstallable,
+# data preserved).
 #
-# Options :
-#   --dry-run        simulation complète, aucune modification
-#   --purge          SUPPRIME AUSSI la base + le rôle + la ligne pg_hba
-#                    (irréversible, confirmation demandée)
-#   --clean-legacy   retire aussi les vestiges de l'ancien nom (laya-sql)
+# Options:
+#   --dry-run        full simulation, no modification
+#   --purge          ALSO REMOVES the database + the role + the pg_hba line
+#                    (irreversible, confirmation requested)
+#   --clean-legacy   also removes the remnants of the old name (laya-sql)
 #
-# Garde-fous :
-#   - shared_preload_libraries et pg_stat_statements ne sont JAMAIS modifiés
-#     (extension partagée — retrait manuel si réellement souhaité)
-#   - sans terminal contrôleur, la confirmation --purge passe au défaut (N)
-#     : une opération irréversible ne s'exécute JAMAIS sans confirmation
-#     explicite
-#   - --purge refuse d'agir si le rôle 'pgindexai' possède des objets dans
-#     d'autres bases (DROP ROLE échouerait sinon, partiellement)
+# Safeguards:
+#   - shared_preload_libraries and pg_stat_statements are NEVER modified
+#     (shared extension — manual removal if truly desired)
+#   - without a controlling terminal, the --purge confirmation falls back to the default (N)
+#     : an irreversible operation is NEVER executed without an
+#     explicit confirmation
+#   - --purge refuses to act if the 'pgindexai' role owns objects in
+#     other databases (DROP ROLE would otherwise fail, partially)
 # ============================================================================
 set -euo pipefail
 
 # ─────────────────────────────────────────────
-# Couleurs & logs
+# Colors & logging
 # ─────────────────────────────────────────────
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -42,17 +42,17 @@ error() { echo -e "${RED}[✗]${NC} $*" >&2; }
 step()  { echo -e "${CYAN}→${NC} $*"; }
 
 # ─────────────────────────────────────────────
-# Variables globales
+# Global variables
 # ─────────────────────────────────────────────
 DRY_RUN=false
 PURGE=false
 CLEAN_LEGACY=false
 POSTGRES_USER="${POSTGRES_USER:-postgres}"
 
-# Utilisateur cible : celui qui possède la config, les données et les logs.
-# - script en non-root → l'utilisateur courant
-# - script via sudo    → $SUDO_USER (sinon : propriétaire du répertoire courant)
-# NB : sous sudo, $HOME/$USER pointent vers root — il faut donc les redériver.
+# Target user: the one owning the config, the data and the logs.
+# - script as non-root → the current user
+# - script via sudo    → $SUDO_USER (otherwise: owner of the current directory)
+# NB: under sudo, $HOME/$USER point to root — they must be re-derived.
 if [[ "$(id -u)" -ne 0 ]]; then
     TARGET_USER="${USER:-$(whoami)}"
 elif [[ -n "${SUDO_USER:-}" ]]; then
@@ -61,12 +61,12 @@ else
     TARGET_USER="$(stat -c %U . 2>/dev/null || true)"
 fi
 if [[ -z "${TARGET_USER:-}" ]]; then
-    error "Impossible de déterminer l'utilisateur cible (USER / SUDO_USER absents)."
+    error "Cannot determine the target user (USER / SUDO_USER missing)."
     exit 1
 fi
 TARGET_HOME="$(getent passwd "$TARGET_USER" 2>/dev/null | cut -d: -f6 || true)"
 if [[ -z "${TARGET_HOME:-}" ]]; then
-    error "Impossible de déterminer le home de '$TARGET_USER'."
+    error "Cannot determine the home of '$TARGET_USER'."
     exit 1
 fi
 
@@ -79,7 +79,7 @@ LOG_DIR="/var/log/pgindexai"
 PG_HBA_DEFAULT="/etc/postgresql/16/main/pg_hba.conf"
 
 # ─────────────────────────────────────────────
-# Analyse des arguments
+# Argument parsing
 # ─────────────────────────────────────────────
 for arg in "$@"; do
     case "$arg" in
@@ -90,11 +90,11 @@ for arg in "$@"; do
             sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
-        *) warn "Argument inconnu : $arg (ignoré)" ;;
+        *) warn "Unknown argument: $arg (ignored)" ;;
     esac
 done
 
-# run CMD [ARGS...] — sans eval : chaque argument est passé tel quel
+# run CMD [ARGS...] — no eval: each argument is passed as-is
 run() {
     if $DRY_RUN; then
         echo -e "${CYAN}[dry-run]${NC} $*"
@@ -103,10 +103,10 @@ run() {
     fi
 }
 
-# ask "question" [défaut Y|N] — lit /dev/tty (fonctionne même via curl | bash),
-# repli sur la valeur par défaut si aucun terminal contrôleur n'est disponible.
-# NB : ne JAMAIS rediriger le stderr de `read` : `read -p` écrit le prompt dessus,
-# et 2>/dev/null rendrait la question invisible pour l'utilisateur.
+# ask "question" [default Y|N] — reads /dev/tty (works even via curl | bash),
+# falls back to the default value if no controlling terminal is available.
+# NB: NEVER redirect the stderr of `read`: `read -p` writes the prompt to it,
+# and 2>/dev/null would make the question invisible to the user.
 ask() {
     local prompt="$1" def="${2:-Y}" answer=""
     if ! ( : </dev/tty ) 2>/dev/null; then
@@ -117,12 +117,12 @@ ask() {
     [[ "${answer:-$def}" =~ ^[Yy] ]]
 }
 
-# pg_show "SQL" — requête en -tAc en tant que $POSTGRES_USER (vide si échec)
+# pg_show "SQL" — query with -tAc as $POSTGRES_USER (empty on failure)
 pg_show() {
     sudo -u "$POSTGRES_USER" psql -tAc "$1" 2>/dev/null || true
 }
 
-# hba_file — chemin effectif de pg_hba.conf (SHOW hba_file, sinon défaut)
+# hba_file — effective path of pg_hba.conf (SHOW hba_file, otherwise default)
 hba_file() {
     local hba
     hba="$(pg_show 'SHOW hba_file' | tr -d '[:space:]')"
@@ -130,67 +130,67 @@ hba_file() {
 }
 
 # ─────────────────────────────────────────────
-# Étape 1 : service systemd + éventuel processus orphelin
+# Step 1: systemd service + possible orphan process
 # ─────────────────────────────────────────────
 stop_service() {
     step "Service systemd..."
     if [[ -f "$SERVICE_FILE" ]]; then
-        run sudo systemctl stop "$SERVICE_NAME" || warn "Arrêt impossible (déjà inactif ?)"
+        run sudo systemctl stop "$SERVICE_NAME" || warn "Stop impossible (already inactive?)"
         run sudo systemctl disable "$SERVICE_NAME" 2>/dev/null || true
         run sudo rm -f "$SERVICE_FILE"
         run sudo systemctl daemon-reload
         run sudo systemctl reset-failed "$SERVICE_NAME" 2>/dev/null || true
-        info "Service arrêté, désactivé, unité supprimée"
+        info "Service stopped, disabled, unit removed"
     else
-        info "Aucune unité systemd trouvée ($SERVICE_FILE)"
+        info "No systemd unit found ($SERVICE_FILE)"
     fi
 
-    # Processus démarré à la main (hors systemd) ?
+    # Process started manually (outside systemd)?
     if command -v pgrep &>/dev/null && pgrep -x "$SERVICE_NAME" >/dev/null 2>&1; then
-        warn "Processus $SERVICE_NAME en cours — arrêt..."
+        warn "Process $SERVICE_NAME running — stopping..."
         run sudo pkill -x "$SERVICE_NAME" || true
     fi
 }
 
 # ─────────────────────────────────────────────
-# Étape 2 : binaire
+# Step 2: binary
 # ─────────────────────────────────────────────
 remove_binary() {
     step "Binaire..."
     if [[ -f "$BIN_PATH" ]]; then
         run sudo rm -f "$BIN_PATH"
-        info "Binaire supprimé : $BIN_PATH"
+        info "Binary removed: $BIN_PATH"
     else
-        info "Aucun binaire trouvé ($BIN_PATH)"
+        info "No binary found ($BIN_PATH)"
     fi
 }
 
 # ─────────────────────────────────────────────
-# Étape 3 : config, données, logs de l'utilisateur
+# Step 3: user's config, data, logs
 # ─────────────────────────────────────────────
 remove_dirs() {
-    step "Config, données et logs..."
+    step "Config, data and logs..."
     run sudo rm -rf "$CONFIG_DIR"
     run sudo rm -rf "$PGINDEXAI_DIR"
     run sudo rm -rf "$LOG_DIR"
-    info "Supprimés : $CONFIG_DIR, $PGINDEXAI_DIR, $LOG_DIR"
+    info "Removed: $CONFIG_DIR, $PGINDEXAI_DIR, $LOG_DIR"
 }
 
 # ─────────────────────────────────────────────
-# Étape 4 (option --purge) : base, rôle, ligne pg_hba
+# Step 4 (option --purge): database, role, pg_hba line
 # ─────────────────────────────────────────────
 remove_pg_objects() {
-    step "Objets PostgreSQL (base + rôle + pg_hba)..."
-    # Confirmation par défaut NON (N) : sans tty (curl|bash, cron…) la purge
-    # est annulée au lieu de s'exécuter — opération irréversible.
-    if ! ask "Supprimer DÉFINITIVEMENT la base 'pgindexai_demo' (toutes ses données) ET le rôle 'pgindexai' ? (irréversible) [y/N]" N; then
-        warn "Suppression annulée (pas de confirmation explicite) : base et rôle conservés."
+    step "PostgreSQL objects (database + role + pg_hba)..."
+    # Default confirmation is NO (N): without a tty (curl|bash, cron…) the purge
+    # is canceled instead of executing — irreversible operation.
+    if ! ask "Permanently REMOVE the 'pgindexai_demo' database (all its data) AND the 'pgindexai' role? (irreversible) [y/N]" N; then
+        warn "Removal canceled (no explicit confirmation): database and role preserved."
         return 0
     fi
 
-    # Garde-fou : si le rôle possède des objets dans d'AUTRES bases, DROP ROLE
-    # échouerait (et partiellement en plus). On refuse AVANT toute suppression
-    # pour garder l'opération atomique — on ne drop jamais « à moitié ».
+    # Safeguard: if the role owns objects in OTHER databases, DROP ROLE
+    # would fail (and partially on top of that). We refuse BEFORE any removal
+    # to keep the operation atomic — we never drop « half-way ».
     local foreign
     foreign="$(
         for db in $(pg_show "SELECT datname FROM pg_database WHERE datallowconn AND datname <> 'pgindexai_demo' ORDER BY 1"); do
@@ -205,89 +205,89 @@ remove_pg_objects() {
         done
     )"
     if [[ -n "$foreign" ]]; then
-        error "Le rôle 'pgindexai' possède des objets dans d'AUTRES bases — purge refusée en l'état :"
+        error "The 'pgindexai' role owns objects in OTHER databases — purge refused as-is:"
         echo "$foreign" | head -10 >&2
-        error "Transférez la propriété ou supprimez ces objets, puis relancez avec --purge."
+        error "Transfer ownership or remove those objects, then re-run with --purge."
         return 1
     fi
 
-    # Ordre : base d'abord (détient les tables/index), puis le rôle.
-    # Échec explicite (pas d'abort silencieux en plein purge : DROP ROLE
-    # partiellement appliqué serait un état incohérent).
+    # Order: database first (holds the tables/indexes), then the role.
+    # Explicit failure (no silent abort mid-purge: DROP ROLE
+    # partially applied would be an inconsistent state).
     if ! run sudo -u "$POSTGRES_USER" psql -qc "DROP DATABASE IF EXISTS pgindexai_demo"; then
-        error "DROP DATABASE a échoué (connexions actives ?) — purge arrêtée, rôle conservé."
+        error "DROP DATABASE failed (active connections?) — purge stopped, role preserved."
         return 1
     fi
     if ! run sudo -u "$POSTGRES_USER" psql -qc "DROP ROLE IF EXISTS pgindexai"; then
-        error "DROP ROLE a échoué (privilèges résiduels ?) — voir l'erreur ci-dessus."
+        error "DROP ROLE failed (residual privileges?) — see the error above."
         return 1
     fi
-    info "Base et rôle supprimés"
+    info "Database and role removed"
 
-    # Ligne dédiée (forme corrigée « local all pgindexai » ET variante
-    # défectueuse « local pgindexai pgindexai » — colonne DATABASE).
+    # Dedicated line (corrected form « local all pgindexai » AND
+    # defective variant « local pgindexai pgindexai » — DATABASE column).
     local hba
     hba="$(hba_file)"
     if [[ -f "$hba" ]] && sudo grep -Eq "^[[:space:]]*local[[:space:]]+(all|pgindexai_demo|pgindexai)[[:space:]]+pgindexai[[:space:]]+" "$hba"; then
         run sudo sed -i -E "/^[[:space:]]*local[[:space:]]+(all|pgindexai_demo|pgindexai)[[:space:]]+pgindexai[[:space:]]+.*$/d" "$hba"
         run sudo systemctl reload postgresql
-        info "Ligne pg_hba supprimée, PostgreSQL rechargé"
+        info "pg_hba line removed, PostgreSQL reloaded"
     else
-        info "Aucune ligne pg_hba dédiée trouvée (rien à retirer)"
+        info "No dedicated pg_hba line found (nothing to remove)"
     fi
 
-    warn "pg_stat_statements est CONSERVÉ (extension partagée, shared_preload_libraries)."
-    warn "Retrait manuel (si réellement souhaité) : retirer 'pg_stat_statements' de"
-    warn "shared_preload_libraries dans postgresql.conf, puis redémarrer PostgreSQL."
+    warn "pg_stat_statements is PRESERVED (shared extension, shared_preload_libraries)."
+    warn "Manual removal (if truly desired): remove 'pg_stat_statements' from"
+    warn "shared_preload_libraries in postgresql.conf, then restart PostgreSQL."
 }
 
 # ─────────────────────────────────────────────
-# Étape 5 (option --clean-legacy) : vestiges de l'ancien nom
+# Step 5 (option --clean-legacy): remnants of the old name
 # ─────────────────────────────────────────────
 clean_legacy() {
-    step "Vestiges de l'ancien nom (laya-sql)..."
+    step "Remnants of the old name (laya-sql)..."
     local legacy_unit="/etc/systemd/system/laya-sql.service"
     if [[ -f "$legacy_unit" ]]; then
         run sudo systemctl stop laya-sql 2>/dev/null || true
         run sudo systemctl disable laya-sql 2>/dev/null || true
         run sudo rm -f "$legacy_unit"
         run sudo systemctl daemon-reload
-        info "Unité laya-sql supprimée"
+        info "laya-sql unit removed"
     fi
     run sudo rm -f /usr/local/bin/laya-sql
     run sudo rm -rf "${TARGET_HOME}/.config/layaSQL"
     run sudo rm -rf /var/log/laya-sql
-    # Objets PG legacy (déjà renommés en pgindexai* lors de la migration) — no-op si absents
+    # Legacy PG objects (already renamed to pgindexai* during the migration) — no-op if absent
     run sudo -u "$POSTGRES_USER" psql -qc "DROP DATABASE IF EXISTS laya_demo" 2>/dev/null || true
     run sudo -u "$POSTGRES_USER" psql -qc "DROP ROLE IF EXISTS laya_sql" 2>/dev/null || true
-    info "Vestiges nettoyés : binaire, config, logs, objets PG éventuels"
+    info "Remnants cleaned: binary, config, logs, possible PG objects"
 }
 
 # ─────────────────────────────────────────────
-# Résumé
+# Summary
 # ─────────────────────────────────────────────
 verify() {
     echo ""
     echo "============================================"
-    echo "  Désinstallation PGindexAI terminée"
+    echo "  PGindexAI uninstallation finished"
     echo "============================================"
     echo ""
-    echo "  Service    : $SERVICE_NAME — arrêté, unité supprimée"
-    echo "  Binaire    : $BIN_PATH — supprimé"
-    echo "  Fichiers   : config, données, logs supprimés"
+    echo "  Service    : $SERVICE_NAME — stopped, unit removed"
+    echo "  Binary    : $BIN_PATH — removed"
+    echo "  Files   : config, data, logs removed"
     if $PURGE; then
-        echo "  PostgreSQL : base pgindexai_demo + rôle pgindexai + ligne pg_hba supprimés"
+        echo "  PostgreSQL : pgindexai_demo database + pgindexai role + pg_hba line removed"
     else
-        echo "  PostgreSQL : CONSERVÉ (base pgindexai_demo, rôle pgindexai, ligne pg_hba)"
-        echo "               → suppression complète : sudo ./uninstall.sh --purge"
+        echo "  PostgreSQL : PRESERVED (pgindexai_demo database, pgindexai role, pg_hba line)"
+        echo "               → full removal: sudo ./uninstall.sh --purge"
     fi
-    echo "  pg_stat_statements : conservé (extension partagée)"
+    echo "  pg_stat_statements : preserved (shared extension)"
     if $DRY_RUN; then
         echo ""
-        echo "  📋 Mode dry-run — aucune modification n'a été appliquée"
+        echo "  📋 Dry-run mode — no modification has been applied"
     fi
     echo ""
-    echo "  Réinstallation : sudo ./install.sh"
+    echo "  Reinstallation: sudo ./install.sh"
     echo ""
 }
 
@@ -297,12 +297,12 @@ verify() {
 main() {
     echo ""
     echo "============================================"
-    echo "  PGindexAI — Désinstallation"
+    echo "  PGindexAI — Uninstallation"
     echo "============================================"
     echo ""
-    echo "  Utilisateur cible : $TARGET_USER"
+    echo "  Target user: $TARGET_USER"
     if $PURGE; then
-        warn "Mode --purge : la base pgindexai_demo et le rôle pgindexai seront supprimés."
+        warn "--purge mode: the pgindexai_demo database and the pgindexai role will be removed."
     fi
     echo ""
     stop_service

@@ -192,8 +192,8 @@ Config error: Cannot parse config at /path/to/PGindexAI.yaml: ...
 
 **Cause**: Invalid YAML (indentation, syntax) or value out of range
 (`Config::validate()` rejects dangerous configs) — or unknown keys
-(this is **not** blocking: warning, e.g. `config : clé 'laya.variant'
-inconnue (ignorée …)`).
+(this is **not** blocking: warning, e.g. `config: key 'laya.variant'
+unknown (ignored — typo or removed feature?)`).
 
 **Solution**: Validate the YAML with `yamllint` or `python -c "import yaml; yaml.safe_load(open('PGindexAI.yaml'))"`;
 remove the unknown keys that were reported.
@@ -201,7 +201,7 @@ remove the unknown keys that were reported.
 ### TLS failure (PostgreSQL connection)
 
 ```
-ERROR ssl_mode=verify-full mais certificat non vérifiable: InvalidCertificate(UnknownIssuer)
+ERROR ssl_mode=verify-full but certificate not verifiable: InvalidCertificate(UnknownIssuer)
 ```
 
 **Behavior**: the connection is **refused** (rustls always validates the

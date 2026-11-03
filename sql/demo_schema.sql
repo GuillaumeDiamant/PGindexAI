@@ -1,17 +1,17 @@
 /* ============================================================================
-   demo_schema.sql — Schéma de démonstration pour PGindexAI
+   demo_schema.sql — Demonstration schema for PGindexAI
    ----------------------------------------------------------------------------
-   Exécuter : psql -U postgres -d postgres -f sql/demo_schema.sql
+   Run: psql -U postgres -d postgres -f sql/demo_schema.sql
    ============================================================================ */
 
--- ── Base de données ──────────────────────────────────────────────────────
+-- ── Database ─────────────────────────────────────────────────────────────
 SELECT 'CREATE DATABASE pgindexai_demo'
 WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = 'pgindexai_demo')
 \gexec
 
 \c pgindexai_demo
 
--- ── Table : customers ────────────────────────────────────────────────────
+-- ── Table: customers ─────────────────────────────────────────────────────
 DROP TABLE IF EXISTS orders, products, order_items, users CASCADE;
 
 CREATE TABLE customers (
@@ -29,7 +29,7 @@ CREATE INDEX idx_customers_country ON customers(country);
 CREATE INDEX idx_customers_city    ON customers(city);
 CREATE INDEX idx_customers_email   ON customers(email);
 
--- ── Table : products ─────────────────────────────────────────────────────
+-- ── Table: products ──────────────────────────────────────────────────────
 CREATE TABLE products (
     id          SERIAL       PRIMARY KEY,
     sku         VARCHAR(50)  NOT NULL UNIQUE,
@@ -47,7 +47,7 @@ CREATE INDEX idx_products_sku       ON products(sku);
 CREATE INDEX idx_products_price     ON products(price);
 CREATE INDEX idx_products_stock     ON products(stock_qty);
 
--- ── Table : orders ───────────────────────────────────────────────────────
+-- ── Table: orders ────────────────────────────────────────────────────────
 CREATE TABLE orders (
     id              SERIAL       PRIMARY KEY,
     customer_id     INT          NOT NULL REFERENCES customers(id),
@@ -59,14 +59,14 @@ CREATE TABLE orders (
     updated_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 
--- Index qui deviendra inutilisé
+-- Index that will become unused
 CREATE INDEX idx_orders_status ON orders(status);
 
--- Index fragmenté (sera reconstruit par le daemon)
+-- Fragmented index (will be rebuilt by the daemon)
 CREATE INDEX idx_orders_date   ON orders(order_date);
 CREATE INDEX idx_orders_customer ON orders(customer_id);
 
--- ── Table : order_items ──────────────────────────────────────────────────
+-- ── Table: order_items ───────────────────────────────────────────────────
 CREATE TABLE order_items (
     id          SERIAL       PRIMARY KEY,
     order_id    INT          NOT NULL REFERENCES orders(id),
@@ -81,7 +81,7 @@ CREATE INDEX idx_items_order   ON order_items(order_id);
 CREATE INDEX idx_items_product ON order_items(product_id);
 CREATE INDEX idx_items_date    ON order_items(created_at);
 
--- ── Table : users (pour simuler des sessions) ────────────────────────────
+-- ── Table: users (to simulate sessions) ──────────────────────────────────
 CREATE TABLE users (
     id          SERIAL       PRIMARY KEY,
     username    VARCHAR(80)  NOT NULL UNIQUE,
@@ -94,7 +94,7 @@ CREATE TABLE users (
 CREATE INDEX idx_users_role ON users(role);
 CREATE INDEX idx_users_login ON users(last_login);
 
--- ── Données : customers ──────────────────────────────────────────────────
+-- ── Data: customers ──────────────────────────────────────────────────────
 INSERT INTO customers (email, first_name, last_name, country, city)
 SELECT
     'user' || g || '@example.com',
@@ -104,11 +104,11 @@ SELECT
     (ARRAY['Paris','New York','Berlin','London','Tokyo','Sao Paulo','Mumbai','Sydney','Toronto','Mexico City'])[1 + (g % 10)]
 FROM generate_series(1, 10000) g;
 
--- ── Données : products ───────────────────────────────────────────────────
+-- ── Data: products ───────────────────────────────────────────────────────
 INSERT INTO products (sku, name, category, price, cost, stock_qty, is_active)
 SELECT
     'SKU-' || LPAD(g::text, 6, '0'),
-    'Produit ' || g,
+    'Product ' || g,
     (ARRAY['Electronics','Clothing','Food','Books','Sports','Home','Toys','Beauty'])[1 + (g % 8)],
     ROUND((random() * 990 + 10)::numeric, 2),
     ROUND((random() * 400 + 5)::numeric, 2),
@@ -116,7 +116,7 @@ SELECT
     random() > 0.1
 FROM generate_series(1, 5000) g;
 
--- ── Données : orders ─────────────────────────────────────────────────────
+-- ── Data: orders ─────────────────────────────────────────────────────────
 INSERT INTO orders (customer_id, order_date, status, total_amount, shipping_method)
 SELECT
     1 + (g % 10000),
@@ -126,7 +126,7 @@ SELECT
     (ARRAY['standard','express','overnight','pickup'])[1 + (g % 4)]
 FROM generate_series(1, 200000) g;
 
--- ── Données : order_items ────────────────────────────────────────────────
+-- ── Data: order_items ────────────────────────────────────────────────────
 INSERT INTO order_items (order_id, product_id, quantity, unit_price, discount)
 SELECT
     1 + (g % 200000),
@@ -136,7 +136,7 @@ SELECT
     (random() * 0.3)::numeric
 FROM generate_series(1, 500000) g;
 
--- ── Données : users ──────────────────────────────────────────────────────
+-- ── Data: users ──────────────────────────────────────────────────────────
 INSERT INTO users (username, role, last_login, is_active)
 SELECT
     'user' || g,
@@ -145,24 +145,24 @@ SELECT
     random() > 0.15
 FROM generate_series(1, 2000) g;
 
--- ── Statistiques ─────────────────────────────────────────────────────────
+-- ── Statistics ───────────────────────────────────────────────────────────
 ANALYZE customers;
 ANALYZE products;
 ANALYZE orders;
 ANALYZE order_items;
 ANALYZE users;
 
--- ── Résumé ───────────────────────────────────────────────────────────────
+-- ── Summary ──────────────────────────────────────────────────────────────
 DO $$
 DECLARE
     r RECORD;
 BEGIN
-    RAISE NOTICE '=== Schéma demo pgindexai_demo ===';
+    RAISE NOTICE '=== pgindexai_demo demo schema ===';
     FOR r IN SELECT tablename, n_live_tup
               FROM pg_stat_user_tables
               ORDER BY tablename
     LOOP
-        RAISE NOTICE '  %: % lignes', r.tablename, r.n_live_tup;
+        RAISE NOTICE '  %: % rows', r.tablename, r.n_live_tup;
     END LOOP;
     RAISE NOTICE '=== Index ===';
     FOR r IN SELECT indexname, pg_size_pretty(pg_relation_size(indexrelid)) AS size

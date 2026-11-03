@@ -11,18 +11,18 @@ use crate::laya::{DecisionAction, LayaClient, Proposal};
 use crate::naming;
 use crate::state::DaemonState;
 
-/// Limite de longueur des identifiants copiés dans un `reason` (payload Laya)
+/// Length limit for identifiers copied into a `reason` (Laya payload)
 const SANITIZED_MAX_LEN: usize = 64;
 
-/// Résultat d'une passe d'application des propositions : les DDL réellement
-/// exécutés (`applied`) sont distingués des no-ops idempotents (`skipped` :
-/// index déjà présent / déjà absent). Précédemment, les no-ops étaient
-/// comptés comme « appliqués » — les deux sont désormais rapportés séparément.
+/// Result of a proposal application pass: the DDL actually
+/// executed (`applied`) is distinguished from idempotent no-ops (`skipped`:
+/// index already present / already absent). Previously, no-ops were
+/// counted as "applied" — the two are now reported separately.
 #[derive(Debug, Clone)]
 pub struct ApplyResult {
-    /// Propositions dont le DDL a été exécuté
+    /// Proposals whose DDL was executed
     pub applied: Vec<Proposal>,
-    /// Propositions sans effet (objet déjà présent / déjà absent)
+    /// Proposals with no effect (object already present / already absent)
     pub skipped: Vec<Proposal>,
 }
 
@@ -31,8 +31,8 @@ pub struct Analyzer {
     laya: LayaClient,
     config: Config,
     daemon_state: DaemonState,
-    /// Partagé (log synchronique interne, mutex court) — jamais verrouillé
-    /// à travers un `await` par l'appelant.
+    /// Shared (synchronous log, short-lived mutex) — never locked
+    /// across an `await` by the caller.
     log_writer: Arc<IndexLogWriter>,
 }
 
@@ -55,40 +55,40 @@ impl Analyzer {
         }
     }
 
-    /// Budget de propositions par cycle (défaut config : 20)
+    /// Proposal budget per cycle (config default: 20)
     fn cap(&self) -> u32 {
         self.config.thresholds.max_proposals_per_cycle
     }
 
-    /// Exécuter un cycle complet d'analyse
+    /// Run a full analysis cycle
     pub async fn analyze_cycle(
         &self,
     ) -> Result<Vec<Proposal>, Box<dyn std::error::Error + Sync + Send>> {
         let mut proposals = Vec::new();
 
-        // 1. Analyse des index inutilisés (fenêtre d'observation requise)
+        // 1. Unused index analysis (observation window required)
         if self.config.actions.drop_unused {
             proposals.extend(self.analyze_unused().await?);
         }
 
-        // 2. Analyse de la fragmentation
+        // 2. Fragmentation analysis
         if self.config.actions.rebuild_fragmented {
             proposals.extend(self.analyze_fragmentation().await?);
         }
 
-        // 3. Détection d'index manquants SARGable
-        //    → DÉSACTIVÉ en état dégradé (pg_stat_statements absent)
+        // 3. Missing SARGable index detection
+        //    → DISABLED in degraded state (pg_stat_statements missing)
         if self.daemon_state.is_degraded() {
             warn!("DEGRADED mode: missing-index detection is DISABLED (pg_stat_statements unavailable)");
         } else {
             proposals.extend(self.analyze_missing_sargable().await?);
         }
 
-        // Budget total par cycle (chaque détecteur est aussi borné en SQL)
+        // Total budget per cycle (each detector is also bounded in SQL)
         let cap = self.cap();
         if proposals.len() > cap as usize {
             warn!(
-                "Proposals cap reached: {} > {} — {} proposition(s) écartée(s) ce cycle (seront re-détectées au prochain)",
+                "Proposals cap reached: {} > {} — {} proposal(s) dropped this cycle (will be re-detected next)",
                 proposals.len(),
                 cap,
                 proposals.len() - cap as usize
@@ -103,25 +103,25 @@ impl Analyzer {
         Ok(proposals)
     }
 
-    /// Vérifier qu'un identifiant de catalogue est injectable dans du DDL /
-    /// un payload Laya. Sinon : warning + exclusion (pas d'exécution aveugle).
+    /// Check that a catalog identifier is safe to inject into DDL /
+    /// a Laya payload. Otherwise: warning + exclusion (no blind execution).
     fn guard_identifier(&self, kind: &str, name: &str) -> bool {
         if naming::is_simple_identifier(name) {
             true
         } else {
-            warn!("Identifier '{name}' ({kind}) non conforme à [a-z_][a-z0-9_]* — exclu du périmètre de gestion");
+            warn!("Identifier '{name}' ({kind}) does not match [a-z_][a-z0-9_]* — excluded from the management scope");
             false
         }
     }
 
-    /// Analyser les index inutilisés
+    /// Analyze unused indexes
     async fn analyze_unused(
         &self,
     ) -> Result<Vec<Proposal>, Box<dyn std::error::Error + Sync + Send>> {
         let threshold_minutes = self.config.thresholds.unused_minutes;
 
-        // Fenêtre d'observation : les compteurs sont remis à zéro au redémarrage.
-        // Si le serveur tourne depuis moins de `unused_minutes`, on ne prononce pas.
+        // Observation window: counters are reset on restart.
+        // If the server has been up for less than `unused_minutes`, we don't judge.
         if !queries::observation_window_ok(&self.pool, threshold_minutes).await? {
             debug!(
                 "Server uptime < {}min (unused threshold): skipping unused-index analysis this cycle",
@@ -134,7 +134,7 @@ impl Analyzer {
         let mut proposals = Vec::new();
 
         for idx in unused {
-            if !(self.guard_identifier("schéma", &idx.schemaname)
+            if !(self.guard_identifier("schema", &idx.schemaname)
                 && self.guard_identifier("table", &idx.tablename)
                 && self.guard_identifier("index", &idx.indexname))
             {
@@ -157,7 +157,7 @@ impl Analyzer {
                 action: DecisionAction::DropIndex,
                 ddl,
                 reason,
-                confidence: 0.0, // Sera mis à jour par Laya
+                confidence: 0.0, // Will be updated by Laya
                 table: idx.tablename,
                 schema: idx.schemaname,
                 index_name: Some(idx.indexname),
@@ -168,7 +168,7 @@ impl Analyzer {
         Ok(proposals)
     }
 
-    /// Analyser la fragmentation des index (reconstruction en ligne : CONCURRENTLY)
+    /// Analyze index fragmentation (online rebuild: CONCURRENTLY)
     async fn analyze_fragmentation(
         &self,
     ) -> Result<Vec<Proposal>, Box<dyn std::error::Error + Sync + Send>> {
@@ -178,7 +178,7 @@ impl Analyzer {
 
         for idx in fragmented {
             if idx.fragmentation_pct >= threshold_pct as f64 {
-                if !(self.guard_identifier("schéma", &idx.schemaname)
+                if !(self.guard_identifier("schema", &idx.schemaname)
                     && self.guard_identifier("table", &idx.tablename)
                     && self.guard_identifier("index", &idx.indexname))
                 {
@@ -216,7 +216,7 @@ impl Analyzer {
         Ok(proposals)
     }
 
-    /// Détecter les requêtes SARGable sans index
+    /// Detect SARGable queries lacking an index
     async fn analyze_missing_sargable(
         &self,
     ) -> Result<Vec<Proposal>, Box<dyn std::error::Error + Sync + Send>> {
@@ -232,13 +232,13 @@ impl Analyzer {
         let mut proposals = Vec::new();
 
         for miss in missing {
-            // Ignorer les catalogues système (pg_*) : on n'indexe jamais les vues de monitoring
+            // Ignore system catalogs (pg_*): we never index monitoring views
             if miss.tablename.starts_with("pg_") {
                 debug!("Skipping system catalog table: {}", miss.tablename);
                 continue;
             }
 
-            // Cardinalité de la table pour estimer la taille du futur index
+            // Table cardinality to estimate the size of the future index
             let cardinality =
                 queries::get_table_cardinality(&self.pool, &miss.schemaname, &miss.tablename)
                     .await
@@ -248,14 +248,14 @@ impl Analyzer {
                     });
 
             for col in &miss.sargable_columns {
-                if !(self.guard_identifier("schéma", &miss.schemaname)
+                if !(self.guard_identifier("schema", &miss.schemaname)
                     && self.guard_identifier("table", &miss.tablename)
-                    && self.guard_identifier("colonne", &col.column_name))
+                    && self.guard_identifier("column", &col.column_name))
                 {
                     continue;
                 }
 
-                // Convention de nommage explicite + validation de longueur
+                // Explicit naming convention + length validation
                 let idx_name = match naming::generate_index_name(
                     &miss.schemaname,
                     &miss.tablename,
@@ -271,7 +271,7 @@ impl Analyzer {
                     }
                 };
 
-                // Densité cible par type de colonne (config) → estimation de taille
+                // Target density per column type (config) → size estimation
                 let density = self.density_for_bucket(&col.density_bucket);
                 let est_pages = if density > 0.0 && cardinality.reltuples > 0.0 {
                     (cardinality.reltuples / density).ceil() as i64
@@ -295,12 +295,12 @@ impl Analyzer {
                     est_bytes
                 );
 
-                // Index filtré si la colonne est nullable à > 10%
-                // (variante proposée par défaut — LAYA reste libre de choisir
-                // l'autre variante à l'application, cf. apply_proposals)
+                // Filtered index if the column is nullable by > 10%
+                // (default proposed variant — LAYA is free to choose
+                // the other variant at apply time, see apply_proposals)
                 let filtered = col.is_nullable && col.null_frac > 0.1;
 
-                // DDL en ligne : CREATE INDEX CONCURRENTLY (ne bloque pas les écritures)
+                // Online DDL: CREATE INDEX CONCURRENTLY (does not block writes)
                 let ddl = ddl::build_create_index_ddl(
                     &miss.schemaname,
                     &idx_name,
@@ -331,7 +331,7 @@ impl Analyzer {
         Ok(proposals)
     }
 
-    /// Récupérer la densité cible pour un bucket depuis la config
+    /// Get the target density for a bucket from the config
     fn density_for_bucket(&self, bucket: &str) -> f64 {
         let d = &self.config.density_by_type;
         match bucket {
@@ -348,10 +348,10 @@ impl Analyzer {
         }
     }
 
-    /// Envoyer les propositions à Laya et appliquer celles avec confiance suffisante.
+    /// Send the proposals to Laya and apply those with sufficient confidence.
     ///
-    /// Politique "pas de fallback" : si Laya est injoignable, AUCUNE décision
-    /// n'est appliquée (les propositions sont simplement journalisées).
+    /// "No fallback" policy: if Laya is unreachable, NO decision
+    /// is applied (the proposals are simply logged).
     pub async fn apply_proposals(
         &self,
         proposals: &[Proposal],
@@ -363,7 +363,7 @@ impl Analyzer {
             return Ok(ApplyResult { applied, skipped });
         }
 
-        // Vérification unique de la disponibilité Laya (health check profond)
+        // Single check of Laya availability (deep health check)
         match self.laya.deep_health().await {
             Ok(_) => debug!("Laya available (deep health OK)"),
             Err(e) => {
@@ -377,7 +377,7 @@ impl Analyzer {
         }
 
         for proposal in proposals {
-            // Construire le payload
+            // Build the payload
             let criteria = match proposal.action {
                 DecisionAction::DropIndex => HashMap::from([
                     (
@@ -422,7 +422,7 @@ impl Analyzer {
 
             let payload = LayaClient::build_payload(&proposal.reason, criteria);
 
-            // Appeler Laya
+            // Call Laya
             match self.laya.decision(&payload).await {
                 Ok(response) => {
                     let choice = response.answers.action.choice;
@@ -433,7 +433,7 @@ impl Analyzer {
                         choice, confidence, response.usage.input_tokens
                     );
 
-                    // Vérifier la confiance
+                    // Check the confidence
                     if confidence < self.config.thresholds.min_confidence {
                         debug!(
                             "Confidence {} < threshold {}, skipping",
@@ -442,7 +442,7 @@ impl Analyzer {
                         continue;
                     }
 
-                    // Appliquer si Laya confirme (choice=1 = APPLY pour ce proposal)
+                    // Apply if Laya confirms (choice=1 = APPLY for this proposal)
                     let decision = match proposal.action {
                         DecisionAction::DropIndex => {
                             if choice == "1" {
@@ -475,9 +475,9 @@ impl Analyzer {
                             DecisionAction::CreateIndex | DecisionAction::CreateFilteredIndex => {
                                 info!("Laya recommended CREATE INDEX: {}", proposal.reason);
                                 if self.config.actions.create_index {
-                                    // Le CHOIX de Laya (1 = standard, 2 = filtré) détermine la
-                                    // DDL exécutée — pas la variante générée à l'analyse.
-                                    // (Régression corrigée : les deux choix exécutaient la même DDL.)
+                                    // Laya's CHOICE (1 = standard, 2 = filtered) determines the
+                                    // DDL executed — not the variant generated at analysis.
+                                    // (Fixed regression: both choices executed the same DDL.)
                                     let filtered = matches!(d, DecisionAction::CreateFilteredIndex);
                                     let ddl_to_run = match (
                                         proposal.index_name.as_deref(),
@@ -519,7 +519,7 @@ impl Analyzer {
                             DecisionAction::DropIndex => {
                                 info!("Laya recommended DROP INDEX: {}", proposal.reason);
                                 if self.config.actions.drop_unused {
-                                    // Récupérer la taille de l'index avant suppression
+                                    // Get the index size before dropping
                                     let size_bytes =
                                         self.get_index_size(&proposal.ddl).await.unwrap_or(0);
                                     match ddl::execute_drop_index(
@@ -546,7 +546,7 @@ impl Analyzer {
                             DecisionAction::RebuildIndex => {
                                 info!("Laya recommended REINDEX: {}", proposal.reason);
                                 if self.config.actions.rebuild_fragmented {
-                                    // Récupérer la fragmentation
+                                    // Get the fragmentation
                                     let frag = self
                                         .get_index_fragmentation(&proposal.ddl)
                                         .await
@@ -567,8 +567,8 @@ impl Analyzer {
                                             applied.push(proposal.clone());
                                         }
                                         Ok(ddl::DdlOutcome::Skipped) => {
-                                            // REINDEX n'a pas de IF EXISTS : en pratique
-                                            // cette branche n'est jamais atteinte.
+                                            // REINDEX has no IF EXISTS: in practice
+                                            // this branch is never reached.
                                             skipped.push(proposal.clone());
                                         }
                                         Err(e) => warn!("Failed to rebuild index: {}", e),
@@ -597,7 +597,7 @@ impl Analyzer {
         Ok(ApplyResult { applied, skipped })
     }
 
-    /// Récupérer la taille d'un index à partir d'un DDL (schéma-qualifié)
+    /// Get the size of an index from a DDL (schema-qualified)
     async fn get_index_size(
         &self,
         ddl: &str,
@@ -623,8 +623,8 @@ impl Analyzer {
         }
     }
 
-    /// Récupérer le taux de fragmentation d'un index (même score que l'analyse :
-    /// dead tuples 50% + modifications non-analysées 30% + index volumineux jamais scanné 20%)
+    /// Get the fragmentation rate of an index (same score as the analysis:
+    /// dead tuples 50% + unanalyzed modifications 30% + large index never scanned 20%)
     async fn get_index_fragmentation(
         &self,
         ddl: &str,
@@ -692,9 +692,9 @@ impl Analyzer {
     }
 }
 
-/// Assainir un champ (type de colonne issu du catalogue) avant de l'insérer
-/// dans un `reason` envoyé à Laya : alphanumérique + `_ ()/,` uniquement,
-/// longueur bornée. Tout le reste est éliminé — jamais de texte brut non contrôlé.
+/// Sanitize a field (column type from the catalog) before inserting it
+/// into a `reason` sent to Laya: alphanumeric + `_ ()/,` only,
+/// bounded length. Everything else is removed — never uncontrolled raw text.
 fn sanitize_reason_field(raw: &str) -> String {
     let cleaned: String = raw
         .chars()
@@ -718,7 +718,7 @@ mod tests {
             sanitize_reason_field("character varying"),
             "character varying"
         );
-        assert_eq!(sanitize_reason_field("int[]"), "int"); // crochets éliminés
+        assert_eq!(sanitize_reason_field("int[]"), "int"); // brackets removed
         assert_eq!(sanitize_reason_field(""), "unknown");
         assert_eq!(
             sanitize_reason_field("a; DROP TABLE x; --"),

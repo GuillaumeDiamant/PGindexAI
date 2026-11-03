@@ -5,7 +5,7 @@ use reqwest::Client;
 use std::collections::HashMap;
 use tracing::debug;
 
-/// Client HTTP vers le serveur Laya
+/// HTTP client to the Laya server
 #[derive(Clone)]
 pub struct LayaClient {
     client: Client,
@@ -23,12 +23,12 @@ impl LayaClient {
         }
     }
 
-    /// Health check PROFOND : envoie un vrai payload de décision de test
-    /// au endpoint /v1/systemone et vérifie que la réponse est structurée
-    /// et cohérente (choice présent, confidence dans [0,1]).
+    /// DEEP health check: sends a real test decision payload
+    /// to the /v1/systemone endpoint and verifies that the response is structured
+    /// and coherent (choice present, confidence in [0,1]).
     ///
-    /// Ce test détecte les cas où /health répond mais que le pipeline de
-    /// décision (modèle, variante, parsing de réponse) est cassé.
+    /// This test detects cases where /health responds but the decision
+    /// pipeline (model, variant, response parsing) is broken.
     pub async fn deep_health(&self) -> Result<String, LayaError> {
         let payload = LayaClient::build_payload(
             "deep-health-check",
@@ -43,7 +43,7 @@ impl LayaClient {
 
         let response = self.decision(&payload).await?;
 
-        // Validation structurelle de la réponse
+        // Structural validation of the response
         let choice = response.answers.action.choice.as_str();
         let confidence = response.answers.action.confidence;
 
@@ -67,7 +67,7 @@ impl LayaClient {
         Ok(format!("choice={}, confidence={:.2}", choice, confidence))
     }
 
-    /// Envoyer une question de décision à Laya
+    /// Send a decision question to Laya
     pub async fn decision(&self, payload: &LayaPayload) -> Result<LayaResponse, LayaError> {
         let url = format!("{}/v1/systemone", self.base_url);
         let resp = self
@@ -103,10 +103,10 @@ impl LayaClient {
         }
     }
 
-    /// Construire le payload pour une proposition de décision
+    /// Build the payload for a decision proposal
     pub fn build_payload(state: &str, criteria: HashMap<String, String>) -> LayaPayload {
         let mut creds = criteria;
-        // S'assurer que les clés sont dans l'ordre 0,1,2,...
+        // Make sure the keys are in the order 0,1,2,...
         let mut ordered = HashMap::new();
         for i in 0..creds.len() {
             let key = i.to_string();

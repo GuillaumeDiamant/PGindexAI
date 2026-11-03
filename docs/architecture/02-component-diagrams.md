@@ -31,7 +31,7 @@
 │  │  analyze_cycle():                                                  │  │
 │  │    ├── analyze_unused()           → Vec<Proposal>  (gate uptime)   │  │
 │  │    ├── analyze_fragmentation()    → Vec<Proposal>  (btree only)    │  │
-│  │    └── analyze_missing_sargable() → Vec<Proposal> (si Healthy)     │  │
+│  │    └── analyze_missing_sargable() → Vec<Proposal> (if Healthy)     │  │
 │  │          ├── parse AST (sqlparser)                                  │  │
 │  │          ├── real types + null_frac                                 │  │
 │  │          ├── naming::generate_index_name()                          │  │

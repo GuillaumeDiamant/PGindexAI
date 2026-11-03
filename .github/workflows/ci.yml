@@ -37,8 +37,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # Les tests « live » (requérant un PG local sur socket) se sautent
-      # proprement ; les tests unitaires couvrent la logique.
+      # The "live" tests (requiring a local PG on socket) skip
+      # cleanly; the unit tests cover the logic.
       - run: cargo test --all-targets
       - run: cargo build --release
 

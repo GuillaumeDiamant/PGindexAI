@@ -45,11 +45,11 @@ enum Command {
 async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
     let cli = Cli::parse();
 
-    // Charger la config
+    // Load the configuration
     let config_path = cli.config.unwrap_or_else(config::default_config_path);
     let cfg = config::load(&config_path).map_err(|e| format!("Config error: {}", e))?;
 
-    // Initialiser le logging
+    // Initialize logging
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&cfg.logging.level));
     if cfg.logging.format == "json" {
@@ -64,20 +64,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
 
     info!("PGindexAI starting...");
 
-    // Créer le pool de connexions PostgreSQL (TLS selon ssl_mode, taille configurable)
+    // Create the PostgreSQL connection pool (TLS per ssl_mode, configurable size)
     let pool = db::create_pool(&cfg.postgresql, &cfg.pg_pool).await?;
 
-    // Vérifier que pg_stat_statements est activé → état du daemon
+    // Check that pg_stat_statements is enabled → daemon state
     let daemon_state = check_pg_stat_statements(&pool).await?;
     if daemon_state == DaemonState::Degraded {
         warn!("Daemon running in DEGRADED mode: pg_stat_statements missing.");
         warn!("Missing-index detection is DISABLED until the extension is installed.");
     }
 
-    // Créer le client Laya
+    // Create the Laya client
     let laya = laya::LayaClient::new(&cfg.laya.url, cfg.laya.timeout_seconds);
 
-    // Health check PROFOND : un vrai payload de test, pas juste GET /health
+    // DEEP health check: an actual test payload, not just GET /health
     match laya.deep_health().await {
         Ok(status) => info!("Laya deep health OK at {} ({})", cfg.laya.url, status),
         Err(e) => {
@@ -96,7 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
     }
 }
 
-/// Exécuter un cycle unique
+/// Run a single cycle
 async fn run_once(
     pool: deadpool_postgres::Pool,
     laya: laya::LayaClient,
@@ -106,7 +106,7 @@ async fn run_once(
 ) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
     let analyzer = analyzer::Analyzer::new(pool, laya, cfg, daemon_state);
 
-    // Analyser
+    // Analyze
     let proposals = match analyzer.analyze_cycle().await {
         Ok(p) => p,
         Err(e) => {
@@ -128,7 +128,7 @@ async fn run_once(
         return Ok(());
     }
 
-    // Appliquer les décisions Laya
+    // Apply the Laya decisions
     let result = analyzer.apply_proposals(&proposals).await?;
     info!(
         "Applied: {} proposal(s), skipped (no-op): {}",
@@ -139,7 +139,7 @@ async fn run_once(
     Ok(())
 }
 
-/// Mode daemon : boucle d'analyse continue, arrêt gracieux (SIGINT / SIGTERM)
+/// Daemon mode: continuous analysis loop, graceful shutdown (SIGINT / SIGTERM)
 async fn run_daemon(
     pool: deadpool_postgres::Pool,
     laya: laya::LayaClient,
@@ -154,7 +154,7 @@ async fn run_daemon(
         cycle_secs, daemon_state, dry_run
     );
 
-    // L'analyzer (et son log writer) est créé une fois, puis réutilisé à chaque cycle
+    // The analyzer (and its log writer) is created once, then reused on each cycle
     let analyzer = analyzer::Analyzer::new(pool, laya, cfg, daemon_state);
 
     let mut shutdown = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -162,7 +162,7 @@ async fn run_daemon(
     loop {
         let start = std::time::Instant::now();
 
-        // Analyser
+        // Analyze
         let proposals = match analyzer.analyze_cycle().await {
             Ok(p) => p,
             Err(e) => {
@@ -182,7 +182,7 @@ async fn run_daemon(
             info!("Proposal: [{}] {}", p.action, p.reason);
         }
 
-        // Appliquer (sauf dry-run)
+        // Apply (unless dry-run)
         if !dry_run {
             match analyzer.apply_proposals(&proposals).await {
                 Ok(result) => {
@@ -200,7 +200,7 @@ async fn run_daemon(
             info!("DRY-RUN: skipping Laya + DDL this cycle");
         }
 
-        // Attendre le prochain cycle — interruptible par Ctrl-C ou SIGTERM
+        // Wait for the next cycle — interruptible by Ctrl-C or SIGTERM
         let sleep_dur = std::time::Duration::from_secs(cycle_secs);
         tokio::select! {
             _ = tokio::time::sleep(sleep_dur) => {}
@@ -219,7 +219,7 @@ async fn run_daemon(
     Ok(())
 }
 
-/// Vérifier que pg_stat_statements est activé et retourner l'état du daemon
+/// Check that pg_stat_statements is enabled and return the daemon state
 async fn check_pg_stat_statements(
     pool: &deadpool_postgres::Pool,
 ) -> Result<DaemonState, Box<dyn std::error::Error + Sync + Send>> {

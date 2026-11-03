@@ -1,30 +1,30 @@
 #!/usr/bin/env bash
 # ============================================================================
-# install.sh — Installation sécurisée de PGindexAI
+# install.sh — Secure installation of PGindexAI
 #
-# Prérequis :
-#   - PostgreSQL 16+ (binaire psql + cluster fonctionnel)
+# Prerequisites:
+#   - PostgreSQL 16+ (psql binary + working cluster)
 #   - Rust toolchain (cargo)
-#   - Accès sudo
+#   - sudo access
 #
-# Usage :
+# Usage:
 #   curl -fsSL https://raw.githubusercontent.com/GuillaumeDiamant/PGindexAI/main/install.sh | bash
-#   # ou
+#   # or
 #   ./install.sh [--dry-run]
 #
-# Garanties :
-#   - Rôle PostgreSQL dédié NON superutilisateur (pgindexai, auth scram-sha-256)
-#   - pg_hba : ligne CIBLÉE (local all pgindexai scram-sha-256), jamais
-#     de 'local all all trust'
-#   - shared_preload_libraries est fUSIONNÉ, jamais écrasé
-#   - Config 0600, mot de passe généré (openssl rand), jamais echo'ed en log
-#   - Pas d'eval, pas de commande interprétée en chaîne
-#   - Unit systemd durcie (MemoryMax, CPUQuota, NoNewPrivileges, …)
+# Guarantees:
+#   - Dedicated NON-superuser PostgreSQL role (pgindexai, scram-sha-256 auth)
+#   - pg_hba: TARGETED line (local all pgindexai scram-sha-256), never
+#     a 'local all all trust'
+#   - shared_preload_libraries is MERGED, never overwritten
+#   - 0600 config, generated password (openssl rand), never echoed in the log
+#   - No eval, no command interpreted as a string
+#   - Hardened systemd unit (MemoryMax, CPUQuota, NoNewPrivileges, …)
 # ============================================================================
 set -euo pipefail
 
 # ─────────────────────────────────────────────
-# Couleurs & logs
+# Colors & logging
 # ─────────────────────────────────────────────
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -38,15 +38,15 @@ error() { echo -e "${RED}[✗]${NC} $*" >&2; }
 step()  { echo -e "${CYAN}→${NC} $*"; }
 
 # ─────────────────────────────────────────────
-# Variables globales
+# Global variables
 # ─────────────────────────────────────────────
 DRY_RUN=false
 POSTGRES_USER="${POSTGRES_USER:-postgres}"
 
-# Utilisateur cible : celui qui possède le daemon, la config et le dépôt.
-# - script en non-root → l'utilisateur courant
-# - script via sudo    → $SUDO_USER (sinon : propriétaire du répertoire courant)
-# NB : sous sudo, $HOME/$USER pointent vers root — il faut donc les redériver.
+# Target user: the one owning the daemon, the config and the repo.
+# - script as non-root → the current user
+# - script via sudo    → $SUDO_USER (otherwise: owner of the current directory)
+# NB: under sudo, $HOME/$USER point to root — they must be re-derived.
 if [[ "$(id -u)" -ne 0 ]]; then
     TARGET_USER="${USER:-$(whoami)}"
 elif [[ -n "${SUDO_USER:-}" ]]; then
@@ -55,7 +55,7 @@ else
     TARGET_USER="$(stat -c %U . 2>/dev/null || true)"
 fi
 if [[ -z "${TARGET_USER:-}" ]]; then
-    error "Impossible de déterminer l'utilisateur cible (USER / SUDO_USER absents)."
+    error "Cannot determine the target user (USER / SUDO_USER missing)."
     exit 1
 fi
 TARGET_HOME="$(getent passwd "$TARGET_USER" 2>/dev/null | cut -d: -f6 || true)"
@@ -65,13 +65,13 @@ CONFIG_DIR="${TARGET_HOME}/.config/PGindexAI"
 CONFIG_FILE="$CONFIG_DIR/PGindexAI.yaml"
 BIN_PATH="/usr/local/bin/pgindexai"
 SERVICE_NAME="pgindexai"
-PGINDEXAI_PW=""          # mot de passe du rôle pgindexai (jamais affiché)
+PGINDEXAI_PW=""          # password of the pgindexai role (never displayed)
 PG_CONF=""
 PG_HBA=""
 PG_SSL="off"
 
 # ─────────────────────────────────────────────
-# Analyse des arguments
+# Argument parsing
 # ─────────────────────────────────────────────
 for arg in "$@"; do
     case "$arg" in
@@ -80,11 +80,11 @@ for arg in "$@"; do
             sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
-        *) warn "Argument inconnu : $arg (ignoré)" ;;
+        *) warn "Unknown argument: $arg (ignored)" ;;
     esac
 done
 
-# run CMD [ARGS...] — sans eval : chaque argument est passé tel quel
+# run CMD [ARGS...] — no eval: each argument is passed as-is
 run() {
     if $DRY_RUN; then
         echo -e "${CYAN}[dry-run]${NC} $*"
@@ -93,11 +93,11 @@ run() {
     fi
 }
 
-# psql_stdin "SQL" [options psql...] — exécute la SQL via STDIN, pas en
-# argument de commande : une valeur sensible (mot de passe) ne transite
-# JAMAIS par la liste de processus locale (`ps`).
-# (L'ancien `psql -c "…PASSWORD '…'"` restait visible pendant l'exécution ;
-# le dry-run l'affichait même à l'écran/log.)
+# psql_stdin "SQL" [psql options...] — runs the SQL via STDIN, not as
+# a command argument: a sensitive value (password) never goes
+# through the local process list (`ps`) EVER.
+# (The old `psql -c "…PASSWORD '…'"` remained visible during execution;
+# the dry-run even displayed it on screen/in the log.)
 psql_stdin() {
     local sql="$1"
     shift
@@ -108,10 +108,10 @@ psql_stdin() {
     fi
 }
 
-# ask "question" [défaut Y|N] — lit /dev/tty (fonctionne même via curl | bash),
-# repli sur la valeur par défaut si aucun terminal contrôleur n'est disponible.
-# NB : ne JAMAIS rediriger le stderr de `read` : `read -p` écrit le prompt dessus,
-# et 2>/dev/null rendrait la question invisible pour l'utilisateur.
+# ask "question" [default Y|N] — reads /dev/tty (works even via curl | bash),
+# falls back to the default value if no controlling terminal is available.
+# NB: NEVER redirect the stderr of `read`: `read -p` writes the prompt to it,
+# and 2>/dev/null would make the question invisible to the user.
 ask() {
     local prompt="$1" def="${2:-Y}" answer=""
     if ! ( : </dev/tty ) 2>/dev/null; then
@@ -122,39 +122,39 @@ ask() {
     [[ "${answer:-$def}" =~ ^[Yy] ]]
 }
 
-# pg_show "SQL" — exécute une requête en -tAc en tant que $POSTGRES_USER
-# (via sudo -u, sans mot de passe). Renvoie une chaîne vide en cas d'échec.
+# pg_show "SQL" — runs a query with -tAc as $POSTGRES_USER
+# (via sudo -u, no password). Returns an empty string on failure.
 pg_show() {
     sudo -u "$POSTGRES_USER" psql -tAc "$1" 2>/dev/null || true
 }
 
 # ─────────────────────────────────────────────
-# Prérequis
+# Prerequisites
 # ─────────────────────────────────────────────
 check_sudo() {
-    step "Vérification de l'accès sudo..."
+    step "Checking sudo access..."
     if sudo -n true 2>/dev/null; then
-        info "sudo disponible (sans mot de passe)"
+        info "sudo available (without password)"
     else
-        warn "sudo requis — le script vous demandera votre mot de passe"
+        warn "sudo required — the script will ask you for your password"
     fi
 }
 
 check_postgres() {
-    step "Vérification de PostgreSQL..."
+    step "Checking PostgreSQL..."
     if ! command -v psql &>/dev/null; then
-        error "psql introuvable — installez PostgreSQL 16+"
+        error "psql not found — install PostgreSQL 16+"
         exit 1
     fi
     local version
     version="$(psql --version 2>/dev/null | grep -oE '[0-9]+' | head -1 || echo 0)"
     if [[ "${version:-0}" -ge 16 ]]; then
-        info "PostgreSQL $version détecté"
+        info "PostgreSQL $version detected"
     else
-        warn "PostgreSQL 16+ requis (version ${version:-inconnue} trouvée)"
+        warn "PostgreSQL 16+ required (found version ${version:-unknown})"
     fi
 
-    # Détection des fichiers de config via le serveur lui-même (pas de chemin codé)
+    # Detecting config files via the server itself (no hardcoded path)
     PG_CONF="$(pg_show "SHOW config_file" | tr -d '[:space:]')"
     PG_HBA="$(pg_show "SHOW hba_file" | tr -d '[:space:]')"
     PG_SSL="$(pg_show "SHOW ssl" | tr -d '[:space:]')"
@@ -163,14 +163,14 @@ check_postgres() {
         info "pg_hba.conf     : ${PG_HBA:-?}"
         info "ssl             : ${PG_SSL:-?}"
     else
-        warn "Impossible de lire l'état du serveur (sudo -u $POSTGRES_USER psql ?)."
-        warn "La configuration automatique sera limitée."
+        warn "Cannot read the server state (sudo -u $POSTGRES_USER psql?)."
+        warn "Automatic configuration will be limited."
     fi
 }
 
 check_rust() {
-    step "Vérification de Rust..."
-    # cargo peut vivre dans le home de l'utilisateur cible (absent du PATH de root)
+    step "Checking Rust..."
+    # cargo may live in the target user's home (missing from root's PATH)
     local cargo_bin=""
     if command -v cargo &>/dev/null; then
         cargo_bin="$(command -v cargo)"
@@ -179,16 +179,16 @@ check_rust() {
         export PATH="${TARGET_HOME}/.cargo/bin:${PATH}"
     fi
     if [[ -n "$cargo_bin" ]]; then
-        info "Rust toolchain détecté ($cargo_bin)"
+        info "Rust toolchain detected ($cargo_bin)"
         return 0
     fi
 
-    if ask "Rust introuvable. Installer via rustup ? [Y/n]" Y; then
+    if ask "Rust not found. Install via rustup? [Y/n]" Y; then
         local rustup_script
         rustup_script="$(mktemp)"
         run curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o "$rustup_script"
-        # Installer POUR l'utilisateur cible (pas root) : le daemon tourne sous ce compte.
-        # NB : le drapeau « -s » n'existe plus dans rustup-init récent → « -y » suffit.
+        # Install FOR the target user (not root): the daemon runs under this account.
+        # NB: the « -s » flag no longer exists in recent rustup-init → « -y » suffices.
         if [[ "$(id -u)" -eq 0 ]]; then
             run sudo -u "$TARGET_USER" sh "$rustup_script" -y --default-toolchain stable
         else
@@ -200,31 +200,31 @@ check_rust() {
         else
             source "$HOME/.cargo/env" 2>/dev/null || true
         fi
-        info "rustup installé (pour l'utilisateur $TARGET_USER)"
+        info "rustup installed (for user $TARGET_USER)"
     else
-        error "Rust est requis pour compiler pgindexai"
+        error "Rust is required to compile pgindexai"
         exit 1
     fi
 }
 
 # ─────────────────────────────────────────────
-# Étape 1 : PostgreSQL (rôle dédié, hba ciblée, pg_stat_statements)
+# Step 1: PostgreSQL (dedicated role, targeted hba, pg_stat_statements)
 # ─────────────────────────────────────────────
 ensure_demo_db() {
     if [[ -n "$(pg_show "SELECT 1 FROM pg_database WHERE datname = 'pgindexai_demo'")" ]]; then
-        info "Base 'pgindexai_demo' présente"
+        info "Database 'pgindexai_demo' present"
         return
     fi
-    step "Création de la base 'pgindexai_demo'..."
+    step "Creating database 'pgindexai_demo'..."
     run sudo -u "$POSTGRES_USER" psql -qc "CREATE DATABASE pgindexai_demo"
 }
 
-# Transfert de propriété des objets de pgindexai_demo vers pgindexai :
-# CREATE INDEX / DROP INDEX / REINDEX exigent la propriété de la table/index.
-# NB : 'pg_toast' est EXCLU — les index TOAST sont des catalogues système ;
-# un ALTER ... OWNER dessus échoue et ABORT le bloc DO entier, annulant
-# tout le transfert (sans cette exclusion, le transfert échouait dès qu'une
-# table possédait une colonne TOAST : text/varchar/jsonb…).
+# Ownership transfer of pgindexai_demo objects to pgindexai:
+# CREATE INDEX / DROP INDEX / REINDEX require ownership of the table/index.
+# NB: 'pg_toast' is EXCLUDED — TOAST indexes are system catalogs;
+# an ALTER ... OWNER on them fails and ABORTs the whole DO block, canceling
+# the whole transfer (without this exclusion, the transfer failed as soon as a
+# table had a TOAST column: text/varchar/jsonb…).
 transfer_ownership() {
     local sql
     sql="
@@ -260,31 +260,31 @@ END
     fi
     local err
     if ! err="$(sudo -u "$POSTGRES_USER" psql -d pgindexai_demo -qc "$sql" 2>&1 >/dev/null)"; then
-        error "Transfert de propriété ÉCHOUÉ — le daemon ne pourra PAS créer/supprimer d'index tant que les objets de pgindexai_demo ne sont pas détenus par 'pgindexai'."
+        error "Ownership transfer FAILED — the daemon will NOT be able to create/drop indexes until the pgindexai_demo objects are owned by 'pgindexai'."
         if [[ -n "$err" ]]; then
-            error "Détail : $(head -c 300 <<<"$err" | tr '\n' ' ')"
+            error "Detail: $(head -c 300 <<<"$err" | tr '\n' ' ')"
         fi
         return 1
     fi
-    info "Droits de propriété appliqués (tables + index de pgindexai_demo → pgindexai)"
+    info "Ownership applied (tables + indexes of pgindexai_demo → pgindexai)"
 }
 
 setup_role() {
-    step "Configuration du rôle dédié 'pgindexai' (non superutilisateur)..."
+    step "Configuring the dedicated 'pgindexai' role (non-superuser)..."
 
     local role_exists
     role_exists="$(pg_show "SELECT 1 FROM pg_roles WHERE rolname = 'pgindexai'")"
 
     if [[ -n "$role_exists" ]]; then
-        info "Rôle 'pgindexai' existe déjà"
-        # Si une config existante contient le mot de passe, le réappliquer
-        # (garantie de cohérence rôle ↔ config)
+        info "Role 'pgindexai' already exists"
+        # If an existing config contains the password, re-apply it
+        # (guaranteeing role ↔ config consistency)
         if [[ -f "$CONFIG_FILE" ]]; then
             local existing_pw pw_sql q
             existing_pw="$(sed -n 's/^[[:space:]]*password:[[:space:]]*//p' "$CONFIG_FILE" | head -1 || true)"
-            # Retirer UNE paire de guillemets YAML externes éventuels —
-            # les guillemets INTERNES font partie du mot de passe (on ne
-            # les supprime pas : l'ancienne `tr -d` les corrompait).
+            # Strip ONE pair of outer YAML quotes if present —
+            # INNER quotes are part of the password (we do not
+            # remove them: the old `tr -d` was corrupting them).
             q="'"
             if [[ ${#existing_pw} -ge 2 && "${existing_pw:0:1}" == "$q" && "${existing_pw: -1}" == "$q" ]]; then
                 existing_pw="${existing_pw:1:${#existing_pw}-2}"
@@ -294,67 +294,67 @@ setup_role() {
             fi
             if [[ -n "$existing_pw" ]]; then
                 PGINDEXAI_PW="$existing_pw"
-                pw_sql="${existing_pw//$q/$q$q}"   # échappement SQL : ' → ''
+                pw_sql="${existing_pw//$q/$q$q}"   # SQL escaping: ' → ''
                 psql_stdin "ALTER ROLE pgindexai PASSWORD '$pw_sql'"
-                info "Mot de passe existant conservé (re-appliqué au rôle)"
+                info "Existing password kept (re-applied to the role)"
             fi
         fi
     else
         PGINDEXAI_PW="$(openssl rand -hex 16)"
         psql_stdin "CREATE ROLE pgindexai LOGIN PASSWORD '${PGINDEXAI_PW}'"
-        info "Rôle 'pgindexai' créé (mot de passe généré — conservé dans la config 0600)"
+        info "Role 'pgindexai' created (generated password — kept in the 0600 config)"
     fi
 
     if [[ -z "$PGINDEXAI_PW" ]]; then
-        # Rôle existant sans mot de passe connu : en générer un et l'imposer
+        # Existing role without a known password: generate one and enforce it
         PGINDEXAI_PW="$(openssl rand -hex 16)"
         psql_stdin "ALTER ROLE pgindexai PASSWORD '${PGINDEXAI_PW}'"
-        warn "Mot de passe régénéré pour 'pgindexai' (aucun trouvé dans la config existante)"
+        warn "Password regenerated for 'pgindexai' (none found in the existing config)"
     fi
 
     run sudo -u "$POSTGRES_USER" psql -qc "GRANT CONNECT ON DATABASE pgindexai_demo TO pgindexai"
-    # PostgreSQL 15+ : CREATE n'est plus accordé à tous sur le schéma public
-    # par défaut — sans ce GRANT, CREATE/DROP INDEX échoue (permission denied
-    # for schema public) même si pgindexai possède les tables.
+    # PostgreSQL 15+: CREATE is no longer granted to everyone on the public schema
+    # by default — without this GRANT, CREATE/DROP INDEX fails (permission denied
+    # for schema public) even if pgindexai owns the tables.
     run sudo -u "$POSTGRES_USER" psql -d pgindexai_demo -qc "GRANT CREATE ON SCHEMA public TO pgindexai"
 
-    # Transfert de propriété (tables + index) vers pgindexai.
-    # NB : re-appliqué après setup_demo dans main() — le schéma de démo est
-    # créé PAR postgres et doit être ré-attribué pour que le daemon puisse
-    # y exécuter du DDL (sinon : permission denied sur CREATE/DROP INDEX).
+    # Ownership transfer (tables + indexes) to pgindexai.
+    # NB: re-applied after setup_demo in main() — the demo schema is
+    # created BY postgres and must be re-attributed so the daemon can
+    # execute DDL on it (otherwise: permission denied on CREATE/DROP INDEX).
     transfer_ownership
 }
 
 ensure_hba() {
-    step "pg_hba.conf : ligne ciblée pour pgindexai (scram-sha-256)..."
+    step "pg_hba.conf: targeted line for pgindexai (scram-sha-256)..."
     local hba="${PG_HBA:-/etc/postgresql/16/main/pg_hba.conf}"
-    # pg_hba.conf : TYPE  DATABASE  USER  METHOD — le daemon se connecte à la
-    # base pgindexai_demo (pas à une base « pgindexai ») → DATABASE = « all ».
+    # pg_hba.conf: TYPE  DATABASE  USER  METHOD — the daemon connects to the
+    # database pgindexai_demo (not a database « pgindexai ») → DATABASE = « all ».
     local line="local   all   pgindexai   scram-sha-256"
 
     if [[ ! -f "$hba" ]]; then
-        warn "pg_hba introuvable à '$hba' — ajout manuel requis : $line"
+        warn "pg_hba not found at '$hba' — manual addition required: $line"
         return 1
     fi
 
     local hba_modified=false
 
     if sudo grep -Eq "^[[:space:]]*local[[:space:]]+(all|pgindexai_demo)[[:space:]]+pgindexai[[:space:]]+" "$hba"; then
-        info "Ligne pour pgindexai déjà présente"
+        info "Line for pgindexai already present"
     elif sudo grep -Eq "^[[:space:]]*local[[:space:]]+pgindexai[[:space:]]+pgindexai[[:space:]]+" "$hba"; then
-        # Variante défectueuse : « local pgindexai pgindexai » met pgindexai dans
-        # la colonne DATABASE → le daemon (base pgindexai_demo) ne matche jamais
+        # Defective variant: « local pgindexai pgindexai » puts pgindexai in
+        # the DATABASE column → the daemon (database pgindexai_demo) never matches
         # → « no pg_hba.conf entry for host [local] ».
-        warn "Ligne mal formée (DATABASE=pgindexai) détectée — correction en « local all pgindexai »..."
+        warn "Malformed line (DATABASE=pgindexai) detected — correcting to « local all pgindexai »..."
         run sudo sed -i -E "s|^([[:space:]]*)local[[:space:]]+pgindexai[[:space:]]+pgindexai([[:space:]]+.*)\$|\1local   all   pgindexai\2|" "$hba"
         hba_modified=true
-        info "Ligne corrigée : local all pgindexai scram-sha-256"
+        info "Line corrected: local all pgindexai scram-sha-256"
     else
-        # pg_hba est « first match wins » : la ligne dédiée est insérée EN TÊTE
-        # pour qu'elle prévale sur toute ligne large ('local all all ...').
+        # pg_hba is « first match wins »: the dedicated line is inserted AT THE TOP
+        # so it takes precedence over any broad line ('local all all ...').
         local old_content
         if $DRY_RUN; then
-            old_content="<contenu actuel de pg_hba.conf>"
+            old_content="<current content of pg_hba.conf>"
         else
             old_content="$(sudo cat "$hba")"
         fi
@@ -364,46 +364,46 @@ $line
 $old_content
 EOF
         if $DRY_RUN; then
-            echo -e "  ${CYAN}(dry-run : la ligne serait insérée en tête de pg_hba.conf)${NC}"
+            echo -e "  ${CYAN}(dry-run: the line would be inserted at the top of pg_hba.conf)${NC}"
         else
-            info "Ligne insérée en tête de pg_hba.conf (priorité first-match)"
+            info "Line inserted at the top of pg_hba.conf (first-match priority)"
         fi
         hba_modified=true
     fi
 
-    # pg_hba.conf est rechargé au SIGHUP (reload) — PAS à chaque connexion.
+    # pg_hba.conf is reloaded on SIGHUP (reload) — NOT on every connection.
     if $hba_modified; then
         run sudo systemctl reload postgresql
-        info "PostgreSQL rechargé (pg_hba.conf appliqué)"
+        info "PostgreSQL reloaded (pg_hba.conf applied)"
     fi
 
     if sudo grep -Eq "^[[:space:]]*local[[:space:]]+all[[:space:]]+all[[:space:]]+trust" "$hba"; then
-        warn "Attention : 'local all all trust' est présent dans pg_hba.conf."
-        warn "La ligne dédiée à pgindexai la précède (donc appliquée), mais retirez la"
-        warn "ligne trust pour durcir le cluster (tous les autres rôles sont concernés)."
+        warn "Warning: 'local all all trust' is present in pg_hba.conf."
+        warn "The line dedicated to pgindexai precedes it (so it is applied), but remove the"
+        warn "trust line to harden the cluster (all the other roles are affected)."
     fi
 }
 
 ensure_pg_stat_statements() {
-    step "Activation de pg_stat_statements..."
+    step "Enabling pg_stat_statements..."
     local lib="pg_stat_statements"
 
     if [[ -n "$(pg_show "SELECT 1 FROM pg_extension WHERE extname = '$lib'")" ]]; then
-        info "pg_stat_statements est actif"
+        info "pg_stat_statements is active"
         return 0
     fi
 
-    # Valeur effective en cours
+    # Current effective value
     local current
     current="$(pg_show "SHOW shared_preload_libraries" || echo "")"
     if echo " $current " | tr ',' ' ' | tr -s ' ' | grep -qw "$lib"; then
-        info "Déjà dans shared_preload_libraries (un redémarrage peut suffire)"
+        info "Already in shared_preload_libraries (a restart may suffice)"
     fi
 
     local conf="${PG_CONF:-/etc/postgresql/16/main/postgresql.conf}"
     if [[ -z "$PG_CONF" || ! -r "$conf" ]]; then
-        warn "Impossible de modifier '$conf' automatiquement."
-        warn "Action manuelle : shared_preload_libraries += '$lib', redémarrer PG,"
+        warn "Cannot modify '$conf' automatically."
+        warn "Manual action: shared_preload_libraries += '$lib', restart PG,"
         warn "puis CREATE EXTENSION IF NOT EXISTS pg_stat_statements;"
         return 1
     fi
@@ -412,25 +412,25 @@ ensure_pg_stat_statements() {
     line="$(grep -E "^[[:space:]]*shared_preload_libraries[[:space:]]*=" "$conf" | tail -n1 || true)"
 
     if grep -qw "$lib" <<<"$line"; then
-        info "Déjà déclaré dans $conf (redémarrage nécessaire)"
+        info "Already declared in $conf (restart required)"
     elif [[ -n "$line" ]]; then
-        # FUSION : on conserve les bibliothèques existantes, on ajoute la nôtre
+        # MERGE: we keep the existing libraries, we add ours
         local val newval
         val="$(sed -E "s/^[[:space:]]*shared_preload_libraries[[:space:]]*=[[:space:]]*//" <<<"$line" \
                | sed -E "s/[[:space:]]*\$//" | sed -E "s/^['\"]//; s/['\"]\$//" | xargs)"
         newval="${val:+$val,}$lib"
         run sudo sed -i -E "s|^[[:space:]]*shared_preload_libraries[[:space:]]*=.*|shared_preload_libraries = '${newval}'|" "$conf"
-        info "Fusion : shared_preload_libraries = '${newval}'"
+        info "Merge: shared_preload_libraries = '${newval}'"
     else
-        run sudo bash -c "printf '\n# Ajouté par pgindexai install.sh\nshared_preload_libraries = '%s'\n' \"$lib\" >> \"$conf\""
-        info "Ajout : shared_preload_libraries = '$lib'"
+        run sudo bash -c "printf '\n# Added by pgindexai install.sh\nshared_preload_libraries = '%s'\n' \"$lib\" >> \"$conf\""
+        info "Added: shared_preload_libraries = '$lib'"
     fi
 
-    # Redémarrage si nécessaire (pg_hba.conf est, lui, rechargé par « reload » — géré dans ensure_hba)
+    # Restart if needed (pg_hba.conf, for its part, is reloaded by « reload » — handled in ensure_hba)
     if [[ -z "$(pg_show "SELECT 1 FROM pg_extension WHERE extname = '$lib'")" ]]; then
-        warn "Redémarrage de PostgreSQL (shared_preload_libraries modifié)..."
+        warn "Restarting PostgreSQL (shared_preload_libraries modified)..."
         run sudo systemctl restart postgresql
-        # Polling d'activité (30 s)
+        # Activity polling (30 s)
         for _ in {1..15}; do
             if [[ "$(pg_show "SELECT 1")" == "1" ]]; then
                 break
@@ -438,11 +438,11 @@ ensure_pg_stat_statements() {
             sleep 2
         done
         if [[ "$(pg_show "SELECT 1")" != "1" ]]; then
-            error "PostgreSQL n'a pas redémarré — vérifiez : sudo journalctl -u postgresql"
+            error "PostgreSQL did not restart — check: sudo journalctl -u postgresql"
             return 1
         fi
         run sudo -u "$POSTGRES_USER" psql -d pgindexai_demo -qc "CREATE EXTENSION IF NOT EXISTS $lib"
-        info "pg_stat_statements activé"
+        info "pg_stat_statements enabled"
     fi
 }
 
@@ -454,13 +454,13 @@ setup_postgresql() {
 }
 
 # ─────────────────────────────────────────────
-# Étape 2 : Compilation & installation
+# Step 2: Compilation & installation
 # ─────────────────────────────────────────────
 build_and_install() {
-    step "Compilation de pgindexai..."
+    step "Compiling pgindexai..."
     local repo_dir
     repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    # Sous root : compiler SOUS l'utilisateur cible (cargos de son home, target/ à son nom)
+    # Under root: compile AS the target user (cargo in their home, target/ in their name)
     if [[ "$(id -u)" -eq 0 ]]; then
         local cargo_exe
         if command -v cargo &>/dev/null; then
@@ -474,37 +474,37 @@ build_and_install() {
     else
         ( cd "$repo_dir" && run cargo build --release )
     fi
-    info "Compilation terminée"
+    info "Compilation finished"
 
-    step "Installation du binaire → $BIN_PATH"
+    step "Installing the binary → $BIN_PATH"
     run sudo cp "$repo_dir/target/release/pgindexai" "$BIN_PATH"
     run sudo chmod 755 "$BIN_PATH"
 
-    step "Création des répertoires..."
+    step "Creating directories..."
     run mkdir -p "$PGINDEXAI_DIR" "$CONFIG_DIR"
     run sudo mkdir -p /var/log/pgindexai
     if [[ "$(id -u)" -eq 0 ]]; then
         run chown "$TARGET_USER" "$PGINDEXAI_DIR" "$CONFIG_DIR" /var/log/pgindexai
     fi
-    info "Répertoires prêts"
+    info "Directories ready"
 }
 
 # ─────────────────────────────────────────────
-# Étape 3 : Configuration (0600)
+# Step 3: Configuration (0600)
 # ─────────────────────────────────────────────
 setup_config() {
-    step "Génération de la configuration..."
+    step "Generating the configuration..."
 
     if [[ -f "$CONFIG_FILE" ]]; then
-        if ask "Configuration existante → $CONFIG_FILE. La conserver ? [Y/n]" Y; then
-            info "Configuration conservée"
-            # S'assurer du 0600, de la propriété cible et du mot de passe cohérent
+        if ask "Existing configuration → $CONFIG_FILE. Keep it? [Y/n]" Y; then
+            info "Configuration kept"
+            # Ensure 0600, the target ownership and a consistent password
             run chmod 600 "$CONFIG_FILE"
             if [[ "$(id -u)" -eq 0 ]]; then
                 run chown "$TARGET_USER" "$CONFIG_FILE"
             fi
             if ! grep -q "password:" "$CONFIG_FILE"; then
-                warn "Aucun 'password:' dans la config existante — requis si pg_hba exige scram."
+                warn "No 'password:' in the existing config — required if pg_hba requires scram."
             fi
             return
         fi
@@ -512,71 +512,71 @@ setup_config() {
         if [[ "$(id -u)" -eq 0 ]]; then
             run chown "$TARGET_USER" "${CONFIG_FILE}.bak"
         fi
-        warn "Sauvegarde → ${CONFIG_FILE}.bak"
+        warn "Backup → ${CONFIG_FILE}.bak"
     fi
 
-    # TLS : la config générée pointe sur le socket Unix local — le daemon
-    # impose ssl_mode=disable sur socket (src/db/mod.rs : le TLS se négocie
-    # sur TCP avec un nom d'hôte, pas sur un IPC local). ssl=on côté serveur
-    # (snakeoil par défaut) n'y change rien pour une connexion IPC locale.
-    # Pour un déploiement TCP distant : host = NOM D'HÔTE DNS + ssl_mode
-    # require (ou verify-ca/verify-full) — rustls vérifie chaîne + nom
-    # d'hôte au handshake et REJETTE les littéraux IP (ServerName est
-    # DNS-only) : « 127.0.0.1 » ne marcherait PAS (src/db/mod.rs).
+    # TLS: the generated config points to the local Unix socket — the daemon
+    # enforces ssl_mode=disable on socket (src/db/mod.rs: TLS is negotiated
+    # over TCP with a hostname, not over local IPC). Server-side ssl=on
+    # (snakeoil by default) changes nothing for a local IPC connection.
+    # For a remote TCP deployment: host = DNS HOSTNAME + ssl_mode
+    # require (or verify-ca/verify-full) — rustls verifies chain + name
+    # at the handshake and REJECTS IP literals (ServerName is
+    # DNS-only): « 127.0.0.1 » would NOT work (src/db/mod.rs).
     local ssl_mode="disable"
 
     run mkdir -p "$CONFIG_DIR"
 
-    # Le mot de passe est injecté directement (pas d'affichage)
+    # The password is injected directly (no display)
     if $DRY_RUN; then
-        echo -e "${CYAN}[dry-run]${NC} écrire $CONFIG_FILE (password: <généré>, ssl_mode: $ssl_mode)"
-        PGINDEXAI_PW="${PGINDEXAI_PW:-<généré>}"
+        echo -e "${CYAN}[dry-run]${NC} write $CONFIG_FILE (password: <generated>, ssl_mode: $ssl_mode)"
+        PGINDEXAI_PW="${PGINDEXAI_PW:-<generated>}"
     else
         cat > "$CONFIG_FILE" <<EOF
-# Configuration du daemon PGindexAI
-# Générée par install.sh le $(date '+%F %T')
-# Droits : 0600 (contient un mot de passe)
+# Configuration of the PGindexAI daemon
+# Generated by install.sh at $(date '+%F %T')
+# Permissions: 0600 (contains a password)
 
 postgresql:
-  host: "/var/run/postgresql"   # Socket Unix local (TLS inapplicable sur socket → disable)
+  host: "/var/run/postgresql"   # Local Unix socket (TLS not applicable on socket → disable)
   port: 5432
   user: "pgindexai"
   database: "pgindexai_demo"
   password: "${PGINDEXAI_PW}"
   ssl_mode: "${ssl_mode}"
-  # ssl_root_cert: "/etc/ssl/certs/votre-ca.pem"   # CA auto-signée (TCP uniquement : verify-ca/verify-full)
+  # ssl_root_cert: "/etc/ssl/certs/your-ca.pem"   # Self-signed CA (TCP only: verify-ca/verify-full)
 laya:
   url: "http://127.0.0.1:8080"
   timeout_seconds: 30
 
-# Contrôle des actions DDL — mettre false pour désactiver une action
+# Control of DDL actions — set to false to disable an action
 actions:
   create_index: true
   drop_unused: true
   rebuild_fragmented: true
 
-# Seuils de décision
+# Decision thresholds
 thresholds:
-  cycle_seconds: 60        # Fréquence du cycle d'analyse
-  unused_minutes: 10080    # Fenêtre d'observation (7 jours) avant DROP d'un index inutilisé
-  fragmentation_pct: 70    # % de fragmentation déclenchant un REINDEX CONCURRENTLY
-  min_sargable_rows: 100   # Min. d'exécutions (pg_stat_statements.calls) pour un index SARGable
-  min_confidence: 0.7      # Confiance minimale de Laya pour appliquer une décision
-  max_proposals_per_cycle: 20  # Budget de propositions par cycle
+  cycle_seconds: 60        # Analysis cycle frequency
+  unused_minutes: 10080    # Observation window (7 days) before DROP of an unused index
+  fragmentation_pct: 70    # % of fragmentation triggering a REINDEX CONCURRENTLY
+  min_sargable_rows: 100   # Min. executions (pg_stat_statements.calls) for a SARGable index
+  min_confidence: 0.7      # Minimum Laya confidence to apply a decision
+  max_proposals_per_cycle: 20  # Proposal budget per cycle
 
-# Périmètre d'analyse (multi-schéma)
+# Analysis scope (multi-schema)
 analysis:
-  # Liste des schémas à analyser.
-  # - liste vide = tous les schémas non-système (défaut)
-  # - exemple : ["public", "billing"]
+  # List of schemas to analyze.
+  # - empty list = all non-system schemas (default)
+  # - example: ["public", "billing"]
   schemas: []
 
-# Pool de connexions PostgreSQL
+# PostgreSQL connection pool
 pg_pool:
   max_size: 8
   wait_timeout_ms: 30000
 
-# Densité cible par type de colonne (tuples/page visés, estimation de taille d'index)
+# Target density per column type (tuples/page targeted, index size estimation)
 density_by_type:
   int4: 200
   int8: 200
@@ -594,40 +594,40 @@ logging:
   level: "info"
   format: "json"
 
-# Historisation des opérations d'index
+# History of index operations
 index_logging:
   enabled: true
   verbosity: "minimal"   # minimal | standard | verbose
   log_file: "/var/log/pgindexai/index_operations.log"
-  max_file_size_bytes: 10485760  # rotation à 10 MB
+  max_file_size_bytes: 10485760  # rotation at 10 MB
   max_files: 5
 EOF
         chmod 600 "$CONFIG_FILE"
-        # Sous root : le fichier écrit est root:root — le rendre à l'utilisateur
-        # cible, sinon le daemon (qui tourne sous ce compte) → EACCES (os error 13).
+        # Under root: the file written is root:root — give it back to the
+        # target user, otherwise the daemon (which runs under that account) → EACCES (os error 13).
         if [[ "$(id -u)" -eq 0 ]]; then
             run chown "$TARGET_USER" "$CONFIG_FILE"
         fi
         info "Configuration → $CONFIG_FILE (0600)"
     fi
-    warn "Vérifiez le fichier avant de lancer le daemon (URL Laya, schémas, seuils)"
+    warn "Check the file before starting the daemon (Laya URL, schemas, thresholds)"
 }
 
 # ─────────────────────────────────────────────
-# Étape 4 : Service systemd durci
+# Step 4: Hardened systemd service
 # ─────────────────────────────────────────────
 setup_systemd() {
-    step "Installation du service systemd..."
+    step "Installing the systemd service..."
     local service_file="/etc/systemd/system/${SERVICE_NAME}.service"
 
     if [[ -f "$service_file" ]]; then
-        if ! ask "Service existant → $service_file. Le remplacer ? [Y/n]" Y; then
+        if ! ask "Existing service → $service_file. Replace it? [Y/n]" Y; then
             return
         fi
     fi
 
     if $DRY_RUN; then
-        echo -e "${CYAN}[dry-run]${NC} écrire $service_file (User=$TARGET_USER, MemoryMax=512M, CPUQuota=100%)"
+        echo -e "${CYAN}[dry-run]${NC} write $service_file (User=$TARGET_USER, MemoryMax=512M, CPUQuota=100%)"
         return
     fi
 
@@ -650,11 +650,11 @@ RestartSec=10
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=HOME=$TARGET_HOME
 
-# Ressources
+# Resources
 MemoryMax=512M
 CPUQuota=100%
 
-# Durcissement
+# Hardening
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
@@ -678,38 +678,38 @@ SERVICE
     run rm -f "$tmp"
     run sudo systemctl daemon-reload
     run sudo systemctl enable "$SERVICE_NAME"
-    info "Service installé et activé"
+    info "Service installed and enabled"
 }
 
 # ─────────────────────────────────────────────
-# Étape 5 : Démarrage
+# Step 5: Startup
 # ─────────────────────────────────────────────
 start_daemon() {
-    step "Démarrage du daemon..."
+    step "Starting the daemon..."
     if $DRY_RUN; then
         echo -e "${CYAN}[dry-run]${NC} sudo systemctl restart $SERVICE_NAME"
         return
     fi
     sudo systemctl restart "$SERVICE_NAME"
 
-    # Polling d'activité (30 s)
+    # Activity polling (30 s)
     for _ in {1..15}; do
         if sudo systemctl is-active --quiet "$SERVICE_NAME"; then
-            info "Daemon PGindexAI est actif"
+            info "PGindexAI daemon is active"
             return 0
         fi
         sleep 2
     done
 
-    error "Le daemon n'est pas actif après 30 s — vérifiez : sudo journalctl -u $SERVICE_NAME -n 30"
+    error "The daemon is not active after 30 s — check: sudo journalctl -u $SERVICE_NAME -n 30"
     return 1
 }
 
 # ─────────────────────────────────────────────
-# Étape 6 : Démo (schéma + workload)
+# Step 6: Demo (schema + workload)
 # ─────────────────────────────────────────────
 setup_demo() {
-    step "Installation du schéma de démo..."
+    step "Installing the demo schema..."
     local repo_dir
     repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -717,23 +717,23 @@ setup_demo() {
         "SELECT 1 FROM information_schema.tables WHERE table_name = 'customers' LIMIT 1" 2>/dev/null | grep -q 1; then
         if [[ -f "$repo_dir/sql/demo_schema.sql" ]]; then
             run sudo -u "$POSTGRES_USER" psql -d pgindexai_demo -v ON_ERROR_STOP=1 -f "$repo_dir/sql/demo_schema.sql"
-            info "Schéma de démo installé"
+            info "Demo schema installed"
         fi
         if [[ -f "$repo_dir/sql/demo_workload.sql" ]]; then
-            run sudo -u "$POSTGRES_USER" psql -d pgindexai_demo -v ON_ERROR_STOP=1 -f "$repo_dir/sql/demo_workload.sql" || warn "Workload de démo partiel"
+            run sudo -u "$POSTGRES_USER" psql -d pgindexai_demo -v ON_ERROR_STOP=1 -f "$repo_dir/sql/demo_workload.sql" || warn "Partial demo workload"
         fi
     else
-        info "Schéma de démo déjà installé"
+        info "Demo schema already installed"
     fi
 }
 
 # ─────────────────────────────────────────────
-# Vérification finale
+# Final verification
 # ─────────────────────────────────────────────
 verify() {
     echo ""
     echo "============================================"
-    echo "  Installation PGindexAI terminée"
+    echo "  PGindexAI installation finished"
     echo "============================================"
     echo ""
     echo "  Binaire    : $BIN_PATH"
@@ -742,18 +742,18 @@ verify() {
     echo "  Service    : systemctl status $SERVICE_NAME"
     echo "  Daemon     : journalctl -u $SERVICE_NAME -f"
     echo ""
-    echo "  Commandes utiles :"
-    echo "    pgindexai run --dry-run   → cycle unique, AUCUNE DDL"
-    echo "    pgindexai daemon          → mode continu"
+    echo "  Useful commands:"
+    echo "    pgindexai run --dry-run   → single cycle, NO DDL"
+    echo "    pgindexai daemon          → continuous mode"
     echo "    journalctl -u $SERVICE_NAME -n 50"
     echo "    tail -f /var/log/pgindexai/index_operations.log"
     echo ""
     if $DRY_RUN; then
-        echo "  📋 Mode dry-run — aucune modification n'a été appliquée"
+        echo "  📋 Dry-run mode — no modification has been applied"
         echo ""
     fi
-    echo "  Rappel durcissement : supprimez 'local all all trust' de pg_hba.conf"
-    echo "  (si présent) pour que SEUL le rôle pgindexai reste accessible en local."
+    echo "  Hardening reminder: remove 'local all all trust' from pg_hba.conf"
+    echo "  (if present) so that ONLY the pgindexai role remains accessible locally."
     echo ""
 }
 
@@ -763,7 +763,7 @@ verify() {
 main() {
     echo ""
     echo "============================================"
-    echo "  PGindexAI Installer (sécurisé)"
+    echo "  PGindexAI Installer (secure)"
     echo "============================================"
     echo ""
 
@@ -783,14 +783,14 @@ main() {
     start_daemon || daemon_ok=false
     echo ""
     setup_demo || true
-    # Le schéma de démo est créé PAR postgres (après setup_role) : re-appliquer
-    # le transfert de propriété pour que pgindexai puisse y exécuter du DDL.
+    # The demo schema is created BY postgres (after setup_role): re-apply
+    # the ownership transfer so pgindexai can execute DDL on it.
     transfer_ownership
     echo ""
     verify
-    # Si le daemon n'est pas actif, l'installation ne peut pas se déclarer
-    # terminée (précédemment : échec masqué — le script sortait « succès »
-    # alors que le service était en crash loop).
+    # If the daemon is not active, the installation cannot declare itself
+    # finished (previously: masked failure — the script exited « success »
+    # while the service was in a crash loop).
     $daemon_ok
 }
 

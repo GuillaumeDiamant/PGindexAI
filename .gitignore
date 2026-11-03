@@ -1,6 +1,6 @@
 # Build artifacts
 target/
-# (Cargo.lock EST commité : crate binaire — reproductibilité des dépendances)
+# (Cargo.lock IS committed: binary crate — dependency reproducibility)
 
 # IDE
 .idea/

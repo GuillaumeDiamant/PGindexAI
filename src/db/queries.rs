@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use tracing::debug;
 
 // ─────────────────────────────────────────────
-// Types de résultats d'analyse
+// Analysis result types
 // ─────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,7 +17,7 @@ pub struct UnusedIndexInfo {
     pub idx_tup_read: i64,
     pub idx_tup_fetch: i64,
     pub size_bytes: i64,
-    /// Début de la fenêtre d'observation (redémarrage du serveur)
+    /// Start of the observation window (server restart)
     pub installed_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -46,15 +46,15 @@ pub struct MissingSargableIndex {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SargableColumn {
     pub column_name: String,
-    /// Type PostgreSQL réel (ex: "integer", "character varying")
+    /// Actual PostgreSQL type (e.g. "integer", "character varying")
     pub column_type: String,
     pub is_nullable: bool,
     pub null_frac: f64,
-    /// Bucket de densité (ex: "int4", "varchar", "timestamptz", "default")
+    /// Density bucket (e.g. "int4", "varchar", "timestamptz", "default")
     pub density_bucket: String,
 }
 
-/// Cardinalité d'une table (pour estimer la taille d'un futur index)
+/// Cardinality of a table (to estimate the size of a future index)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableCardinality {
     pub reltuples: f64,
@@ -62,16 +62,16 @@ pub struct TableCardinality {
 }
 
 // ─────────────────────────────────────────────
-// Requêtes DMV
+// DMV queries
 // ─────────────────────────────────────────────
 
-/// Vérifier si la fenêtre d'observation est suffisante pour qualifier un
-/// index d'"inutilisé".
+/// Check whether the observation window is sufficient to qualify an
+/// index as "unused".
 ///
-/// Les compteurs pg_stat_* sont remis à zéro au redémarrage de PostgreSQL :
-/// un index jamais scanné peut l'avoir été juste avant le dernier restart.
-/// On n'applique donc la détection "unused" que si le serveur tourne depuis
-/// au moins `min_observation_minutes` minutes.
+/// The pg_stat_* counters are reset when PostgreSQL restarts:
+/// an index never scanned may have been scanned just before the last restart.
+/// The "unused" detection is therefore only applied if the server has been up for
+/// at least `min_observation_minutes` minutes.
 pub async fn observation_window_ok(
     pool: &Pool,
     min_observation_minutes: u64,
@@ -86,8 +86,8 @@ pub async fn observation_window_ok(
     Ok(row.get::<_, bool>(0))
 }
 
-/// Récupérer les index inutilisés (jamais scannés dans la fenêtre d'observation).
-/// `max_rows` borne le nombre de candidats (budget de propositions par cycle).
+/// Fetch the unused indexes (never scanned within the observation window).
+/// `max_rows` bounds the number of candidates (proposal budget per cycle).
 pub async fn get_unused_indexes(
     pool: &Pool,
     max_rows: i64,
@@ -140,11 +140,11 @@ pub async fn get_unused_indexes(
     Ok(result)
 }
 
-/// Récupérer la liste des index existants par table (multi-schéma)
-/// Retourne une map : (schemaname, tablename) → Vec<(indexname, indexdef)>
+/// Fetch the list of existing indexes per table (multi-schema)
+/// Returns a map: (schemaname, tablename) → Vec<(indexname, indexdef)>
 ///
-/// Le filtre de schémas est poussé dans la requête (`schemaname = ANY($1)`)
-/// pour éviter de charger tout le catalogue quand un périmètre est configuré.
+/// The schema filter is pushed into the query (`schemaname = ANY($1)`)
+/// to avoid loading the whole catalog when a scope is configured.
 pub async fn get_existing_indexes(
     pool: &Pool,
     schemas: &[String],
@@ -155,7 +155,7 @@ pub async fn get_existing_indexes(
     let client = pool.get().await?;
 
     let rows = if schemas.is_empty() {
-        // Tous les schémas non-système
+        // All non-system schemas
         client
             .query(
                 r#"
@@ -203,13 +203,13 @@ pub async fn get_existing_indexes(
     Ok(map)
 }
 
-/// Récupérer les index B-tree fragmentés (estimation heuristique documentée)
+/// Fetch the fragmented B-tree indexes (documented heuristic estimation)
 ///
-/// PostgreSQL ne fournit pas de métrique "avg_leaf_density" native.
-/// On combine trois signaux :
-///   1. ratio n_dead_tup / (n_live + n_dead) de la table (proxy principal, 50%)
-///   2. n_mod_since_analyze / n_live_tup (modifications non-analysées, 30%)
-///   3. index volumineux jamais scanné (20%)
+/// PostgreSQL does not provide a native "avg_leaf_density" metric.
+/// We combine three signals:
+///   1. ratio n_dead_tup / (n_live + n_dead) of the table (main proxy, 50%)
+///   2. n_mod_since_analyze / n_live_tup (unanalyzed modifications, 30%)
+///   3. large index never scanned (20%)
 pub async fn get_fragmented_indexes(
     pool: &Pool,
     max_rows: i64,
@@ -278,7 +278,7 @@ pub async fn get_fragmented_indexes(
 
         let mut frag_score: f64 = 0.0;
 
-        // Critère 1 : ratio dead tuples (50%)
+        // Criterion 1: dead tuples ratio (50%)
         let total_tuples = (n_live_tup + n_dead_tup) as f64;
         let dead_ratio = if total_tuples > 0.0 {
             n_dead_tup as f64 / total_tuples
@@ -287,7 +287,7 @@ pub async fn get_fragmented_indexes(
         };
         frag_score += dead_ratio * 0.5;
 
-        // Critère 2 : modifications non-analysées (30%)
+        // Criterion 2: unanalyzed modifications (30%)
         let mod_ratio = if n_live_tup > 0 {
             (n_mod_since_analyze as f64 / n_live_tup as f64).min(1.0)
         } else {
@@ -295,15 +295,15 @@ pub async fn get_fragmented_indexes(
         };
         frag_score += mod_ratio * 0.3;
 
-        // Critère 3 : index volumineux jamais scanné (20%)
+        // Criterion 3: large index never scanned (20%)
         if idx_scan == 0 && relpages > 100 {
             frag_score += 0.2;
         }
 
         let fragmentation_pct = (frag_score * 100.0).min(100.0);
 
-        // avg_leaf_density : ratio tuples/pages du index, normalisé sur 100
-        // (B-tree PostgreSQL cible ~90% de remplissage des pages feuilles)
+        // avg_leaf_density: tuples/pages ratio of the index, normalized over 100
+        // (PostgreSQL B-tree targets ~90% fill of leaf pages)
         let avg_leaf_density = if index_tuples > 0.0 && index_pages > 0 {
             (index_tuples / index_pages as f64 / 100.0).clamp(0.0, 1.0)
         } else {
@@ -327,10 +327,10 @@ pub async fn get_fragmented_indexes(
     Ok(result)
 }
 
-/// Vérifier si une colonne est déjà couverte en première position par un
-/// index existant sur la table (analyse de l'indexdef, pas d'exécution)
+/// Check whether a column is already covered in first position by an
+/// existing index on the table (indexdef parsing, no execution)
 fn is_column_covered_by_index(indexdef: &str, column_name: &str) -> bool {
-    // L'indexdef ressemble à : CREATE INDEX idx ON schema.table USING btree (col1, col2)
+    // The indexdef looks like: CREATE INDEX idx ON schema.table USING btree (col1, col2)
     let upper = indexdef.to_uppercase();
     if let Some(paren_open) = upper.rfind('(') {
         let inner = &indexdef[paren_open + 1..];
@@ -341,7 +341,7 @@ fn is_column_covered_by_index(indexdef: &str, column_name: &str) -> bool {
                     .trim()
                     .trim_matches('"')
                     .trim_matches(|c| c == ' ' || c == '\t');
-                // Retirer les opérateurs/classe (ex: col DESC, col COLLATE ...)
+                // Strip the operator/class (e.g.: col DESC, col COLLATE ...)
                 let col_name = cleaned.split_whitespace().next().unwrap_or(cleaned);
                 if col_name.to_lowercase() == column_name.to_lowercase() {
                     return true;
@@ -352,14 +352,14 @@ fn is_column_covered_by_index(indexdef: &str, column_name: &str) -> bool {
     false
 }
 
-/// Détecter les requêtes SARGable sans index couvrant la colonne filtrée.
+/// Detect SARGable queries with no index covering the filtered column.
 ///
-/// - `min_calls` : nombre minimum d'exécutions (pg_stat_statements.calls) —
-///   appliqué dans la requête SQL (plus de seuil durci `calls > 10`).
-/// - `max_queries` : budget de requêtes candidates examinées (LIMIT SQL).
+/// - `min_calls`: minimum number of executions (pg_stat_statements.calls) —
+///   applied in the SQL query (no more hardcoded `calls > 10` threshold).
+/// - `max_queries`: budget of candidate queries examined (SQL LIMIT).
 ///
-/// Résultat groupé par (schéma, table) : une requête JOIN peut produire des
-/// colonnes attributées à DIFFÉRENTES tables (résolution des alias).
+/// Result grouped by (schema, table): a JOIN query can produce columns
+/// attributed to DIFFERENT tables (alias resolution).
 pub async fn get_missing_sargable_indexes(
     pool: &Pool,
     schemas: &[String],
@@ -395,10 +395,10 @@ pub async fn get_missing_sargable_indexes(
         )
         .await?;
 
-    // Charger les index existants par table (multi-schéma, filtré côté SQL)
+    // Load the existing indexes per table (multi-schema, filtered on the SQL side)
     let existing_indexes = get_existing_indexes(pool, schemas).await?;
 
-    // Passerelle schéma : si des schémas sont configurés, ignorer les tables hors périmètre
+    // Schema gate: if schemas are configured, ignore tables out of scope
     let in_scope = |schemaname: &str| -> bool {
         schemas.is_empty() || schemas.iter().any(|s| s == schemaname)
     };
@@ -416,14 +416,14 @@ pub async fn get_missing_sargable_indexes(
             if !in_scope(&schemaname) {
                 continue;
             }
-            // Ignorer les catalogues système (pg_*)
+            // Ignore the system catalogs (pg_*)
             if tablename.starts_with("pg_") {
                 continue;
             }
 
             let key = (schemaname.clone(), tablename.clone());
 
-            // Filtrer les colonnes déjà couvertes par un index existant
+            // Filter out columns already covered by an existing index
             if let Some(indexes) = existing_indexes.get(&key) {
                 let covered = indexes
                     .iter()
@@ -463,7 +463,7 @@ pub async fn get_missing_sargable_indexes(
         }
     }
 
-    // Enrichir avec les types réels (information_schema) et null_frac (pg_stats)
+    // Enrich with the actual types (information_schema) and null_frac (pg_stats)
     let column_meta = fetch_column_metadata(pool, &column_queries).await?;
     for miss in by_table.values_mut() {
         for col in miss.sargable_columns.iter_mut() {
@@ -490,7 +490,7 @@ pub async fn get_missing_sargable_indexes(
     Ok(result)
 }
 
-/// Cardinalité d'une table (pg_class) — pour estimer la taille d'un index
+/// Cardinality of a table (pg_class) — to estimate the size of an index
 pub async fn get_table_cardinality(
     pool: &Pool,
     schemaname: &str,
@@ -515,7 +515,7 @@ pub async fn get_table_cardinality(
     }
 }
 
-/// Vérifier si un index existe déjà (multi-schéma)
+/// Check whether an index already exists (multi-schema)
 pub async fn index_exists(
     pool: &Pool,
     schemaname: &str,
@@ -531,9 +531,9 @@ pub async fn index_exists(
     Ok(row.is_some())
 }
 
-/// Vérifier qu'un index EXISTE et est VALIDE (indisvalid).
-/// Après un CREATE/REINDEX CONCURRENTLY interrompu, l'index peut exister
-/// en étant INVALIDE — il ne doit pas être considéré comme opérationnel.
+/// Check that an index EXISTS and is VALID (indisvalid).
+/// After an interrupted CREATE/REINDEX CONCURRENTLY, the index may exist
+/// as INVALID — it must not be considered operational.
 pub async fn index_valid(
     pool: &Pool,
     schemaname: &str,
@@ -555,9 +555,9 @@ pub async fn index_valid(
     Ok(row.map(|r| r.get::<_, bool>(0)).unwrap_or(false))
 }
 
-/// Supprimer les index INVALIDES (indisvalid = false) portant ce nom —
-/// résidus d'un CREATE/REINDEX CONCURRENTLY interrompu.
-/// Renvoie le nombre d'index supprimés.
+/// Drop the INVALID indexes (indisvalid = false) bearing this name —
+/// leftovers of an interrupted CREATE/REINDEX CONCURRENTLY.
+/// Returns the number of indexes dropped.
 pub async fn cleanup_invalid_indexes(
     pool: &Pool,
     schemaname: &str,
@@ -581,7 +581,7 @@ pub async fn cleanup_invalid_indexes(
     let mut dropped = 0u64;
     for row in &rows {
         let oid: i32 = row.get(0);
-        // pg_drop_index : la fonction interne de DROP INDEX (fonctionne sur les index invalides)
+        // pg_drop_index: the internal function of DROP INDEX (works on invalid indexes)
         if client
             .execute("SELECT pg_catalog.pg_drop_index($1)", &[&oid])
             .await?
@@ -594,25 +594,25 @@ pub async fn cleanup_invalid_indexes(
 }
 
 // ─────────────────────────────────────────────
-// Parsing SQL réel (sqlparser-rs)
+// Real SQL parsing (sqlparser-rs)
 // ─────────────────────────────────────────────
 
-/// Résultat du parsing : colonnes SARGable **attribuées à leur table**
-/// (schéma, table, colonne).
+/// Parsing result: SARGable columns **attributed to their table**
+/// (schema, table, column).
 ///
-/// En cas de JOIN, les colonnes sont attribuées via les alias (`a.status` →
-/// table de l'alias `a`) ; une colonne NON qualifiée n'est acceptée que si
-/// la requête ne référence qu'UNE table (sinon l'attribution serait un
-/// faux positif — c'est le comportement conservateur).
+/// In case of JOIN, columns are attributed via the aliases (`a.status` →
+/// table of alias `a`); a NON qualified column is only accepted if
+/// the query references only ONE table (otherwise the attribution would be a
+/// false positive — that's the conservative behavior).
 type AttributedColumns = Vec<(String, String, String)>;
 
-/// Extraire les colonnes SARGable d'une requête via sqlparser-rs, avec
-/// attribution de table (alias JOIN inclus).
+/// Extract the SARGable columns of a query via sqlparser-rs, with
+/// table attribution (JOIN aliases included).
 ///
-/// SARGable = colonne comparée directement à une valeur/littéral/placeholder
+/// SARGable = column compared directly to a value/literal/placeholder
 /// (col = v, col > v, col IN (v1,v2), col BETWEEN a AND b, col IS [NOT] NULL,
-///  col LIKE 'pref%'). Les fonctions sur la colonne (LOWER(col), CAST(col...))
-/// et les LIKE '%...' ne sont PAS SARGables.
+///  col LIKE 'pref%'). Functions on the column (LOWER(col), CAST(col...))
+/// and LIKE '%...' are NOT SARGable.
 fn parse_query_for_sargable(query: &str) -> Option<AttributedColumns> {
     let dialect = sqlparser::dialect::PostgreSqlDialect {};
     let dialect_ref: &dyn sqlparser::dialect::Dialect = &dialect;
@@ -630,7 +630,7 @@ fn parse_query_for_sargable(query: &str) -> Option<AttributedColumns> {
     for stmt in &statements {
         if let sqlparser::ast::Statement::Query(query_ast) = stmt {
             if let Some(select) = query_ast.body.as_select() {
-                // Collecter les tables (alias, schéma, table) — première table ET tables JOINées
+                // Collect the tables (alias, schema, table) — first table AND JOINed tables
                 let mut tables: Vec<(Option<String>, String, String)> = Vec::new();
                 let push_table =
                     |relation: &sqlparser::ast::TableFactor,
@@ -656,21 +656,21 @@ fn parse_query_for_sargable(query: &str) -> Option<AttributedColumns> {
                     }
                 }
                 if tables.is_empty() {
-                    continue; // FROM subquery / fonction / CTE : hors périmètre
+                    continue; // FROM subquery / function / CTE: out of scope
                 }
 
                 if let Some(selection) = &select.selection {
-                    let mut raw: Vec<(Option<String>, String)> = Vec::new(); // (qualifier, colonne)
+                    let mut raw: Vec<(Option<String>, String)> = Vec::new(); // (qualifier, column)
                     collect_sargable(selection, &mut raw);
 
                     for (qualifier, col) in raw {
                         let resolved = match &qualifier {
-                            // Colonne qualifiée : alias ou nom de table
+                            // Qualified column: alias or table name
                             Some(q) => tables.iter().find(|(alias, _, t)| {
                                 alias.as_deref() == Some(q.as_str()) || t == q
                             }),
-                            // Colonne nue : sûre seulement si la requête référence UNE table
-                            // unique (sinon l'attribution serait un faux positif)
+                            // Bare column: safe only if the query references ONE table
+                            // (otherwise the attribution would be a false positive)
                             None => tables.first().filter(|_| tables.len() == 1),
                         };
                         if let Some((_, s, t)) = resolved {
@@ -682,7 +682,7 @@ fn parse_query_for_sargable(query: &str) -> Option<AttributedColumns> {
                                 out.push((s, t, col));
                             }
                         }
-                        // Non résolue (sous-query, fonction, alias inconnu) → ignorée
+                        // Unresolved (subquery, function, unknown alias) → ignored
                     }
                 }
             }
@@ -696,13 +696,13 @@ fn parse_query_for_sargable(query: &str) -> Option<AttributedColumns> {
     }
 }
 
-/// Parcourir l'arbre d'expressions et collecter les (qualifier, colonne) SARGables
+/// Walk the expression tree and collect the SARGable (qualifier, column)
 fn collect_sargable(expr: &sqlparser::ast::Expr, out: &mut Vec<(Option<String>, String)>) {
     use sqlparser::ast::{BinaryOperator, UnaryOperator};
 
     match expr {
-        // AND / OR : récursif sur les deux opérandes ;
-        // comparaisons simples : col = v, col > v, col < v, col >= v, col <= v
+        // AND / OR: recursive on both operands;
+        // simple comparisons: col = v, col > v, col < v, col >= v, col <= v
         sqlparser::ast::Expr::BinaryOp { left, op, right } => match op {
             BinaryOperator::And | BinaryOperator::Or => {
                 collect_sargable(left, out);
@@ -714,7 +714,7 @@ fn collect_sargable(expr: &sqlparser::ast::Expr, out: &mut Vec<(Option<String>, 
             | BinaryOperator::GtEq
             | BinaryOperator::LtEq => {
                 if let Some(qualified) = expr_as_qualified_column(left) {
-                    // SARGable uniquement si la droite n'est pas une colonne
+                    // SARGable only if the right side is not a column
                     if !expr_is_column_ref(right) {
                         push_qualified(out, &qualified);
                     }
@@ -723,7 +723,7 @@ fn collect_sargable(expr: &sqlparser::ast::Expr, out: &mut Vec<(Option<String>, 
             _ => {}
         },
 
-        // NOT : non-SARGable (négation) → on ne descend pas
+        // NOT: non-SARGable (negation) → do not descend
         sqlparser::ast::Expr::UnaryOp {
             op: UnaryOperator::Not,
             ..
@@ -731,7 +731,7 @@ fn collect_sargable(expr: &sqlparser::ast::Expr, out: &mut Vec<(Option<String>, 
         | sqlparser::ast::Expr::IsNotDistinctFrom(_, _)
         | sqlparser::ast::Expr::IsDistinctFrom(_, _) => {}
 
-        // (expr) : récursif
+        // (expr): recursive
         sqlparser::ast::Expr::Nested(inner) => {
             collect_sargable(inner, out);
         }
@@ -771,7 +771,7 @@ fn collect_sargable(expr: &sqlparser::ast::Expr, out: &mut Vec<(Option<String>, 
             }
         }
 
-        // col LIKE 'prefix%' (sans % en tête = SARGable)
+        // col LIKE 'prefix%' (no leading % = SARGable)
         sqlparser::ast::Expr::Like {
             negated: false,
             expr,
@@ -801,7 +801,7 @@ fn collect_sargable(expr: &sqlparser::ast::Expr, out: &mut Vec<(Option<String>, 
     }
 }
 
-/// Renvoyer (qualifier, colonne) si l'expression est une référence de colonne.
+/// Return (qualifier, column) if the expression is a column reference.
 /// - `col` → (None, col)
 /// - `alias.col` → (Some(alias), col)
 /// - `schema.table.col` → (Some(table), col)
@@ -821,7 +821,7 @@ fn expr_as_qualified_column(expr: &sqlparser::ast::Expr) -> Option<(Option<Strin
     }
 }
 
-/// Vrai si l'expression référence une colonne (pas un littéral)
+/// True if the expression references a column (not a literal)
 fn expr_is_column_ref(expr: &sqlparser::ast::Expr) -> bool {
     matches!(
         expr,
@@ -829,7 +829,7 @@ fn expr_is_column_ref(expr: &sqlparser::ast::Expr) -> bool {
     )
 }
 
-/// Pousse un (qualifier, colonne) s'il n'est pas déjà présent
+/// Push a (qualifier, column) if it is not already present
 fn push_qualified(out: &mut Vec<(Option<String>, String)>, qualified: &(Option<String>, String)) {
     if out
         .iter()
@@ -840,7 +840,7 @@ fn push_qualified(out: &mut Vec<(Option<String>, String)>, qualified: &(Option<S
     out.push(qualified.clone());
 }
 
-/// Vérifier si un motif LIKE est un préfixe ('abc%') → SARGable
+/// Check whether a LIKE pattern is a prefix ('abc%') → SARGable
 fn like_pattern_is_prefix(pattern: &sqlparser::ast::Expr) -> bool {
     if let sqlparser::ast::Expr::Value(sqlparser::ast::Value::SingleQuotedString(s)) = pattern {
         !s.starts_with('%') && !s.starts_with("\\%")
@@ -850,7 +850,7 @@ fn like_pattern_is_prefix(pattern: &sqlparser::ast::Expr) -> bool {
 }
 
 // ─────────────────────────────────────────────
-// Métadonnées de colonnes
+// Column metadata
 // ─────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -860,7 +860,7 @@ struct ColumnMeta {
     null_frac: f64,
 }
 
-/// Récupérer type réel, nullabilité et null_frac pour les colonnes candidates
+/// Fetch actual type, nullability and null_frac for the candidate columns
 async fn fetch_column_metadata(
     pool: &Pool,
     triples: &[(String, String, String)],
@@ -873,7 +873,7 @@ async fn fetch_column_metadata(
 
     let client = pool.get().await?;
 
-    // Une requête ciblée par (schéma, table) — plus de scan complet d'information_schema
+    // A targeted query per (schema, table) — no more full scan of information_schema
     let mut seen_tables: Vec<(String, String)> = triples
         .iter()
         .map(|(s, t, _)| (s.clone(), t.clone()))
@@ -915,7 +915,7 @@ async fn fetch_column_metadata(
         }
     }
 
-    // pg_stats : null_frac (par schéma+table, paramètres fixes)
+    // pg_stats: null_frac (per schema+table, fixed parameters)
     for (s, t) in &seen_tables {
         let rows = client
             .query(
@@ -935,7 +935,7 @@ async fn fetch_column_metadata(
     Ok(map)
 }
 
-/// Mapper un type PostgreSQL sur un bucket de densité (config density_by_type)
+/// Map a PostgreSQL type to a density bucket (config density_by_type)
 fn map_pg_type_to_bucket(data_type: &str) -> String {
     match data_type {
         "integer" | "smallint" => "int4".to_string(),
@@ -953,7 +953,7 @@ fn map_pg_type_to_bucket(data_type: &str) -> String {
     }
 }
 
-/// Tronquer une requête de façon sûre (pas de coupure de caractère UTF-8)
+/// Truncate a query safely (no splitting of a UTF-8 character)
 fn truncate_query(query: &str) -> String {
     const MAX: usize = 200;
     if query.len() <= MAX {
@@ -970,7 +970,7 @@ fn truncate_query(query: &str) -> String {
 mod tests {
     use super::*;
 
-    /// Renvoie l'ensemble de (schéma, table, colonne) attribuées
+    /// Returns the set of attributed (schema, table, column)
     fn cols(query: &str) -> Vec<(String, String, String)> {
         parse_query_for_sargable(query).unwrap_or_default()
     }
@@ -1009,7 +1009,7 @@ mod tests {
 
     #[test]
     fn test_sargable_like_prefix_vs_wildcard() {
-        // 'prefix%' est SARGable, '%suffix' ne l'est pas
+        // 'prefix%' is SARGable, '%suffix' is not
         let set = colset("SELECT * FROM users WHERE email LIKE 'a@corp.com' OR name LIKE '%admin'");
         assert!(set.contains(&(
             "public".to_string(),
@@ -1025,13 +1025,13 @@ mod tests {
 
     #[test]
     fn test_non_sargable_function_on_column() {
-        // LOWER(email) = ... n'est PAS SARGable (fonction sur la colonne)
+        // LOWER(email) = ... is NOT SARGable (function on the column)
         assert!(cols("SELECT * FROM users WHERE LOWER(email) = 'x@y.z'").is_empty());
     }
 
     #[test]
     fn test_column_vs_column_not_sargable() {
-        // a = b (colonne vs colonne) n'est PAS SARGable
+        // a = b (column vs column) is NOT SARGable
         assert!(cols("SELECT * FROM t WHERE a = b").is_empty());
     }
 
@@ -1052,7 +1052,7 @@ mod tests {
 
     #[test]
     fn test_join_alias_resolution() {
-        // Chaque colonne est attribuée à la table de SON alias
+        // Each column is attributed to the table of ITS alias
         let set = colset(
             "SELECT * FROM public.orders a JOIN public.users b ON a.user_id = b.id \
              WHERE a.status = 'open' AND b.email = 'x@y.z'",
@@ -1067,7 +1067,7 @@ mod tests {
             "users".to_string(),
             "email".to_string()
         )));
-        // a.user_id / b.id : colonne vs colonne → non-SARGable
+        // a.user_id / b.id: column vs column → non-SARGable
         assert!(!set.contains(&(
             "public".to_string(),
             "orders".to_string(),
@@ -1078,13 +1078,13 @@ mod tests {
 
     #[test]
     fn test_join_ambiguous_unqualified_column_is_dropped() {
-        // `id` non qualifiée avec 2 tables : attribution incertaine → exclue (pas de faux positif)
+        // Unqualified `id` with 2 tables: uncertain attribution → excluded (no false positive)
         assert!(cols("SELECT * FROM t1 x JOIN t2 y ON x.k = y.k WHERE id = 5").is_empty());
     }
 
     #[test]
     fn test_join_qualified_by_table_name_not_alias() {
-        // Qualification par le NOM DE TABLE (pas l'alias) est résolue
+        // Qualification by the TABLE NAME (not the alias) is resolved
         let set = colset(
             "SELECT * FROM public.orders JOIN public.users u ON orders.user_id = u.id \
              WHERE orders.status = 'shipped'",
@@ -1098,8 +1098,8 @@ mod tests {
 
     #[test]
     fn test_cardinality_live() {
-        // Test contre le PG local (pgindexai_demo) — vérifie le chemin complet de get_table_cardinality.
-        // Sauté proprement si la base de démonstration n'est pas disponible.
+        // Test against the local PG (pgindexai_demo) — verifies the full path of get_table_cardinality.
+        // Skipped cleanly if the demo database is not available.
         let rt = tokio::runtime::Runtime::new().unwrap();
         let pool = rt.block_on(async {
             let mut c = deadpool_postgres::Config::new();
@@ -1126,10 +1126,10 @@ mod tests {
 
     #[test]
     fn test_truncate_query_multibyte_safe() {
-        let long = "é".repeat(300);
+        let long = "中".repeat(300);
         let t = truncate_query(&long);
         assert!(t.len() <= 200 + 3); // 200 + "..."
         assert!(t.ends_with("..."));
-        // Pas de panique = coupure sur une frontière de caractère valide
+        // No panic = cut on a valid character boundary
     }
 }

@@ -16,14 +16,14 @@ fn ssl_error(msg: impl std::fmt::Display) -> Box<dyn std::error::Error + Sync + 
     Box::new(std::io::Error::other(msg.to_string()))
 }
 
-/// Construit le connecteur TLS (rustls) :
-/// - racines web PKI (Mozilla) par défaut,
-/// - + `ssl_root_cert` (PEM) si fourni (CA auto-signée, snakeoil, …),
-/// - sans certificat client (l'auth PG passe par le mot de passe / peer).
+/// Builds the TLS connector (rustls):
+/// - web PKI (Mozilla) roots by default,
+/// - + `ssl_root_cert` (PEM) if provided (self-signed CA, snakeoil, …),
+/// - no client certificate (PG auth goes through password / peer).
 fn build_tls_connector(
     cfg: &PgConfig,
 ) -> Result<MakeRustlsConnect, Box<dyn std::error::Error + Sync + Send>> {
-    // rustls 0.23 : un provider crypto par défaut est requis (ring).
+    // rustls 0.23: a default crypto provider is required (ring).
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let mut root_store = rustls::RootCertStore::empty();
@@ -31,18 +31,18 @@ fn build_tls_connector(
 
     if let Some(path) = &cfg.ssl_root_cert {
         let file = std::fs::File::open(path)
-            .map_err(|e| ssl_error(format!("ssl_root_cert : impossible d'ouvrir {path} : {e}")))?;
+            .map_err(|e| ssl_error(format!("ssl_root_cert: cannot open {path}: {e}")))?;
         let mut reader = BufReader::new(file);
         let certs = rustls_pemfile::certs(&mut reader)
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| ssl_error(format!("ssl_root_cert : PEM invalide dans {path} : {e}")))?;
+            .map_err(|e| ssl_error(format!("ssl_root_cert: invalid PEM in {path}: {e}")))?;
         if certs.is_empty() {
             return Err(ssl_error(format!(
-                "ssl_root_cert : aucun certificat trouvé dans {path}"
+                "ssl_root_cert: no certificate found in {path}"
             )));
         }
         root_store.add_parsable_certificates(certs.iter().cloned());
-        info!("ssl_root_cert : certificat(s) CA chargé(s) depuis {path}");
+        info!("ssl_root_cert: CA certificate(s) loaded from {path}");
     }
 
     let tls_config = rustls::ClientConfig::builder()
@@ -51,7 +51,7 @@ fn build_tls_connector(
     Ok(MakeRustlsConnect::new(tls_config))
 }
 
-/// Crée un pool de connexions PostgreSQL avec TLS, taille et timeout configurables.
+/// Creates a PostgreSQL connection pool with TLS, configurable size and timeout.
 pub async fn create_pool(
     cfg: &PgConfig,
     pool_cfg: &PgPoolConfig,
@@ -65,11 +65,11 @@ pub async fn create_pool(
         dp_conf.password = Some(pw.clone());
     }
 
-    // Mode TLS selon la config (ssl_mode est validé par Config::validate).
-    // Avec rustls, la vérification du certificat (chaîne + nom d'hôte) est TOUJOURS
-    // effectuée au handshake : `require` est donc au moins aussi strict que
-    // `verify-ca`/`verify-full` (libpq). La différence entre les trois modes
-    // réside dans les racines acceptées (web PKI + éventuelle ssl_root_cert).
+    // TLS mode per config (ssl_mode is validated by Config::validate).
+    // With rustls, certificate verification (chain + hostname) is ALWAYS
+    // performed at handshake: `require` is therefore at least as strict as
+    // `verify-ca`/`verify-full` (libpq). The difference between the three modes
+    // lies in the accepted roots (web PKI + optional ssl_root_cert).
     let ssl = cfg.ssl_mode.to_ascii_lowercase();
     let ssl_mode = match ssl.as_str() {
         "disable" => SslMode::Disable,
@@ -78,7 +78,7 @@ pub async fn create_pool(
             return Err(Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
-                    "ssl_mode '{other}' non supporté (disable | require | verify-ca | verify-full)"
+                    "ssl_mode '{other}' not supported (disable | require | verify-ca | verify-full)"
                 ),
             )))
         }
@@ -86,18 +86,18 @@ pub async fn create_pool(
     dp_conf.ssl_mode = Some(ssl_mode);
 
     if ssl_mode != SslMode::Disable {
-        // Socket Unix : tokio-postgres refuse le TLS sans nom d'hôte (et le TLS
-        // n'a pas de sens sur un socket local IPC) → erreur claire et précoce.
+        // Unix socket: tokio-postgres refuses TLS without a hostname (and TLS
+        // makes no sense on a local IPC socket) → clear and early error.
         if cfg.host.starts_with('/') {
             return Err(ssl_error(
-                "host est un socket Unix : ssl_mode doit être 'disable' (le TLS se négocie sur TCP avec un nom d'hôte)",
+                "host is a Unix socket: ssl_mode must be 'disable' (TLS is negotiated over TCP with a hostname)",
             ));
         }
-        // Fail fast si le nom d'hôte est invalide pour le handshake TLS
+        // Fail fast if the hostname is invalid for the TLS handshake
         validate_hostname(&cfg.host)?;
     }
 
-    // Pool dynamique : taille max + timeout d'attente configurable
+    // Dynamic pool: max size + wait timeout configurable
     let mut dp_pool_cfg = DpPoolConfig::new(pool_cfg.max_size as usize);
     dp_pool_cfg.timeouts.wait = Some(Duration::from_millis(pool_cfg.wait_timeout_ms));
 
@@ -114,11 +114,11 @@ pub async fn create_pool(
         .create_pool(Some(Runtime::Tokio1), connector)
         .map_err(|e| format!("Failed to create PostgreSQL pool: {}", e))?;
 
-    // Vérifier la connectivité dès le démarrage
+    // Check connectivity at startup
     let client = pool.get().await?;
     client.simple_query("SELECT 1").await?;
 
-    // Information TLS effective sur cette connexion
+    // Effective TLS information for this connection
     if ssl_mode != SslMode::Disable {
         match client
             .query_opt(
@@ -131,42 +131,42 @@ pub async fn create_pool(
                 let is_ssl: bool = row.get(0);
                 if is_ssl {
                     info!(
-                        "PostgreSQL pool créé ({0}:{1}) — TLS actif",
+                        "PostgreSQL pool created ({0}:{1}) — TLS active",
                         cfg.host, cfg.port
                     );
                 } else {
                     warn!(
-                        "PostgreSQL pool créé ({0}:{1}) — ssl_mode={ssl} mais la connexion n'est PAS chiffrée !",
+                        "PostgreSQL pool created ({0}:{1}) — ssl_mode={ssl} but the connection is NOT encrypted!",
                         cfg.host, cfg.port
                     );
                 }
             }
             Ok(None) => warn!(
-                "PostgreSQL pool créé ({0}:{1}) — pg_stat_ssl indisponible, état TLS non vérifiable",
+                "PostgreSQL pool created ({0}:{1}) — pg_stat_ssl unavailable, TLS state not verifiable",
                 cfg.host, cfg.port
             ),
             Err(e) => warn!(
-                "PostgreSQL pool créé ({0}:{1}) — vérification pg_stat_ssl en échec : {e}",
+                "PostgreSQL pool created ({0}:{1}) — pg_stat_ssl check failed: {e}",
                 cfg.host, cfg.port
             ),
         }
     } else {
         info!(
-            "PostgreSQL pool créé ({0}:{1}) — TLS désactivé (ssl_mode=disable)",
+            "PostgreSQL pool created ({0}:{1}) — TLS disabled (ssl_mode=disable)",
             cfg.host, cfg.port
         );
     }
     Ok(pool)
 }
 
-/// Vérifie que le nom d'hôte fourni dans la config est un FQDN valide pour
-/// `verify-full` (évite l'échec tardif du handshake avec un message cryptographique).
+/// Checks that the hostname provided in the config is a valid FQDN for
+/// `verify-full` (avoids a late handshake failure with a cryptic message).
 pub fn validate_hostname(host: &str) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
     ServerName::try_from(host.to_string())
         .map(|_| ())
         .map_err(|e| {
             ssl_error(format!(
-                "postgresql.host '{host}' : nom d'hôte invalide pour verify-full : {e}"
+                "postgresql.host '{host}': invalid hostname for verify-full: {e}"
             ))
         })
 }
