@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 // ─────────────────────────────────────────────
-// Payload envoyé à Laya /v1/systemone
+// Payload sent to Laya /v1/systemone
 // ─────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -25,7 +25,7 @@ pub struct ActionQuestion {
 }
 
 // ─────────────────────────────────────────────
-// Réponse reçue de Laya
+// Response received from Laya
 // ─────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -51,7 +51,7 @@ pub struct Usage {
 }
 
 // ─────────────────────────────────────────────
-// Types internes du daemon
+// Internal daemon types
 // ─────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -75,7 +75,7 @@ impl std::fmt::Display for DecisionAction {
     }
 }
 
-/// Une proposition d'action issue de l'analyse
+/// An action proposal resulting from the analysis
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Proposal {
     #[serde(
@@ -87,14 +87,14 @@ pub struct Proposal {
     pub reason: String,
     pub confidence: f64,
     pub table: String,
-    /// Schéma de la table concernée (rempli pour CREATE INDEX).
+    /// Schema of the table concerned (filled in for CREATE INDEX).
     #[serde(default)]
     pub schema: String,
-    /// Nom de l'index (rempli pour CREATE INDEX ; pour DROP/REINDEX il est
-    /// déjà porté par `ddl`).
+    /// Name of the index (filled in for CREATE INDEX; for DROP/REINDEX it is
+    /// already carried by `ddl`).
     #[serde(default)]
     pub index_name: Option<String>,
-    /// Colonne indexée (rempli pour CREATE INDEX).
+    /// Indexed column (filled in for CREATE INDEX).
     #[serde(default)]
     pub column: Option<String>,
 }

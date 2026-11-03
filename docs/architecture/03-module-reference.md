@@ -319,7 +319,7 @@ reopened at **0640** (entries contain the executed DDL — audit trail).
 | Situation | Behavior |
 |-----------|--------------|
 | File impossible to open at startup | explicit `error!` — audit is **stdout only** (never silent) |
-| Entry write failure | `error!` "cette entrée d'audit est PERDUE" |
+| Entry write failure | `error!` "this audit entry is LOST" |
 | Rotation failure (rename/delete) | explicit `warn!`/`error!`, best-effort continuation |
 
 ---
@@ -505,8 +505,8 @@ without these sections remains valid.
   `disable|require|verify-ca|verify-full`, empty `host`/`user`/`database`,
   densities not strictly positive.
 - **Unknown keys**: `warn_unknown_keys()` — a warning per ignored key
-  (e.g. `config : clé 'laya.variant' inconnue (ignorée — typo ou fonctionnalité
-  retirée ?)`), non-blocking load.
+  (e.g. `config: key 'laya.variant' unknown (ignored — typo or removed
+  feature?)`), non-blocking load.
 - `ssl_mode = verify-ca|verify-full` **without** `ssl_root_cert` → warning
   (self-signed certificates not accepted).
 

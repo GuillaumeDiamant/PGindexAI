@@ -1,6 +1,6 @@
-# Template systemd PGindexAI — installé par install.sh (les valeurs $USER/$HOME
-# sont résolues à l'installation). Ce fichier est une référence lisible ;
-# l'unité réellement déployée est /etc/systemd/system/pgindexai.service.
+# PGindexAI systemd template — installed by install.sh ($USER/$HOME values
+# are resolved at install time). This file is a readable reference;
+# the unit actually deployed is /etc/systemd/system/pgindexai.service.
 [Unit]
 Description=PGindexAI - PostgreSQL Index Management Daemon
 Documentation=https://github.com/GuillaumeDiamant/PGindexAI
@@ -17,11 +17,11 @@ RestartSec=10
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=HOME=$HOME
 
-# Ressources
+# Resources
 MemoryMax=512M
 CPUQuota=100%
 
-# Durcissement
+# Hardening
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only

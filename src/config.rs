@@ -2,7 +2,7 @@ use serde::Deserialize;
 use std::path::PathBuf;
 use tracing::{info, warn};
 
-/// Chemin par défaut de la configuration
+/// Default path for the configuration file
 pub fn default_config_path() -> PathBuf {
     if let Some(dir) = dirs::config_dir() {
         dir.join("PGindexAI").join("PGindexAI.yaml")
@@ -30,60 +30,58 @@ pub struct Config {
 }
 
 impl Config {
-    /// Valide la cohérence des valeurs. Refuse les configs dangereuses
-    /// (boucle chaude, pool illimité, plage de confiance hors [0,1], …).
+    /// Validates the coherence of the values. Rejects dangerous configs
+    /// (hot loop, unbounded pool, confidence range outside [0,1], ...).
     pub fn validate(&self) -> Result<(), ConfigError> {
         let mut errs: Vec<String> = Vec::new();
 
         let t = &self.thresholds;
         if t.cycle_seconds < 1 {
             errs.push(
-                "thresholds.cycle_seconds doit être >= 1 (protection contre la boucle chaude)"
+                "thresholds.cycle_seconds must be >= 1 (protection against the hot loop)"
                     .to_string(),
             );
         }
         if t.cycle_seconds > 86_400 {
-            errs.push("thresholds.cycle_seconds doit être <= 86400 (1 jour)".to_string());
+            errs.push("thresholds.cycle_seconds must be <= 86400 (1 day)".to_string());
         }
         if t.unused_minutes < 1 {
-            errs.push("thresholds.unused_minutes doit être >= 1".to_string());
+            errs.push("thresholds.unused_minutes must be >= 1".to_string());
         }
         if !(1..=100).contains(&t.fragmentation_pct) {
-            errs.push("thresholds.fragmentation_pct doit être dans [1, 100]".to_string());
+            errs.push("thresholds.fragmentation_pct must be in [1, 100]".to_string());
         }
         if !(0.0..=1.0).contains(&t.min_confidence) {
-            errs.push("thresholds.min_confidence doit être dans [0.0, 1.0]".to_string());
+            errs.push("thresholds.min_confidence must be in [0.0, 1.0]".to_string());
         }
         if t.max_proposals_per_cycle < 1 {
-            errs.push("thresholds.max_proposals_per_cycle doit être >= 1".to_string());
+            errs.push("thresholds.max_proposals_per_cycle must be >= 1".to_string());
         }
         if t.max_proposals_per_cycle > 1_000 {
-            errs.push("thresholds.max_proposals_per_cycle doit être <= 1000".to_string());
+            errs.push("thresholds.max_proposals_per_cycle must be <= 1000".to_string());
         }
         if t.min_sargable_rows == 0 {
-            errs.push("thresholds.min_sargable_rows doit être >= 1".to_string());
+            errs.push("thresholds.min_sargable_rows must be >= 1".to_string());
         }
         if t.ddl_timeout_seconds > 86_400 {
             errs.push(
-                "thresholds.ddl_timeout_seconds doit être <= 86400 (1 jour ; 0 = illimité)"
+                "thresholds.ddl_timeout_seconds must be <= 86400 (1 day; 0 = unlimited)"
                     .to_string(),
             );
         }
 
         if !(1..=512).contains(&self.pg_pool.max_size) {
-            errs.push(
-                "pg_pool.max_size doit être dans [1, 512] (0 = illimité, refusé)".to_string(),
-            );
+            errs.push("pg_pool.max_size must be in [1, 512] (0 = unlimited, rejected)".to_string());
         }
         if !(100..=600_000).contains(&self.pg_pool.wait_timeout_ms) {
-            errs.push("pg_pool.wait_timeout_ms doit être dans [100, 600000]".to_string());
+            errs.push("pg_pool.wait_timeout_ms must be in [100, 600000]".to_string());
         }
 
         if self.laya.url.trim().is_empty() {
-            errs.push("laya.url est vide".to_string());
+            errs.push("laya.url is empty".to_string());
         }
         if !(1..=600).contains(&self.laya.timeout_seconds) {
-            errs.push("laya.timeout_seconds doit être dans [1, 600]".to_string());
+            errs.push("laya.timeout_seconds must be in [1, 600]".to_string());
         }
 
         let ssl = self.postgresql.ssl_mode.to_ascii_lowercase();
@@ -92,24 +90,24 @@ impl Config {
             "disable" | "require" | "verify-ca" | "verify-full"
         ) {
             errs.push(format!(
-                "postgresql.ssl_mode '{}' non supporté (disable | require | verify-ca | verify-full)",
+                "postgresql.ssl_mode '{}' not supported (disable | require | verify-ca | verify-full)",
                 self.postgresql.ssl_mode
             ));
         }
         if (ssl == "verify-ca" || ssl == "verify-full") && self.postgresql.ssl_root_cert.is_none() {
             warn!(
-                "ssl_mode={} : aucune ssl_root_cert fournie — les certificats auto-signés (snakeoil) ne seront pas acceptés (racines web PKI uniquement)",
+                "ssl_mode={}: no ssl_root_cert provided — self-signed certificates (snakeoil) will not be accepted (web PKI roots only)",
                 ssl
             );
         }
         if self.postgresql.host.trim().is_empty() {
-            errs.push("postgresql.host est vide".to_string());
+            errs.push("postgresql.host is empty".to_string());
         }
         if self.postgresql.database.trim().is_empty() {
-            errs.push("postgresql.database est vide".to_string());
+            errs.push("postgresql.database is empty".to_string());
         }
         if self.postgresql.user.trim().is_empty() {
-            errs.push("postgresql.user est vide".to_string());
+            errs.push("postgresql.user is empty".to_string());
         }
 
         let densities: [(&str, f64); 10] = [
@@ -126,7 +124,7 @@ impl Config {
         ];
         for (name, v) in densities {
             if !(v > 0.0 && v.is_finite()) {
-                errs.push(format!("density_by_type.{} doit être > 0 et fini", name));
+                errs.push(format!("density_by_type.{} must be > 0 and finite", name));
             }
         }
 
@@ -138,12 +136,12 @@ impl Config {
     }
 }
 
-/// Paramètres d'analyse (multi-schéma)
+/// Analysis parameters (multi-schema)
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct AnalysisConfig {
-    /// Liste des schémas à analyser.
-    /// - liste vide = tous les schémas non-système (défaut)
-    /// - ["public", "billing"] = uniquement ces schémas
+    /// List of schemas to analyze.
+    /// - empty list = all non-system schemas (default)
+    /// - ["public", "billing"] = only these schemas
     #[serde(default)]
     pub schemas: Vec<String>,
 }
@@ -157,12 +155,12 @@ pub struct PgConfig {
     /// disable | require | verify-ca | verify-full
     #[serde(default = "default_ssl_mode")]
     pub ssl_mode: String,
-    /// Mot de passe (optionnel — requis si pg_hba exige scram-sha-256 / md5).
-    /// Stocker ce fichier en 0600 (le daemon le lit au démarrage).
+    /// Password (optional — required if pg_hba requires scram-sha-256 / md5).
+    /// Store this file with 0600 permissions (the daemon reads it at startup).
     #[serde(default)]
     pub password: Option<String>,
-    /// Chemin vers un certificat CA (PEM) pour verify-ca / verify-full.
-    /// Sans cette clé, les racines web PKI (Mozilla) sont utilisées.
+    /// Path to a CA certificate (PEM) for verify-ca / verify-full.
+    /// Without this key, the web PKI (Mozilla) roots are used.
     #[serde(default)]
     pub ssl_root_cert: Option<String>,
 }
@@ -186,41 +184,41 @@ pub struct ActionsConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Thresholds {
-    /// Intervalle d'un cycle d'analyse (secondes). >= 1.
+    /// Interval of an analysis cycle (seconds). >= 1.
     #[serde(default = "default_cycle")]
     pub cycle_seconds: u64,
-    /// Fenêtre d'observation d'« inutilisé » (minutes).
-    /// Le DROP n'est proposé que si le serveur est up depuis >= cette durée
-    /// (protection contre la remise à zéro des compteurs après reboot).
-    /// Défaud : 10080 (7 jours).
+    /// "Unused" observation window (minutes).
+    /// DROP is only proposed if the server has been up for >= this duration
+    /// (protection against counters being reset after a reboot).
+    /// Default: 10080 (7 days).
     #[serde(default = "default_unused_minutes")]
     pub unused_minutes: u64,
-    /// Seuil de fragmentation pour proposer une reconstruction (1..=100).
+    /// Fragmentation threshold for proposing a rebuild (1..=100).
     #[serde(default = "default_fragmentation")]
     pub fragmentation_pct: u64,
-    /// Nombre minimum d'EXÉCUTIONS (pg_stat_statements.calls) d'une requête
-    /// pour qu'elle soit candidate à un index SARGable.
-    /// (Le nom historique `min_sargable_rows` est conservé pour compatibilité.)
+    /// Minimum number of EXECUTIONS (pg_stat_statements.calls) of a query
+    /// for it to be a candidate for a SARGable index.
+    /// (The historical name `min_sargable_rows` is kept for compatibility.)
     #[serde(default = "default_min_sargable")]
     pub min_sargable_rows: u64,
-    /// Confiance minimale exigée de Laya pour exécuter une action (0.0..=1.0).
+    /// Minimum confidence required from Laya to execute an action (0.0..=1.0).
     #[serde(default = "default_min_confidence")]
     pub min_confidence: f64,
-    /// Budget de propositions par cycle (limite SQL + troncature totale).
+    /// Proposal budget per cycle (SQL limit + overall truncation).
     #[serde(default = "default_max_proposals")]
     pub max_proposals_per_cycle: u32,
-    /// Timeout (secondes) des DDL longs (CREATE/REINDEX CONCURRENTLY).
-    /// 0 = illimité. Défaut : 1800 (30 min).
-    /// NB : un timeout TROP COURT sur une grosse table créerait une boucle
-    /// build→annulé→retry — garder une valeur généreuse.
+    /// Timeout (seconds) of long DDL (CREATE/REINDEX CONCURRENTLY).
+    /// 0 = unlimited. Default: 1800 (30 min).
+    /// NB: a TOO SHORT timeout on a large table would create a
+    /// build→cancelled→retry loop — keep a generous value.
     #[serde(default = "default_ddl_timeout")]
     pub ddl_timeout_seconds: u64,
 }
 
-/// NB : `Default` est implémenté MANUELLEMENT (pas `derive`) : quand la
-/// section `logging:` est absente, `#[serde(default)]` invoque
-/// `Default::default()` — il doit donc produire les MÊMES valeurs que les
-/// defaults serde par champ (un derive donnerait `level: ""` = aucun log).
+/// NB: `Default` is implemented MANUALLY (not `derive`): when the
+/// `logging:` section is absent, `#[serde(default)]` invokes
+/// `Default::default()` — it must therefore produce the SAME values as the
+/// per-field serde defaults (a derive would give `level: ""` = no log).
 #[derive(Debug, Clone, Deserialize)]
 pub struct LoggingConfig {
     #[serde(default = "default_log_level")]
@@ -238,9 +236,9 @@ impl Default for LoggingConfig {
     }
 }
 
-/// Configuration du logging des opérations d'index (historisation)
-/// NB : `Default` manuel — idem `LoggingConfig` (section absente = mêmes
-/// valeurs que les defaults serde par champ : audit ENABLED, pas coupé).
+/// Configuration of the index operation logging (audit trail)
+/// NB: manual `Default` — same as `LoggingConfig` (absent section = same
+/// values as the per-field serde defaults: audit ENABLED, not cut).
 #[derive(Debug, Clone, Deserialize)]
 pub struct IndexLoggingConfig {
     #[serde(default = "default_index_logging_enabled")]
@@ -248,13 +246,13 @@ pub struct IndexLoggingConfig {
     /// minimal | standard | verbose
     #[serde(default = "default_index_logging_verbosity")]
     pub verbosity: String,
-    /// Chemin du fichier de log (vide = stdout uniquement)
+    /// Log file path (empty = stdout only)
     #[serde(default)]
     pub log_file: String,
-    /// Rotation (octets, 0 = désactivé)
+    /// Rotation (bytes, 0 = disabled)
     #[serde(default = "default_index_logging_max_size")]
     pub max_file_size_bytes: u64,
-    /// Nombre max de fichiers rotés
+    /// Max number of rotated files
     #[serde(default = "default_index_logging_max_files")]
     pub max_files: u64,
 }
@@ -271,13 +269,13 @@ impl Default for IndexLoggingConfig {
     }
 }
 
-/// Configuration du pool de connexions PostgreSQL
+/// Configuration of the PostgreSQL connection pool
 #[derive(Debug, Clone, Deserialize)]
 pub struct PgPoolConfig {
-    /// Taille maximale du pool de connexions (1..=512)
+    /// Maximum size of the connection pool (1..=512)
     #[serde(default = "default_pool_max_size")]
     pub max_size: u32,
-    /// Timeout d'attente d'une connexion dans la file (ms)
+    /// Timeout waiting for a connection in the queue (ms)
     #[serde(default = "default_pool_wait_timeout_ms")]
     pub wait_timeout_ms: u64,
 }
@@ -291,7 +289,7 @@ impl Default for PgPoolConfig {
     }
 }
 
-/// Densité cible par type de colonne (tuples par page visés)
+/// Target density per column type (tuples per page targeted)
 #[derive(Debug, Clone, Deserialize)]
 pub struct DensityByTypeConfig {
     #[serde(default = "default_density_int4")]
@@ -334,7 +332,7 @@ impl Default for DensityByTypeConfig {
 }
 
 // ─────────────────────────────────────────────
-// Fonctions de valeur par défaut
+// Default value functions
 // ─────────────────────────────────────────────
 
 fn default_ssl_mode() -> String {
@@ -351,7 +349,7 @@ fn default_cycle() -> u64 {
 }
 fn default_unused_minutes() -> u64 {
     10_080
-} // 7 jours
+} // 7 days
 fn default_fragmentation() -> u64 {
     70
 }
@@ -423,12 +421,12 @@ fn default_density_default() -> f64 {
 }
 
 // ─────────────────────────────────────────────
-// Détection des clés inconnues (avertissement, non bloquant)
+// Unknown key detection (warning, non-blocking)
 // ─────────────────────────────────────────────
 
-/// Clés reconnues par section. Toute clé étrangère déclenche un avertissement
-/// visible (typo, fonctionnalité morte, config résiduelle) au lieu d'être
-/// ignorée silencieusement.
+/// Keys recognized per section. Any foreign key triggers a visible
+/// warning (typo, dead feature, leftover config) instead of being
+/// silently ignored.
 const KNOWN_KEYS: &[(&str, &[&str])] = &[
     (
         "postgresql",
@@ -496,7 +494,7 @@ fn warn_unknown_keys(value: &serde_yaml::Value) {
         let Some(section) = k.as_str() else { continue };
         let Some((_, keys)) = KNOWN_KEYS.iter().find(|(s, _)| *s == section) else {
             warn!(
-                "config : section '{}' inconnue (ignorée — ex. 'dashboard' n'est pas implémenté)",
+                "config: section '{}' unknown (ignored — e.g. 'dashboard' is not implemented)",
                 section
             );
             continue;
@@ -506,7 +504,7 @@ fn warn_unknown_keys(value: &serde_yaml::Value) {
                 if let Some(iks) = ik.as_str() {
                     if !keys.contains(&iks) {
                         warn!(
-                            "config : clé '{}.{}' inconnue (ignorée — typo ou fonctionnalité retirée ?)",
+                            "config: key '{}.{}' unknown (ignored — typo or removed feature?)",
                             section, iks
                         );
                     }
@@ -517,7 +515,7 @@ fn warn_unknown_keys(value: &serde_yaml::Value) {
 }
 
 // ─────────────────────────────────────────────
-// Chargement de la config
+// Config loading
 // ─────────────────────────────────────────────
 
 pub fn load(path: &PathBuf) -> Result<Config, ConfigError> {
@@ -546,16 +544,16 @@ pub enum ConfigError {
 mod tests {
     use super::*;
 
-    /// Une config MINIMALE (sections `logging` / `index_logging` absentes)
-    /// doit produire les mêmes valeurs que les defaults serde par champ.
+    /// A MINIMAL config (sections `logging` / `index_logging` absent)
+    /// must produce the same values as the per-field serde defaults.
     ///
-    /// Régression : avec `#[derive(Default)]`, l'absence de section invoquait
-    /// `Default::default()` → `level: ""` (daemon SANS aucun log) et
-    /// `index_logging.enabled: false` (audit silencieusement coupé).
+    /// Regression: with `#[derive(Default)]`, the absence of a section invoked
+    /// `Default::default()` → `level: ""` (daemon with NO log at all) and
+    /// `index_logging.enabled: false` (audit silently cut).
     #[test]
     fn test_defaults_when_sections_absent() {
-        // NB : `thresholds` est REQUIS par design (fail-fast) — une section
-        // vide vérifie en bonus les defaults serde par champ.
+        // NB: `thresholds` is REQUIRED by design (fail-fast) — an empty
+        // section also verifies the per-field serde defaults as a bonus.
         let yaml = r#"
 postgresql:
   host: localhost
@@ -578,17 +576,17 @@ thresholds: {}
         assert_eq!(cfg.logging.format, "json");
         assert!(
             cfg.index_logging.enabled,
-            "l'audit doit rester ENABLED sans section"
+            "the audit must stay ENABLED without a section"
         );
         assert_eq!(cfg.index_logging.verbosity, "minimal");
         assert_eq!(cfg.index_logging.max_file_size_bytes, 10 * 1024 * 1024);
         assert_eq!(cfg.index_logging.max_files, 5);
 
-        // `thresholds: {}` → les defaults serde par champ doivent s'appliquer
+        // `thresholds: {}` → the per-field serde defaults must apply
         assert_eq!(cfg.thresholds.cycle_seconds, 60);
         assert_eq!(cfg.thresholds.ddl_timeout_seconds, 1800);
 
-        // Cohérence : `Default::default()` = mêmes valeurs que le parse serde
+        // Coherence: `Default::default()` = same values as the serde parse
         assert_eq!(LoggingConfig::default().level, cfg.logging.level);
         assert_eq!(
             IndexLoggingConfig::default().enabled,

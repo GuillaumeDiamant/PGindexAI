@@ -5,39 +5,39 @@ use tracing::{error, info, warn};
 use crate::db::queries;
 use crate::index_log::{CrudOperation, IndexLogWriter, IndexOperationLog};
 
-/// Issue d'une opération DDL :
-/// - `Applied` : le DDL a été exécuté
-/// - `Skipped` : no-op idempotent (index déjà présent / déjà absent) —
-///   compté séparément des « applied » dans les rapports de cycle
-///   (précédemment : les no-ops étaient comptés comme « appliqués »)
+/// Outcome of a DDL operation:
+/// - `Applied`: the DDL was executed
+/// - `Skipped`: idempotent no-op (index already present / already absent) —
+///   counted separately from "applied" in the cycle reports
+///   (previously: no-ops were counted as "applied")
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DdlOutcome {
     Applied,
     Skipped,
 }
 
-/// Exécuter un DDL avec une TRANSACTION EXPLICITE et validation post-commit.
+/// Execute a DDL with an EXPLICIT TRANSACTION and post-commit validation.
 ///
-/// Règle PostgreSQL : `CREATE INDEX CONCURRENTLY` et `REINDEX CONCURRENTLY`
-/// ne peuvent PAS s'exécuter dans un bloc transactionnel.
-/// - DDL atomique (DROP INDEX) → BEGIN … COMMIT, ROLLBACK en cas d'erreur
-/// - DDL CONCURRENTLY → exécution directe (auto-commit), jamais dans une transaction
+/// PostgreSQL rule: `CREATE INDEX CONCURRENTLY` and `REINDEX CONCURRENTLY`
+/// CANNOT be executed inside a transaction block.
+/// - Atomic DDL (DROP INDEX) → BEGIN … COMMIT, ROLLBACK on error
+/// - CONCURRENTLY DDL → direct execution (auto-commit), never inside a transaction
 ///
-/// `timeout_secs` borne la durée des builds CONCURRENTLY (0 = illimité) :
-/// sans borne, un build sur une grosse table peut bloquer l'intégralité du
-/// cycle d'analyse (le daemon est séquentiel). NB : un timeout trop court sur
-/// une grosse table créerait une boucle build→annulé→retry — d'où le défaut
-/// généreux de 30 min (configurable via `thresholds.ddl_timeout_seconds`).
+/// `timeout_secs` bounds the duration of CONCURRENTLY builds (0 = unlimited):
+/// without a bound, a build on a large table can block the entire
+/// analysis cycle (the daemon is sequential). NB: a too-short timeout on
+/// a large table would create a build→cancelled→retry loop — hence the
+/// generous default of 30 min (configurable via `thresholds.ddl_timeout_seconds`).
 pub async fn run_in_transaction(
     pool: &Pool,
     ddl: &str,
     timeout_secs: u64,
 ) -> Result<u64, Box<dyn std::error::Error + Sync + Send>> {
     if is_concurrent_ddl(ddl) {
-        // CONCURRENTLY : interdit dans une transaction, exécution directe
+        // CONCURRENTLY: forbidden in a transaction, direct execution
         let client = pool.get().await?;
-        // Timeout par session (pas par statement) : SET avant, RESET après —
-        // la connexion retourne au pool dans son état initial.
+        // Per-session timeout (not per-statement): SET before, RESET after —
+        // the connection returns to the pool in its initial state.
         if timeout_secs > 0 {
             client
                 .simple_query(&format!("SET statement_timeout = {timeout_secs}s"))
@@ -67,16 +67,16 @@ pub async fn run_in_transaction(
     }
 }
 
-/// Détecter un DDL CONCURRENTLY (CREATE INDEX CONCURRENTLY / REINDEX … CONCURRENTLY)
+/// Detect a CONCURRENTLY DDL (CREATE INDEX CONCURRENTLY / REINDEX … CONCURRENTLY)
 fn is_concurrent_ddl(ddl: &str) -> bool {
     ddl.to_uppercase().contains("CONCURRENTLY")
 }
 
-/// Exécuter un CREATE INDEX (CONCURRENTLY, hors transaction) avec :
-/// - pré-check d'existence (idempotence)
-/// - validation post-commit de la VALIDITÉ (indisvalid) — un build CONCURRENTLY
-///   interrompu laisse un index INVALIDE qui doit être nettoyé
-/// - logging structuré
+/// Execute a CREATE INDEX (CONCURRENTLY, outside a transaction) with:
+/// - existence pre-check (idempotence)
+/// - post-commit validation of VALIDITY (indisvalid) — an interrupted
+///   CONCURRENTLY build leaves an INVALID index that must be cleaned up
+/// - structured logging
 pub async fn execute_create_index(
     pool: &Pool,
     ddl: &str,
@@ -89,7 +89,7 @@ pub async fn execute_create_index(
     let schema = extract_schema_from_ddl(ddl);
     if let Some(ref name) = index_name {
         if queries::index_exists(pool, &schema, name).await? {
-            // No-op idempotent : journalisé « skipped » (plus « success »)
+            // Idempotent no-op: logged as "skipped" (no longer "success")
             info!("Index {name} already exists — CREATE skipped (idempotent no-op)");
             writer.log(
                 IndexOperationLog::new(
@@ -123,14 +123,14 @@ pub async fn execute_create_index(
 
     match result {
         Ok(rows) => {
-            // Validation post-commit : l'index doit EXISTER et être VALIDE
+            // Post-commit validation: the index must EXIST and be VALID
             if let Some(ref name) = index_name {
                 if !queries::index_valid(pool, &schema, name).await? {
                     let cleaned = queries::cleanup_invalid_indexes(pool, &schema, name)
                         .await
                         .unwrap_or(0);
                     let err = format!(
-                        "CREATE INDEX CONCURRENTLY a échoué : index {}.{name} absent ou INVALIDE ({} index invalide nettoyé)",
+                        "CREATE INDEX CONCURRENTLY failed: index {}.{name} absent or INVALID ({} invalid index cleaned up)",
                         schema, cleaned
                     );
                     writer.log(
@@ -172,7 +172,7 @@ pub async fn execute_create_index(
                 .with_ddl(ddl.to_string())
                 .with_metadata(
                     confidence.unwrap_or(0.0),
-                    0, // Taille inconnue avant création
+                    0, // Size unknown before creation
                     0.0,
                     reason
                         .clone()
@@ -185,14 +185,14 @@ pub async fn execute_create_index(
         Err(e) => {
             error!("CREATE INDEX failed: {e}");
 
-            // Nettoyage d'éventuel index invalide résiduel (build CONCURRENTLY interrompu)
+            // Cleanup of any residual invalid index (interrupted CONCURRENTLY build)
             if let Some(ref name) = index_name {
                 let cleaned = queries::cleanup_invalid_indexes(pool, &schema, name)
                     .await
                     .unwrap_or(0);
                 if cleaned > 0 {
                     warn!(
-                        "Nettoyé {cleaned} index invalide(s) résiduel(s) pour {}.{name}",
+                        "Cleaned up {cleaned} residual invalid index(es) for {}.{name}",
                         schema
                     );
                 }
@@ -220,10 +220,10 @@ pub async fn execute_create_index(
     }
 }
 
-/// Exécuter un DROP INDEX avec transaction explicite et logging structuré.
+/// Execute a DROP INDEX with explicit transaction and structured logging.
 ///
-/// Idempotence : si l'index est déjà absent, renvoie `DdlOutcome::Skipped`
-/// (journalisé « skipped ») au lieu de compter un no-op comme « appliqué ».
+/// Idempotence: if the index is already absent, returns `DdlOutcome::Skipped`
+/// (logged as "skipped") instead of counting a no-op as "applied".
 pub async fn execute_drop_index(
     pool: &Pool,
     ddl: &str,
@@ -273,8 +273,8 @@ pub async fn execute_drop_index(
                 rows,
                 duration.as_secs_f64() * 1000.0
             );
-            // NB : `rows` vaut 0 pour un DDL (CommandComplete sans count) —
-            // l'absence d'index est détectée par le pré-check ci-dessus, pas ici.
+            // NB: `rows` is 0 for a DDL (CommandComplete without count) —
+            // the absence of the index is detected by the pre-check above, not here.
 
             writer.log(
                 IndexOperationLog::new(
@@ -320,9 +320,9 @@ pub async fn execute_drop_index(
     }
 }
 
-/// Exécuter un REINDEX (CONCURRENTLY → auto-commit ; standard → transaction)
-/// avec validation post-opération et logging structuré
-#[allow(clippy::too_many_arguments)] // signature plate uniforme avec create/drop
+/// Execute a REINDEX (CONCURRENTLY → auto-commit; standard → transaction)
+/// with post-operation validation and structured logging
+#[allow(clippy::too_many_arguments)] // flat signature uniform with create/drop
 pub async fn execute_reindex(
     pool: &Pool,
     ddl: &str,
@@ -347,15 +347,15 @@ pub async fn execute_reindex(
 
     match result {
         Ok(rows) => {
-            // REINDEX CONCURRENTLY interrompu : l'index valide d'origine subsiste,
-            // mais un index INVALIDE peut résider → nettoyage + échec
+            // Interrupted REINDEX CONCURRENTLY: the original valid index survives,
+            // but an INVALID index may remain → cleanup + failure
             if is_concurrent_ddl(ddl) {
                 let cleaned = queries::cleanup_invalid_indexes(pool, &schema, &object)
                     .await
                     .unwrap_or(0);
                 if cleaned > 0 {
                     let err = format!(
-                        "REINDEX CONCURRENTLY a échoué en cours : {cleaned} index invalide(s) nettoyé(s), l'index d'origine est intact"
+                        "REINDEX CONCURRENTLY failed mid-way: {cleaned} invalid index(es) cleaned up, the original index is intact"
                     );
                     writer.log(
                         IndexOperationLog::new(
@@ -379,7 +379,7 @@ pub async fn execute_reindex(
                 }
                 if !queries::index_valid(pool, &schema, &object).await? {
                     let err =
-                        format!("REINDEX terminé mais l'index {schema}.{object} n'est plus valide");
+                        format!("REINDEX finished but index {schema}.{object} is no longer valid");
                     writer.log(
                         IndexOperationLog::new(
                             CrudOperation::Reindex,
@@ -431,12 +431,12 @@ pub async fn execute_reindex(
         Err(e) => {
             error!("REINDEX failed (rolled back): {e}");
 
-            // Un REINDEX CONCURRENTLY échoué peut laisser un index invalide
+            // A failed REINDEX CONCURRENTLY may leave an invalid index
             let cleaned = queries::cleanup_invalid_indexes(pool, &schema, &object)
                 .await
                 .unwrap_or(0);
             if cleaned > 0 {
-                warn!("Nettoyé {cleaned} index invalide(s) résiduel(s) pour {schema}.{object}");
+                warn!("Cleaned up {cleaned} residual invalid index(es) for {schema}.{object}");
             }
 
             writer.log(
@@ -461,13 +461,13 @@ pub async fn execute_reindex(
     }
 }
 
-/// Construire le DDL de création d'index (CONCURRENTLY, non bloquant),
-/// avec ou sans prédicat de filtre (index filtré `WHERE col IS NOT NULL`).
+/// Build the index creation DDL (CONCURRENTLY, non-blocking),
+/// with or without a filter predicate (filtered index `WHERE col IS NOT NULL`).
 ///
-/// Utilisé à la GÉNÉRATION de la proposition ET à son APPLICATION : le choix
-/// de LAYA (standard vs filtré) détermine la variante exécutée — pas la
-/// variante simplement générée à l'analyse (les deux chemins doivent
-/// produire des DDL strictement identiques).
+/// Used at PROPOSAL GENERATION and at its APPLICATION: the choice
+/// of LAYA (standard vs filtered) determines the variant executed — not the
+/// variant simply generated at analysis (both paths must
+/// produce strictly identical DDL).
 pub fn build_create_index_ddl(
     schema: &str,
     index_name: &str,
@@ -485,15 +485,15 @@ pub fn build_create_index_ddl(
     }
 }
 
-/// Extraire le nom de l'index depuis un DDL (CREATE/DROP/REINDEX)
-/// Gère : CREATE INDEX [CONCURRENTLY] [IF NOT EXISTS] [schema.]name ON …,
-///        DROP INDEX [IF EXISTS] [schema.]name,
-///        REINDEX INDEX [CONCURRENTLY] [schema.]name
+/// Extract the index name from a DDL (CREATE/DROP/REINDEX)
+/// Handles: CREATE INDEX [CONCURRENTLY] [IF NOT EXISTS] [schema.]name ON …,
+///          DROP INDEX [IF EXISTS] [schema.]name,
+///          REINDEX INDEX [CONCURRENTLY] [schema.]name
 pub fn extract_index_name(ddl: &str) -> Option<String> {
     let trimmed = ddl.trim();
     let upper = trimmed.to_uppercase();
 
-    /// Dernier segment après le dernier '.' (gère les noms schema-qualifiés)
+    /// Last segment after the last '.' (handles schema-qualified names)
     fn last_segment(s: &str) -> String {
         s.rsplit('.')
             .next()
@@ -507,7 +507,7 @@ pub fn extract_index_name(ddl: &str) -> Option<String> {
         let after_create_upper = after_create.to_uppercase();
         if let Some(on_pos) = after_create_upper.find(" ON ") {
             let before_on = &after_create[..on_pos];
-            // Le dernier mot avant ON qui n'est pas un mot-clé = le nom
+            // The last word before ON that is not a keyword = the name
             let words: Vec<&str> = before_on
                 .split_whitespace()
                 .filter(|w| {
@@ -558,12 +558,12 @@ pub fn extract_index_name(ddl: &str) -> Option<String> {
     None
 }
 
-/// Extraire le schéma depuis un DDL (CREATE … ON schema.t / DROP INDEX [IF EXISTS] schema.idx /
-/// REINDEX INDEX [CONCURRENTLY] schema.idx). Défaut : "public".
+/// Extract the schema from a DDL (CREATE … ON schema.t / DROP INDEX [IF EXISTS] schema.idx /
+/// REINDEX INDEX [CONCURRENTLY] schema.idx). Default: "public".
 pub fn extract_schema_from_ddl(ddl: &str) -> String {
     let upper = ddl.to_uppercase();
 
-    /// Si `token` est de la forme `schema.nom`, renvoie `schema`.
+    /// If `token` is of the form `schema.name`, returns `schema`.
     fn schema_from(token: &str) -> Option<String> {
         let pos = token.find('.')?;
         let s = token[..pos].trim();
@@ -715,7 +715,7 @@ mod tests {
 
     #[test]
     fn test_build_create_index_ddl_roundtrip_extraction() {
-        // Les DDL produits par le constructeur restent extraisables (nom + schéma)
+        // The DDL produced by the builder remain extractable (name + schema)
         for filtered in [false, true] {
             let ddl = build_create_index_ddl("billing", "idx_events_ts", "events", "ts", filtered);
             assert_eq!(extract_index_name(&ddl), Some("idx_events_ts".to_string()));

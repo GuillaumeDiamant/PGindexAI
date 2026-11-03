@@ -1,58 +1,58 @@
-# Configuration du daemon PGindexAI
-# Emplacement par défaut : ~/.config/PGindexAI/PGindexAI.yaml
-# Droits recommandés : 0600 (le fichier peut contenir un mot de passe)
+# Configuration of the PGindexAI daemon
+# Default location: ~/.config/PGindexAI/PGindexAI.yaml
+# Recommended permissions: 0600 (the file may contain a password)
 
 postgresql:
-  host: "/var/run/postgresql"  # Socket Unix local — ou "127.0.0.1" / nom d'hôte pour du TCP
+  host: "/var/run/postgresql"  # Local Unix socket — or "127.0.0.1" / hostname for TCP
   port: 5432
-  user: "pgindexai"             # Rôle dédié non superutilisateur (voir install.sh)
+  user: "pgindexai"             # Dedicated non-superuser role (see install.sh)
   database: "pgindexai_demo"
-  password: ""                 # Requis si pg_hba.conf exige scram-sha-256 / md5
+  password: ""                 # Required if pg_hba.conf requires scram-sha-256 / md5
   ssl_mode: "disable"          # disable | require | verify-ca | verify-full
-                               # (TLS inapplicable sur socket Unix → disable)
-  # ssl_root_cert: ""          # Chemin PEM d'une CA auto-signée (snakeoil, interne)
-                               # pour verify-ca / verify-full. Sans cette clé,
-                               # seules les racines web PKI (Mozilla) sont acceptées.
+                               # (TLS not applicable on Unix socket → disable)
+  # ssl_root_cert: ""          # PEM path of a self-signed CA (snakeoil, internal)
+                               # for verify-ca / verify-full. Without this key,
+                               # only the web PKI (Mozilla) roots are accepted.
 
 laya:
   url: "http://127.0.0.1:8080"
   timeout_seconds: 30
 
-# Contrôle des actions DDL — mettre false pour désactiver une action
+# Control of DDL actions — set to false to disable an action
 actions:
   create_index: true
   drop_unused: true
   rebuild_fragmented: true
 
-# Seuils de décision
+# Decision thresholds
 thresholds:
-  cycle_seconds: 60        # Fréquence du cycle d'analyse (1..=86400)
-  unused_minutes: 10080    # Fenêtre d'observation (défaut 7 jours) avant DROP
-                           # d'un index inutilisé — les compteurs sont remis à
-                           # zéro au redémarrage de PG : ne pas descendre trop bas.
-  fragmentation_pct: 70    # % de fragmentation déclenchant un REINDEX CONCURRENTLY (1..=100)
-  min_sargable_rows: 100   # Min. d'exécutions (pg_stat_statements.calls) pour qu'une
-                           # requête soit candidate à un index SARGable (>= 1)
-  min_confidence: 0.7      # Confiance minimale de Laya pour appliquer (0.0..=1.0)
-  max_proposals_per_cycle: 20  # Budget de propositions par cycle (1..=1000)
-  ddl_timeout_seconds: 1800  # Timeout des DDL longs CONCURRENTLY, en secondes
-                             # (0 = illimité ; 0..=86400 — garder généreux : un
-                             # timeout trop court sur grosse table créerait une
-                             # boucle build→annulé→retry)
+  cycle_seconds: 60        # Analysis cycle frequency (1..=86400)
+  unused_minutes: 10080    # Observation window (default 7 days) before DROP
+                           # of an unused index — the counters are reset on
+                           # PG restart: do not go too low.
+  fragmentation_pct: 70    # % of fragmentation triggering a REINDEX CONCURRENTLY (1..=100)
+  min_sargable_rows: 100   # Min. executions (pg_stat_statements.calls) for a
+                           # query to be a candidate for a SARGable index (>= 1)
+  min_confidence: 0.7      # Minimum Laya confidence to apply (0.0..=1.0)
+  max_proposals_per_cycle: 20  # Proposal budget per cycle (1..=1000)
+  ddl_timeout_seconds: 1800  # Timeout of long CONCURRENTLY DDL, in seconds
+                             # (0 = unlimited; 0..=86400 — keep generous: a
+                             # too-short timeout on a large table would create a
+                             # build→cancelled→retry loop)
 
-# Périmètre d'analyse (multi-schéma)
+# Analysis scope (multi-schema)
 analysis:
-  # Liste des schémas à analyser.
-  # - liste vide = tous les schémas non-système (défaut)
-  # - exemple : ["public", "billing"]
+  # List of schemas to analyze.
+  # - empty list = all non-system schemas (default)
+  # - example: ["public", "billing"]
   schemas: []
 
-# Pool de connexions PostgreSQL
+# PostgreSQL connection pool
 pg_pool:
-  max_size: 16                # Taille maximale du pool (1..=512)
-  wait_timeout_ms: 30000      # Timeout d'attente d'une connexion (100..=600000)
+  max_size: 16                # Maximum pool size (1..=512)
+  wait_timeout_ms: 30000      # Connection wait timeout (100..=600000)
 
-# Densité cible par type de colonne (tuples/page visés, estimation de taille d'index)
+# Target density per column type (tuples/page targeted, index size estimation)
 density_by_type:
   int4: 200        # integer
   int8: 200        # bigint
@@ -63,23 +63,23 @@ density_by_type:
   timestamptz: 150 # timestamp (with/without time zone)
   uuid: 100        # uuid
   bool: 300        # boolean
-  default_density: 50  # tout autre type
+  default_density: 50  # any other type
 
 # Logging
 logging:
   level: "info"
   format: "json"   # json | text
 
-# Historisation des opérations d'index (fichier 0640, rotation incluse)
+# History of index operations (0640 file, rotation included)
 index_logging:
   enabled: true
-  # Niveaux de verbosité :
-  #   minimal  → timestamp, type CRUD, durée, schéma, nom objet
-  #   standard → + DDL de l'index modifié
-  #   verbose  → + raison détaillée
+  # Verbosity levels:
+  #   minimal  → timestamp, CRUD type, duration, schema, object name
+  #   standard → + DDL of the modified index
+  #   verbose  → + detailed reason
   verbosity: "minimal"
-  # Fichier de log (si vide → stdout uniquement)
+  # Log file (if empty → stdout only)
   log_file: "/var/log/pgindexai/index_operations.log"
-  # Rotation (en octets, 0 = désactivé)
+  # Rotation (in bytes, 0 = disabled)
   max_file_size_bytes: 10485760  # 10 MB
   max_files: 5

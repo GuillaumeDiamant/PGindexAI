@@ -1,15 +1,15 @@
-//! Logging structuré des opérations d'index (DROP/CREATE/REINDEX).
+//! Structured logging of index operations (DROP/CREATE/REINDEX).
 //!
-//! Trois niveaux de verbosité :
-//! - **minimal** : timestamp, type CRUD, durée, schéma, nom objet
-//! - **standard** : + DDL/DML de l'index modifié
-//! - **verbose** : + métadonnées techniques (confiance, taille, fragmentation, reason)
+//! Three verbosity levels:
+//! - **minimal**: timestamp, CRUD type, duration, schema, object name
+//! - **standard**: + DDL/DML of the modified index
+//! - **verbose**: + technical metadata (confidence, size, fragmentation, reason)
 //!
-//! Rotation : si `max_size > 0`, le fichier courant est renommé `.1`, `.1` → `.2`, …
-//! au-delà de `max_size` octets ; au-delà de `max_files`, le plus ancien est supprimé.
+//! Rotation: if `max_size > 0`, the current file is renamed `.1`, `.1` → `.2`, …
+//! once `max_size` bytes is exceeded; beyond `max_files`, the oldest is deleted.
 //!
-//! Sécurité : un échec d'écriture est **toujours** journalisé en `error!`
-//! (jamais `.ok()` silencieux) — chaque entrée est une trace d'audit.
+//! Security: a write failure is **always** logged with `error!`
+//! (never a silent `.ok()`) — each entry is an audit trail.
 
 use serde::Serialize;
 use std::fmt::Display;
@@ -22,7 +22,7 @@ use std::time::Duration;
 use tracing::{error, info, warn};
 
 // ─────────────────────────────────────────────
-// Types de CRUD
+// CRUD types
 // ─────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize)]
@@ -43,7 +43,7 @@ impl Display for CrudOperation {
 }
 
 // ─────────────────────────────────────────────
-// Entrées de log
+// Log entries
 // ─────────────────────────────────────────────
 
 #[derive(Debug, Serialize)]
@@ -91,13 +91,13 @@ impl IndexOperationLog {
         }
     }
 
-    /// Niveau standard : ajoute le DDL/DML
+    /// Standard level: adds the DDL/DML
     pub fn with_ddl(mut self, ddl: impl Into<String>) -> Self {
         self.ddl_statement = Some(ddl.into());
         self
     }
 
-    /// Niveau verbose : ajoute les métadonnées techniques
+    /// Verbose level: adds the technical metadata
     pub fn with_metadata(
         mut self,
         confidence: f64,
@@ -112,7 +112,7 @@ impl IndexOperationLog {
         self
     }
 
-    /// Sérialiser en JSON
+    /// Serialize to JSON
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).unwrap_or_else(|e| {
             error!("Failed to serialize index log: {e}");
@@ -122,7 +122,7 @@ impl IndexOperationLog {
 }
 
 // ─────────────────────────────────────────────
-// Writer de log
+// Log writer
 // ─────────────────────────────────────────────
 
 #[derive(Debug)]
@@ -189,8 +189,8 @@ impl IndexLogWriter {
                 std::fs::create_dir_all(parent)?;
             }
         }
-        // 0640 : les entrées contiennent le DDL exécuté (trace d'audit) —
-        // lecture propriétaire + groupe uniquement.
+        // 0640: entries contain the executed DDL (audit trail) —
+        // owner + group read only.
         let mut opts = OpenOptions::new();
         opts.create(true).append(true);
         #[cfg(unix)]
@@ -200,8 +200,8 @@ impl IndexLogWriter {
         opts.open(path)
     }
 
-    /// Journaliser une opération. Synchronique, court — aucun `await` ici,
-    /// donc la garde mutex n'est jamais tenue à travers un point de suspension.
+    /// Log an operation. Synchronous, short — no `await` here,
+    /// so the mutex guard is never held across a suspension point.
     pub fn log(&self, log: IndexOperationLog) {
         if !self.enabled {
             return;
@@ -209,7 +209,7 @@ impl IndexLogWriter {
 
         let json = log.to_json();
 
-        // Toujours écrire dans stdout (tracing)
+        // Always write to stdout (tracing)
         match self.verbosity {
             VerbosityLevel::Minimal => {
                 info!(
@@ -254,7 +254,7 @@ impl IndexLogWriter {
             }
         }
 
-        // Écrire dans le fichier si configuré (rotation si nécessaire)
+        // Write to the file if configured (rotate if needed)
         if let Some(path) = self.file_path.as_deref() {
             if self.max_size > 0 {
                 let needs_rotate = {
@@ -274,22 +274,24 @@ impl IndexLogWriter {
             let mut guard = self.file_writer.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(f) = guard.as_mut() {
                 if let Err(e) = writeln!(f, "{json}").and_then(|_| f.flush()) {
-                    error!("INDEX LOG: écriture de {path} impossible : {e} — cette entrée d'audit est PERDUE");
+                    error!("INDEX LOG: cannot write to {path}: {e} — this audit entry is LOST");
                 }
             } else {
-                error!("INDEX LOG: aucun fichier ouvert pour {path} — cette entrée d'audit est PERDUE (stdout seulement)");
+                error!(
+                    "INDEX LOG: no file open for {path} — this audit entry is LOST (stdout only)"
+                );
             }
         }
     }
 
-    /// Rotation : path → path.1, path.1 → path.2, … ; path.max_files supprimé.
+    /// Rotation: path → path.1, path.1 → path.2, …; path.max_files deleted.
     fn rotate(&self, path: &str) {
         if self.max_files > 0 {
             let oldest = format!("{path}.{}", self.max_files);
             match std::fs::remove_file(&oldest) {
                 Ok(()) => {}
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                    warn!("rotation : suppression de {oldest} impossible : {e}");
+                    warn!("rotation: cannot delete {oldest}: {e}");
                 }
                 Err(_) => {}
             }
@@ -298,13 +300,13 @@ impl IndexLogWriter {
                 if std::path::Path::new(&from).exists() {
                     let to = format!("{path}.{}", i + 1);
                     if let Err(e) = std::fs::rename(&from, &to) {
-                        warn!("rotation : renommage {from} → {to} impossible : {e}");
+                        warn!("rotation: cannot rename {from} → {to}: {e}");
                     }
                 }
             }
         }
         if let Err(e) = std::fs::rename(path, format!("{path}.1")) {
-            error!("rotation : renommage {path} → {path}.1 impossible : {e} (continuation dans le même fichier)");
+            error!("rotation: cannot rename {path} → {path}.1: {e} (continuing in the same file)");
             return;
         }
         match Self::open_log_file(path) {
@@ -313,7 +315,7 @@ impl IndexLogWriter {
                 info!("Index log rotated : {path} → {path}.1");
             }
             Err(e) => {
-                error!("rotation : réouverture de {path} impossible : {e} — audit logging en stdout seulement");
+                error!("rotation: cannot reopen {path}: {e} — audit logging to stdout only");
                 *self.file_writer.lock().unwrap_or_else(|p| p.into_inner()) = None;
             }
         }
@@ -339,7 +341,7 @@ mod tests {
         assert!(json.contains("\"schema\":\"public\""));
         assert!(json.contains("\"object\":\"idx_test\""));
         assert!(!json.contains("\"ddl_statement\""));
-        // Log sur stdout (tracing n'est pas initialisé en test — pas d'effet de bord)
+        // Log to stdout (tracing is not initialized in test — no side effect)
         writer.log(log);
     }
 
@@ -388,7 +390,7 @@ mod tests {
 
         let writer = IndexLogWriter::new(true, "minimal", &path, 16, 3);
 
-        // Écrire jusqu'à déclencher la rotation plusieurs fois
+        // Write until rotation is triggered several times
         for i in 0..10 {
             writer.log(
                 IndexOperationLog::new(
@@ -402,20 +404,20 @@ mod tests {
             );
         }
 
-        // Le fichier courant existe et des fichiers rotés sont présents
+        // The current file exists and rotated files are present
         assert!(std::path::Path::new(&path).exists());
         assert!(
             std::path::Path::new(&format!("{path}.1")).exists(),
             "expected {path}.1"
         );
 
-        // Au-delà de max_files : pas de .4 (max_files=3 → .1 .2 .3)
+        // Beyond max_files: no .4 (max_files=3 → .1 .2 .3)
         assert!(
             !std::path::Path::new(&format!("{path}.4")).exists(),
             "max_files must be enforced"
         );
 
-        // Nettoyage
+        // Cleanup
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1,9 +1,9 @@
-//! État d'exécution du daemon (indépendant de la configuration statique)
+//! Runtime state of the daemon (independent from the static configuration)
 
-/// État du daemon :
-/// - `Healthy`  : pg_stat_statements actif, toutes les détections disponibles
-/// - `Degraded` : pg_stat_statements absent → la détection d'index manquants
-///   est DÉSACTIVÉE (pas de source de données), le reste fonctionne
+/// Daemon state:
+/// - `Healthy`  : pg_stat_statements active, all detections available
+/// - `Degraded` : pg_stat_statements missing → missing-index detection
+///   is DISABLED (no data source), the rest still works
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DaemonState {
     Healthy,

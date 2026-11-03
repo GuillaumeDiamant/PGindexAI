@@ -1,36 +1,36 @@
-//! Convention de nommage explicite pour les index.
+//! Explicit naming convention for indexes.
 //!
-//! PostgreSQL limite les identifiants à 63 octets (`NAMEDATALEN - 1`).
-//! Toute génération de nom d'index doit respecter cette limite et être
-//! validée avant d'être injectée dans un DDL.
+//! PostgreSQL limits identifiers to 63 bytes (`NAMEDATALEN - 1`).
+//! Any index name generation must respect this limit and be
+//! validated before being injected into DDL.
 
-/// Limite PostgreSQL pour les identifiants (63 octets, non extensible)
+/// PostgreSQL limit for identifiers (63 bytes, not extensible)
 pub const MAX_IDENTIFIER_LEN: usize = 63;
 
-/// Résultat d'une validation de nom d'identifiant PostgreSQL
+/// Result of validating a PostgreSQL identifier name
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidatedName {
-    /// Le nom est tel quel
+    /// The name as-is
     AsIs(String),
-    /// Le nom a été tronqué pour respecter la limite
+    /// The name was truncated to respect the limit
     Truncated(String),
 }
 
-/// Erreur de validation de nom d'index
+/// Error validating an index name
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum NamingError {
     #[error("Index name is empty after cleaning")]
     Empty,
 }
 
-/// Valider un identifiant PostgreSQL.
+/// Validate a PostgreSQL identifier.
 ///
-/// Règles :
-/// - 1 à 63 octets
-/// - première lettre : `[a-z_]`
-/// - suite : `[a-z0-9_]`
-/// - si le nom est valide mais trop long → on propose une version tronquée
-///   (retourne `Ok(Truncated)`), sinon on renvoie une erreur.
+/// Rules:
+/// - 1 to 63 bytes
+/// - first character: `[a-z_]`
+/// - rest: `[a-z0-9_]`
+/// - if the name is valid but too long → propose a truncated version
+///   (returns `Ok(Truncated)`), otherwise return an error.
 pub fn validate_identifier(raw: &str) -> Result<ValidatedName, NamingError> {
     let cleaned: String = raw
         .chars()
@@ -44,7 +44,7 @@ pub fn validate_identifier(raw: &str) -> Result<ValidatedName, NamingError> {
 
     let first = cleaned.chars().next().unwrap();
     if !(first.is_ascii_lowercase() || first == '_') {
-        // Numéro en premier : on préfixe par '_'
+        // Leading digit: prefix with '_'
         let cleaned = format!("_{}", cleaned);
         let bytes = cleaned.len();
         if bytes > MAX_IDENTIFIER_LEN {
@@ -62,8 +62,8 @@ pub fn validate_identifier(raw: &str) -> Result<ValidatedName, NamingError> {
     Ok(ValidatedName::AsIs(cleaned))
 }
 
-/// Tronque une chaîne à `max` caractères (les noms validés sont ASCII,
-/// donc caractères = octets ici) sans couper de caractère multi-octet.
+/// Truncates a string to `max` characters (validated names are ASCII,
+/// so characters = bytes here) without splitting a multi-byte character.
 fn truncate_chars(s: &str, max: usize) -> String {
     let mut result = String::new();
     for (i, c) in s.chars().enumerate() {
@@ -72,35 +72,35 @@ fn truncate_chars(s: &str, max: usize) -> String {
         }
         result.push(c);
     }
-    // Retirer un '_' de fin éventuel pour garder un identifiant "propre"
+    // Strip a trailing '_' if any to keep a "clean" identifier
     while result.ends_with('_') {
         result.pop();
     }
     result
 }
 
-/// Générer le nom d'un index pour une table + colonne, en respectant la convention
-/// `idx_<table>_<col>` et la limite de 63 octets.
+/// Generate the name of an index for a table + column, respecting the
+/// `idx_<table>_<col>` convention and the 63-byte limit.
 ///
-/// En cas de dépassement, la colonne est raccourcie (hash court en suffixe
-/// pour préserver l'unicité entre colonnes longues).
+/// If the limit is exceeded, the column is shortened (short hash as suffix
+/// to preserve uniqueness between long columns).
 pub fn generate_index_name(schema: &str, table: &str, column: &str) -> Result<String, NamingError> {
-    let _ = schema; // le schéma n'entre pas dans le nom (l'index est qualifié au DDL)
+    let _ = schema; // the schema does not enter the name (the index is qualified in the DDL)
     let base = format!("idx_{}_{}", table, column);
     match validate_identifier(&base)? {
         ValidatedName::AsIs(n) => Ok(n),
         ValidatedName::Truncated(n) => {
-            // Garantir l'unicité : si deux colonnes longues se tronquent pareil,
-            // on ajoute un hash court de la colonne complète.
+            // Guarantee uniqueness: if two long columns truncate the same way,
+            // add a short hash of the full column.
             let hash = short_hash(&base);
-            let budget = MAX_IDENTIFIER_LEN - hash.len() - 1; // +1 pour '_'
+            let budget = MAX_IDENTIFIER_LEN - hash.len() - 1; // +1 for '_'
             let head = truncate_chars(&n, budget);
             Ok(format!("{}_{}", head, hash))
         }
     }
 }
 
-/// Hash déterministe (FNV-1a) court en base 36 ([0-9a-z]), stable entre exécutions
+/// Deterministic short (FNV-1a) hash in base 36 ([0-9a-z]), stable across runs
 fn short_hash(s: &str) -> String {
     let mut hash: u64 = 0xcbf29ce484222325;
     for b in s.bytes() {
@@ -123,13 +123,13 @@ fn short_hash(s: &str) -> String {
     s36.chars().take(6).collect()
 }
 
-/// Vérifie qu'un identifiant (issu du catalogue PostgreSQL, ex. noms de
-/// schéma / table / index) est un identifiant « simple » non-quoté :
-/// `[a-z_][a-z0-9_]*`, <= 63 octets.
+/// Checks that an identifier (from the PostgreSQL catalog, e.g. names of
+/// schema / table / index) is a "simple" unquoted identifier:
+/// `[a-z_][a-z0-9_]*`, <= 63 bytes.
 ///
-/// Seuls ces identifiants peuvent être injectés dans du DDL généré ou dans
-/// un payload Laya (les identifiants exotiques/quotés sont exclus du périmètre
-/// de gestion — loggé en warning, jamais exécuté).
+/// Only these identifiers may be injected into generated DDL or into
+/// a Laya payload (exotic/quoted identifiers are excluded from the
+/// management scope — logged as a warning, never executed).
 pub fn is_simple_identifier(name: &str) -> bool {
     let bytes = name.as_bytes();
     if bytes.is_empty() || bytes.len() > MAX_IDENTIFIER_LEN {
@@ -200,7 +200,7 @@ mod tests {
         assert!(is_simple_identifier("_private"));
         assert!(!is_simple_identifier("9bad"));
         assert!(!is_simple_identifier(""));
-        assert!(!is_simple_identifier("MyIndex")); // majuscules = identifiant quoté
+        assert!(!is_simple_identifier("MyIndex")); // uppercase = quoted identifier
         assert!(!is_simple_identifier("a-b"));
         assert!(!is_simple_identifier(&"a".repeat(64)));
         assert!(is_simple_identifier(&"a".repeat(63)));
