@@ -11,6 +11,12 @@ WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = 'pgindexai_demo')
 
 \c pgindexai_demo
 
+-- ── Extension: pg_stat_statements (required by the SARGable detector) ────
+-- Prerequisite: pg_stat_statements in shared_preload_libraries + a PostgreSQL
+-- restart (install.sh does this automatically). No-op if already present.
+-- Without it, the daemon runs in DEGRADED mode (missing-index detection off).
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+
 -- ── Table: customers ─────────────────────────────────────────────────────
 DROP TABLE IF EXISTS orders, products, order_items, users CASCADE;
 
@@ -158,17 +164,17 @@ DECLARE
     r RECORD;
 BEGIN
     RAISE NOTICE '=== pgindexai_demo demo schema ===';
-    FOR r IN SELECT tablename, n_live_tup
+    FOR r IN SELECT relname, n_live_tup
               FROM pg_stat_user_tables
-              ORDER BY tablename
+              ORDER BY relname
     LOOP
-        RAISE NOTICE '  %: % rows', r.tablename, r.n_live_tup;
+        RAISE NOTICE '  %: % rows', r.relname, r.n_live_tup;
     END LOOP;
     RAISE NOTICE '=== Index ===';
-    FOR r IN SELECT indexname, pg_size_pretty(pg_relation_size(indexrelid)) AS size
+    FOR r IN SELECT indexrelname, pg_size_pretty(pg_relation_size(indexrelid)) AS size
               FROM pg_stat_user_indexes
-              ORDER BY indexname
+              ORDER BY indexrelname
     LOOP
-        RAISE NOTICE '  %: %', r.indexname, r.size;
+        RAISE NOTICE '  %: %', r.indexrelname, r.size;
     END LOOP;
 END $$;

@@ -414,23 +414,24 @@ Verbosity levels:
 
 ## 🧪 Demo
 
-A demo schema with workload is provided:
+A self-contained demo schema + workload is provided in [`sql/`](sql/README.md) —
+**see `sql/README.md` for the full testing guide** (dry-run, real run, DDL
+verification, triggering the fragmentation detector, reset).
+
+Quick start (analysis only, no DDL):
 
 ```bash
-# Create the demo database
-sudo -u postgres psql -c "CREATE DATABASE pgindexai_demo;"
+# Load the demo schema (creates pgindexai_demo, data, pg_stat_statements)
+sudo -u postgres psql -v ON_ERROR_STOP=1 -f sql/demo_schema.sql
 
-# Load the schema
-sudo -u postgres psql -d pgindexai_demo -f sql/demo_schema.sql
+# Run the workload (8 phases — a few minutes)
+sudo -u postgres psql -d pgindexai_demo -v ON_ERROR_STOP=1 -f sql/demo_workload.sql
 
-# Run the workload
-sudo -u postgres psql -d pgindexai_demo -f sql/demo_workload.sql
-
-# Check the daemon's proposals
-journalctl --unit=pgindexai -n 50
+# Analyze and PRINT proposals only (no Laya call, no DDL)
+pgindexai run --dry-run -c sql/pgindexai.test.yaml
 ```
 
-The workload creates:
+The demo creates:
 - **5 tables**: `customers` (10k), `products` (5k), `orders` (200k), `order_items` (500k), `users` (2k)
 - **23 indexes**, some intentionally unused
 - **8 phases** of workload, including repeated SARGable patterns and realistic fragmentation
