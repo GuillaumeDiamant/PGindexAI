@@ -128,6 +128,28 @@ impl Config {
             }
         }
 
+        // Enum-like fields: reject typos that would otherwise either PANIC
+        // (`logging.level` → `EnvFilter::new` at startup) or silently degrade
+        // (`verbosity` → an unknown value used to be treated as Minimal).
+        if !matches!(
+            self.logging.level.to_ascii_lowercase().as_str(),
+            "trace" | "debug" | "info" | "warn" | "error" | "off"
+        ) {
+            errs.push(format!(
+                "logging.level '{}' invalid (expected one of: trace, debug, info, warn, error, off)",
+                self.logging.level
+            ));
+        }
+        if !matches!(
+            self.index_logging.verbosity.to_ascii_lowercase().as_str(),
+            "minimal" | "standard" | "verbose"
+        ) {
+            errs.push(format!(
+                "index_logging.verbosity '{}' invalid (expected one of: minimal, standard, verbose)",
+                self.index_logging.verbosity
+            ));
+        }
+
         if errs.is_empty() {
             Ok(())
         } else {
@@ -689,6 +711,60 @@ dashboard:
                 .iter()
                 .any(|w| w.contains("section 'dashboard' unknown")),
             "unknown section must be detected: {warnings:?}"
+        );
+    }
+
+    /// Regression (v0.1.1): `logging.level` and `index_logging.verbosity` are
+    /// validated. Before the fix, a bad `level` PANICKED at startup
+    /// (`EnvFilter::new`) and a typo'd `verbosity` was silently swallowed
+    /// (treated as Minimal) instead of failing fast.
+    #[test]
+    fn test_invalid_level_and_verbosity_are_rejected() {
+        let config_with = |level: &str, verbosity: &str| -> Config {
+            let yaml = format!(
+                r#"
+postgresql:
+  host: localhost
+  port: 5432
+  user: pgindexai
+  database: pgindexai_demo
+  ssl_mode: disable
+laya:
+  url: http://127.0.0.1:8080
+actions:
+  create_index: true
+  drop_unused: true
+  rebuild_fragmented: true
+thresholds:
+  cycle_seconds: 60
+logging:
+  level: {level}
+index_logging:
+  verbosity: {verbosity}
+"#
+            );
+            let value: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+            serde_yaml::from_value(value).unwrap()
+        };
+
+        // Valid values: accepted
+        let cfg = config_with("info", "standard");
+        assert!(cfg.validate().is_ok());
+
+        // Invalid level (used to panic in EnvFilter::new at startup)
+        let cfg = config_with("verbose!", "standard");
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("logging.level"),
+            "invalid level must be rejected, got: {err}"
+        );
+
+        // Invalid verbosity (used to be silently treated as Minimal)
+        let cfg = config_with("info", "verbos");
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("index_logging.verbosity"),
+            "invalid verbosity must be rejected, got: {err}"
         );
     }
 }

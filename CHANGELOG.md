@@ -5,6 +5,24 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-11-04
+
+### Fixed
+
+- **DDL timeout now applies to the transactional path** (`DROP INDEX` / non-concurrent
+  `REINDEX`): previously `thresholds.ddl_timeout_seconds` was only applied to
+  `CONCURRENTLY` builds, so a `DROP INDEX` blocked on a lock held by a long-running
+  transaction could hang the daemon forever. Now `SET LOCAL statement_timeout` and
+  `SET LOCAL lock_timeout` bound the DDL and its lock waits inside the transaction
+  (transaction-scoped, so the pooled connection stays clean).
+- **Config value validation**: `logging.level` and `index_logging.verbosity` are now
+  validated at load time. A bad `level` used to panic at startup (`EnvFilter::new`),
+  and a typo'd `verbosity` was silently treated as `Minimal` — both now fail fast with
+  a clear `ConfigError`.
+- **Laya criteria order is now deterministic**: `ActionQuestion.criteria` is a
+  `BTreeMap` (was `HashMap`), so the serialized JSON criteria keys are always emitted
+  in sorted order ("0" < "1" < "2" < …) instead of an arbitrary hash-seeded order.
+
 ## [0.1.0] - 2026-11-03
 
 First tagged release.

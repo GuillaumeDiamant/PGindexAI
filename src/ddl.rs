@@ -23,11 +23,17 @@ pub enum DdlOutcome {
 /// - Atomic DDL (DROP INDEX) → BEGIN … COMMIT, ROLLBACK on error
 /// - CONCURRENTLY DDL → direct execution (auto-commit), never inside a transaction
 ///
-/// `timeout_secs` bounds the duration of CONCURRENTLY builds (0 = unlimited):
-/// without a bound, a build on a large table can block the entire
-/// analysis cycle (the daemon is sequential). NB: a too-short timeout on
-/// a large table would create a build→cancelled→retry loop — hence the
-/// generous default of 30 min (configurable via `thresholds.ddl_timeout_seconds`).
+/// `timeout_secs` (0 = unlimited) bounds the DDL on BOTH execution paths:
+/// - CONCURRENTLY (auto-commit): `SET statement_timeout` around the build
+/// - transactional (DROP INDEX / REINDEX): `SET LOCAL statement_timeout`
+///   AND `SET LOCAL lock_timeout` — so a DDL blocked on a lock held by a
+///   long-running transaction is cancelled instead of hanging the daemon
+///   forever (previously `timeout_secs` was dead on this path).
+///
+/// Without a bound, a build on a large table can block the entire analysis
+/// cycle (the daemon is sequential). NB: a too-short timeout on a large
+/// table would create a build→cancelled→retry loop — hence the generous
+/// default of 30 min (configurable via `thresholds.ddl_timeout_seconds`).
 pub async fn run_in_transaction(
     pool: &Pool,
     ddl: &str,
@@ -56,6 +62,19 @@ pub async fn run_in_transaction(
             .transaction()
             .await
             .map_err(|e| format!("BEGIN failed: {}", e))?;
+        // Bound the statement AND its lock wait. This is the case that used to
+        // hang forever: a DROP INDEX / REINDEX blocked on a lock held by a
+        // long-running transaction. `SET LOCAL` is scoped to this transaction —
+        // it resets automatically on COMMIT / ROLLBACK, so the pooled connection
+        // stays clean (no manual RESET needed, unlike the CONCURRENTLY branch).
+        if timeout_secs > 0 {
+            tx.simple_query(&format!("SET LOCAL statement_timeout = {timeout_secs}s"))
+                .await
+                .map_err(|e| format!("SET LOCAL statement_timeout failed: {e}"))?;
+            tx.simple_query(&format!("SET LOCAL lock_timeout = {timeout_secs}s"))
+                .await
+                .map_err(|e| format!("SET LOCAL lock_timeout failed: {e}"))?;
+        }
         let rows = tx
             .execute(ddl, &[])
             .await
@@ -702,6 +721,50 @@ mod tests {
         // the execution mode (token-level match, not substring)
         assert!(!is_concurrent_ddl("CREATE INDEX x ON concurrently_log (c)"));
         assert!(!is_concurrent_ddl("DROP INDEX CONCURRENTLY_IDX"));
+    }
+
+    #[test]
+    fn test_transactional_path_applies_statement_timeout() {
+        // Regression (v0.1.1): the transactional DDL path (DROP INDEX /
+        // REINDEX) MUST apply statement_timeout + lock_timeout. Before the
+        // fix, `timeout_secs` was dead on this path — a DDL blocked on a lock
+        // held by a long-running transaction would hang the daemon forever.
+        //
+        // `pg_sleep(5)` is a deterministic stand-in for a blocked DDL: it
+        // honors statement_timeout, so a 1 s bound must CANCEL it (~1 s)
+        // instead of letting it run to completion (~5 s).
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let pool = rt.block_on(async {
+            let mut c = deadpool_postgres::Config::new();
+            c.host = Some("/var/run/postgresql".to_string());
+            c.port = Some(5432);
+            c.user = Some("postgres".to_string());
+            c.dbname = Some("postgres".to_string());
+            c.create_pool(
+                Some(deadpool_postgres::Runtime::Tokio1),
+                tokio_postgres::NoTls,
+            )
+            .ok()
+        });
+        let Some(pool) = pool else {
+            eprintln!(
+                "SKIP test_transactional_path_applies_statement_timeout: no local PostgreSQL"
+            );
+            return;
+        };
+
+        let start = std::time::Instant::now();
+        let res = rt.block_on(run_in_transaction(&pool, "SELECT pg_sleep(5)", 1));
+        let elapsed = start.elapsed();
+
+        assert!(
+            res.is_err(),
+            "expected a timeout cancellation, but the statement succeeded: {res:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(4),
+            "statement ran for {elapsed:?} — statement_timeout was NOT applied (expected ~1 s)"
+        );
     }
 
     #[test]
