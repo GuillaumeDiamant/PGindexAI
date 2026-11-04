@@ -103,17 +103,12 @@ impl LayaClient {
         }
     }
 
-    /// Build the payload for a decision proposal
+    /// Build the payload for a decision proposal.
+    ///
+    /// Criteria are stored in a `BTreeMap` (see [`types::ActionQuestion`]) so
+    /// the serialized JSON keys are emitted in deterministic sorted order.
+    /// Callers may pass a plain `HashMap`; the conversion is done here.
     pub fn build_payload(state: &str, criteria: HashMap<String, String>) -> LayaPayload {
-        let mut creds = criteria;
-        // Make sure the keys are in the order 0,1,2,...
-        let mut ordered = HashMap::new();
-        for i in 0..creds.len() {
-            let key = i.to_string();
-            if let Some(val) = creds.remove(&key) {
-                ordered.insert(key, val);
-            }
-        }
         LayaPayload {
             state: state.to_string(),
             questions: types::Questions {
@@ -122,10 +117,38 @@ impl LayaClient {
                     instructions:
                         "Choose the single best action for this PostgreSQL index situation."
                             .to_string(),
-                    criteria: ordered,
+                    criteria: criteria.into_iter().collect(),
                 },
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_payload_criteria_are_ordered() {
+        // Regression (v0.1.1): criteria must serialize in deterministic
+        // "0", "1", "2" order. With a `HashMap` the JSON key order was
+        // arbitrary (hash-seeded); now a `BTreeMap` guarantees sorted order.
+        // Insert the keys in a deliberately scrambled order to prove the
+        // output order does NOT depend on insertion order.
+        let criteria = [
+            ("2".to_string(), "Option C: rebuild".to_string()),
+            ("0".to_string(), "Option A: no action".to_string()),
+            ("1".to_string(), "Option B: drop index".to_string()),
+        ]
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+        let payload = LayaClient::build_payload("state", criteria);
+        let json = serde_json::to_string(&payload).unwrap();
+        // Keys are serialized as "0":, "1":, "2": — assert sorted order.
+        let i0 = json.find("\"0\":").expect("key 0 missing");
+        let i1 = json.find("\"1\":").expect("key 1 missing");
+        let i2 = json.find("\"2\":").expect("key 2 missing");
+        assert!(i0 < i1 && i1 < i2, "criteria keys out of order: {json}");
     }
 }
 

@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 // ─────────────────────────────────────────────
 // Payload sent to Laya /v1/systemone
@@ -21,7 +21,11 @@ pub struct ActionQuestion {
     #[serde(rename = "type")]
     pub type_: String,
     pub instructions: String,
-    pub criteria: HashMap<String, String>,
+    /// `BTreeMap` (not `HashMap`): the serialized JSON keys appear in
+    /// deterministic sorted order ("0" < "1" < "2" < …). A `HashMap` iterates
+    /// in arbitrary (hash-seeded) order — Laya must not depend on key order,
+    /// but we make it stable regardless.
+    pub criteria: BTreeMap<String, String>,
 }
 
 // ─────────────────────────────────────────────
