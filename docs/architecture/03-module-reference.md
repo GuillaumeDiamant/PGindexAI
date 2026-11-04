@@ -449,7 +449,7 @@ Custom serialization: `DecisionAction` ↔ string (`"IGNORE"`, `"CREATE INDEX"`,
 | `PgConfig` | `host`, `port`, `user`, `database`, `ssl_mode`, **`password`** (optional), **`ssl_root_cert`** (optional, PEM path) |
 | `LayaConfig` | `url`, `timeout_seconds` |
 | `ActionsConfig` | `create_index`, `drop_unused`, `rebuild_fragmented` |
-| `Thresholds` | `cycle_seconds`, `unused_minutes`, `fragmentation_pct`, `min_sargable_rows`, `min_confidence`, **`max_proposals_per_cycle`** |
+| `Thresholds` | `cycle_seconds`, `unused_minutes`, `fragmentation_pct`, `min_sargable_rows`, `min_confidence`, **`max_proposals_per_cycle`**, **`ddl_timeout_seconds`** |
 | **`AnalysisConfig`** (new) | `schemas: Vec<String>` (empty = all non-system schemas) |
 | **`PgPoolConfig`** (new) | `max_size: u32`, `wait_timeout_ms: u64` |
 | `LoggingConfig` | `level`, `format` |

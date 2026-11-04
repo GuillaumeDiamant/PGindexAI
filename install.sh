@@ -404,7 +404,7 @@ ensure_pg_stat_statements() {
     if [[ -z "$PG_CONF" || ! -r "$conf" ]]; then
         warn "Cannot modify '$conf' automatically."
         warn "Manual action: shared_preload_libraries += '$lib', restart PG,"
-        warn "puis CREATE EXTENSION IF NOT EXISTS pg_stat_statements;"
+        warn "then CREATE EXTENSION IF NOT EXISTS pg_stat_statements;"
         return 1
     fi
 
@@ -736,7 +736,7 @@ verify() {
     echo "  PGindexAI installation finished"
     echo "============================================"
     echo ""
-    echo "  Binaire    : $BIN_PATH"
+    echo "  Binary     : $BIN_PATH"
     echo "  Config     : $CONFIG_FILE  (0600)"
     echo "  Logs       : /var/log/pgindexai/"
     echo "  Service    : systemctl status $SERVICE_NAME"

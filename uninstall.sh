@@ -156,7 +156,7 @@ stop_service() {
 # Step 2: binary
 # ─────────────────────────────────────────────
 remove_binary() {
-    step "Binaire..."
+    step "Binary..."
     if [[ -f "$BIN_PATH" ]]; then
         run sudo rm -f "$BIN_PATH"
         info "Binary removed: $BIN_PATH"

@@ -454,6 +454,7 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
             "min_sargable_rows",
             "min_confidence",
             "max_proposals_per_cycle",
+            "ddl_timeout_seconds",
         ],
     ),
     ("analysis", &["schemas"]),
@@ -486,31 +487,41 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     ),
 ];
 
-fn warn_unknown_keys(value: &serde_yaml::Value) {
+/// Collect the unknown sections/keys of a config as warning messages.
+/// Pure function (no logging) so it can be tested directly.
+fn unknown_key_warnings(value: &serde_yaml::Value) -> Vec<String> {
+    let mut warnings = Vec::new();
     let Some(top) = value.as_mapping() else {
-        return;
+        return warnings;
     };
     for (k, v) in top {
         let Some(section) = k.as_str() else { continue };
         let Some((_, keys)) = KNOWN_KEYS.iter().find(|(s, _)| *s == section) else {
-            warn!(
+            warnings.push(format!(
                 "config: section '{}' unknown (ignored — e.g. 'dashboard' is not implemented)",
                 section
-            );
+            ));
             continue;
         };
         if let Some(inner) = v.as_mapping() {
             for ik in inner.keys() {
                 if let Some(iks) = ik.as_str() {
                     if !keys.contains(&iks) {
-                        warn!(
+                        warnings.push(format!(
                             "config: key '{}.{}' unknown (ignored — typo or removed feature?)",
                             section, iks
-                        );
+                        ));
                     }
                 }
             }
         }
+    }
+    warnings
+}
+
+fn warn_unknown_keys(value: &serde_yaml::Value) {
+    for warning in unknown_key_warnings(value) {
+        warn!("{warning}");
     }
 }
 
@@ -591,6 +602,93 @@ thresholds: {}
         assert_eq!(
             IndexLoggingConfig::default().enabled,
             cfg.index_logging.enabled
+        );
+    }
+
+    /// Regression: a FULLY valid config (all 10 sections, all documented keys)
+    /// must trigger NO unknown-key warning — in particular
+    /// `thresholds.ddl_timeout_seconds`, which was missing from `KNOWN_KEYS`
+    /// and produced a false warning on every startup with the shipped config.
+    #[test]
+    fn test_known_keys_cover_full_config() {
+        let yaml = r#"
+postgresql:
+  host: localhost
+  port: 5432
+  user: pgindexai
+  database: pgindexai_demo
+  ssl_mode: disable
+  password: ""
+  ssl_root_cert: /etc/ssl/certs/pg-ca.pem
+laya:
+  url: http://127.0.0.1:8080
+  timeout_seconds: 30
+actions:
+  create_index: true
+  drop_unused: true
+  rebuild_fragmented: true
+thresholds:
+  cycle_seconds: 60
+  unused_minutes: 10080
+  fragmentation_pct: 30
+  min_sargable_rows: 1
+  min_confidence: 0.7
+  max_proposals_per_cycle: 20
+  ddl_timeout_seconds: 1800
+analysis:
+  schemas: []
+pg_pool:
+  max_size: 8
+  wait_timeout_ms: 5000
+logging:
+  level: info
+  format: json
+index_logging:
+  enabled: true
+  verbosity: standard
+  log_file: /var/log/pgindexai/operations.log
+  max_file_size_bytes: 10485760
+  max_files: 5
+density_by_type:
+  int4: 250
+  int8: 200
+  float8: 150
+  varchar: 50
+  text: 40
+  date: 150
+  timestamptz: 150
+  uuid: 50
+  bool: 10
+  default_density: 50
+"#;
+        let value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        assert!(
+            unknown_key_warnings(&value).is_empty(),
+            "the shipped config must trigger no unknown-key warning"
+        );
+
+        // Detection still works: a typo'd key AND an unknown section are both flagged
+        let bad: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+thresholds:
+  ddl_timeout_secondz: 1800
+dashboard:
+  enabled: true
+"#,
+        )
+        .unwrap();
+        let warnings = unknown_key_warnings(&bad);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("thresholds.ddl_timeout_secondz")),
+            "typo'd key must be detected: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("section 'dashboard' unknown")),
+            "unknown section must be detected: {warnings:?}"
         );
     }
 }
