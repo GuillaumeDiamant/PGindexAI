@@ -5,6 +5,29 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Testing guide**: `sql/README.md` — how to test PGindexAI end-to-end with the demo
+  (prerequisites, quick start, dry-run / real run / daemon, verified expected output,
+  DDL verification queries, fragmentation-detector trigger recipe, reset, troubleshooting)
+- **Test configuration**: `sql/pgindexai.test.yaml` — peer-auth `postgres` user (no
+  password), lowered thresholds, index-op log disabled: a fast local test with no secret
+
+### Fixed
+
+- **`sql/demo_schema.sql`**: summary block now uses the correct
+  `pg_stat_user_tables.relname` column (was `tablename` — aborted the load with
+  `column "tablename" does not exist`)
+- **`sql/demo_schema.sql`**: summary block now uses the correct
+  `pg_stat_user_indexes.indexrelname` column (was `indexname`)
+- **`sql/demo_schema.sql`**: now runs `CREATE EXTENSION IF NOT EXISTS pg_stat_statements`
+  itself — previously the extension only existed when `install.sh` had created it, and
+  was lost after any drop/reload of the demo database (SARGable detection silently off)
+- **`sql/demo_workload.sql`**: fragmentation report no longer fails with
+  `function pg_size_pretty(integer) is not unique` (explicit `::bigint` cast)
+
 ## [0.1.1] - 2026-11-04
 
 ### Fixed

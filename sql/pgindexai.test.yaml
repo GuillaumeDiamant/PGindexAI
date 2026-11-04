@@ -1,0 +1,51 @@
+# Test configuration for PGindexAI (see sql/README.md)
+# Tuned for a fast, local, no-secret test:
+#   - user: postgres (peer auth, no password) — simplest for a local test
+#   - lowered thresholds so the detectors fire quickly
+#   - index-operation log disabled (no /var/log write needed)
+#
+# Usage:  pgindexai run --dry-run -c sql/pgindexai.test.yaml
+
+postgresql:
+  host: "/var/run/postgresql"   # Unix socket (or "127.0.0.1" / hostname for TCP)
+  port: 5432
+  user: "postgres"              # peer auth, no password — easiest for a local test
+  database: "pgindexai_demo"
+  password: ""
+  ssl_mode: "disable"           # socket ⇒ disable
+
+laya:
+  url: "http://127.0.0.1:8080"
+  timeout_seconds: 5
+
+actions:
+  create_index: true
+  drop_unused: true
+  rebuild_fragmented: true
+
+thresholds:
+  cycle_seconds: 30
+  unused_minutes: 1             # LOW for the test (default 10080 = 7 days)
+  fragmentation_pct: 50         # LOWER for the test (default 70)
+  min_sargable_rows: 100
+  min_confidence: 0.7
+  max_proposals_per_cycle: 20
+  ddl_timeout_seconds: 60
+
+analysis:
+  schemas: []                   # all non-system schemas
+
+pg_pool:
+  max_size: 8
+  wait_timeout_ms: 5000
+
+logging:
+  level: "info"
+  format: "text"                # text for easy reading (json in production)
+
+index_logging:
+  enabled: false                # no /var/log write needed for a test
+  verbosity: "verbose"
+  log_file: ""
+  max_file_size_bytes: 0
+  max_files: 1

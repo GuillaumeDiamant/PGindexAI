@@ -410,7 +410,7 @@ SELECT '--- Fragmentation (pg_class density) ---';
 SELECT
     c.relname AS table_name,
     i.relname AS index_name,
-    pg_size_pretty(c2.relpages * 8192) AS index_size,
+    pg_size_pretty((c2.relpages * 8192)::bigint) AS index_size,
     c2.relpages AS pages,
     c.reltuples AS estimated_rows,
     CASE
