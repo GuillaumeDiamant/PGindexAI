@@ -629,6 +629,17 @@ fn parse_query_for_sargable(query: &str) -> Option<AttributedColumns> {
 
     for stmt in &statements {
         if let sqlparser::ast::Statement::Query(query_ast) = stmt {
+            // CTE: its name is a PHANTOM table — `WITH cte AS (…) SELECT …
+            // FROM cte` would attribute columns to `public.cte` and produce a
+            // phantom CREATE INDEX proposal (regenerated every cycle).
+            // Conservative: queries that use CTEs are out of scope.
+            if query_ast
+                .with
+                .as_ref()
+                .is_some_and(|with| !with.cte_tables.is_empty())
+            {
+                continue;
+            }
             if let Some(select) = query_ast.body.as_select() {
                 // Collect the tables (alias, schema, table) — first table AND JOINed tables
                 let mut tables: Vec<(Option<String>, String, String)> = Vec::new();
@@ -656,7 +667,7 @@ fn parse_query_for_sargable(query: &str) -> Option<AttributedColumns> {
                     }
                 }
                 if tables.is_empty() {
-                    continue; // FROM subquery / function / CTE: out of scope
+                    continue; // FROM subquery / function: out of scope
                 }
 
                 if let Some(selection) = &select.selection {
@@ -1094,6 +1105,22 @@ mod tests {
             "orders".to_string(),
             "status".to_string()
         )));
+    }
+
+    #[test]
+    fn test_cte_name_is_a_phantom_table_not_attributed() {
+        // A CTE name is NOT a real table: `FROM cte` must not yield an index
+        // proposal on `public.cte` (a phantom, regenerated every cycle).
+        // Conservative behavior: CTE queries are skipped entirely.
+        assert!(parse_query_for_sargable(
+            "WITH cte AS (SELECT id, status FROM orders) SELECT * FROM cte WHERE status = 'open'"
+        )
+        .is_none());
+        assert!(cols(
+            "WITH c AS (SELECT * FROM orders), d AS (SELECT * FROM users) \
+             SELECT * FROM c, d WHERE c.status = 'open'"
+        )
+        .is_empty());
     }
 
     #[test]

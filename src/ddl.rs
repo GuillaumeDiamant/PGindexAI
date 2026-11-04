@@ -67,9 +67,14 @@ pub async fn run_in_transaction(
     }
 }
 
-/// Detect a CONCURRENTLY DDL (CREATE INDEX CONCURRENTLY / REINDEX … CONCURRENTLY)
+/// Detect a CONCURRENTLY DDL (CREATE INDEX CONCURRENTLY / REINDEX … CONCURRENTLY).
+///
+/// Token-level match (not substring): a table named `concurrently_log` must
+/// NOT flip the execution mode (auto-commit + statement_timeout) for a DDL
+/// that is actually transactional.
 fn is_concurrent_ddl(ddl: &str) -> bool {
-    ddl.to_uppercase().contains("CONCURRENTLY")
+    ddl.split_whitespace()
+        .any(|t| t.eq_ignore_ascii_case("CONCURRENTLY"))
 }
 
 /// Execute a CREATE INDEX (CONCURRENTLY, outside a transaction) with:
@@ -693,6 +698,10 @@ mod tests {
         assert!(!is_concurrent_ddl("CREATE INDEX x ON t (c)"));
         assert!(!is_concurrent_ddl("DROP INDEX x"));
         assert!(!is_concurrent_ddl("REINDEX INDEX x"));
+        // A table name containing "CONCURRENTLY" as a substring must NOT flip
+        // the execution mode (token-level match, not substring)
+        assert!(!is_concurrent_ddl("CREATE INDEX x ON concurrently_log (c)"));
+        assert!(!is_concurrent_ddl("DROP INDEX CONCURRENTLY_IDX"));
     }
 
     #[test]
