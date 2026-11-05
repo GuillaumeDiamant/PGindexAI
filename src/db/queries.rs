@@ -1,7 +1,8 @@
 use deadpool_postgres::Pool;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tracing::debug;
+use tokio_postgres::types::{ToSql, Type};
+use tracing::{debug, warn};
 
 // ─────────────────────────────────────────────
 // Analysis result types
@@ -27,7 +28,13 @@ pub struct FragmentationInfo {
     pub tablename: String,
     pub indexname: String,
     pub relpages: i64,
-    pub avg_leaf_density: f64,
+    /// Measured B-tree leaf page fill (0..1), from pgstattuple's
+    /// `pgstatindex().avg_leaf_density` (leaf byte-fill, source-verified;
+    /// returned by the extension as a percent 0..100 — normalized here).
+    /// `None` when pgstattuple is unavailable, the index is below the
+    /// measurement cost threshold, or the probe failed — in that case
+    /// the score rests on the legacy heuristic alone.
+    pub leaf_density: Option<f64>,
     pub fragmentation_pct: f64,
 }
 
@@ -203,16 +210,51 @@ pub async fn get_existing_indexes(
     Ok(map)
 }
 
-/// Fetch the fragmented B-tree indexes (documented heuristic estimation)
+/// Maps a measured B-tree leaf fill (0..1) to a fragmentation score (0..1).
 ///
-/// PostgreSQL does not provide a native "avg_leaf_density" metric.
-/// We combine three signals:
-///   1. ratio n_dead_tup / (n_live + n_dead) of the table (main proxy, 50%)
-///   2. n_mod_since_analyze / n_live_tup (unanalyzed modifications, 30%)
-///   3. large index never scanned (20%)
+/// Empirically calibrated anchors (PostgreSQL 16 / pgstattuple 1.5,
+/// measured on real databases, fresh builds of 100k–250k rows):
+///   * healthy index: ~90 % leaf fill (measured 89.80, 89.83, 89.92, 90.05);
+///   * worst case (50 % of the rows churned, then VACUUM): ~45 % leaf fill —
+///     the index is roughly TWICE the size of the healthy one, and REINDEX
+///     reclaims about half the space (measured 45.06 % on a clean table).
+///
+/// `score = clamp((0.90 − d) / 0.45, 0, 1)`: a healthy index (~90 %) scores
+/// ≈ 0, an index at the 45 % anchor scores 1.0, and in between the score
+/// is linear (e.g. 67.5 % fill → 0.5).
+pub fn bloat_score_from_leaf_density(d: f64) -> f64 {
+    const HEALTHY_FILL: f64 = 0.90;
+    const WORST_FILL: f64 = 0.45;
+    if !d.is_finite() {
+        return 0.0;
+    }
+    let d = d.clamp(0.0, 1.0);
+    ((HEALTHY_FILL - d) / (HEALTHY_FILL - WORST_FILL)).clamp(0.0, 1.0)
+}
+
+/// Fetch the fragmented B-tree indexes
+///
+/// Two criteria are combined, final score = `max` of the two:
+///
+///   1. LEGACY heuristic (works with no extra extension): dead tuples
+///      ratio (50 %) + unanalyzed modifications (30 %) + large index never
+///      scanned (20 %).
+///   2. PHYSICAL bloat (requires `pgstattuple`): the measured leaf page
+///      fill from `pgstatindex()` (a full index scan), mapped to a score by
+///      `bloat_score_from_leaf_density`.
+///
+/// Known limitation of the legacy criterion: those statistics are reset by
+/// VACUUM / ANALYZE, so the score drops to zero right after autovacuum — a
+/// physically bloated index becomes invisible to it. The physical criterion
+/// is robust against autovacuum: the free space left behind by VACUUM stays
+/// on the leaf pages until a REINDEX.
+///
+/// `use_index_bloat = false` (or extension missing / probe failure) degrades
+/// gracefully to criterion 1 alone — the previous behavior.
 pub async fn get_fragmented_indexes(
     pool: &Pool,
     max_rows: i64,
+    use_index_bloat: bool,
 ) -> Result<Vec<FragmentationInfo>, Box<dyn std::error::Error + Sync + Send>> {
     let client = pool.get().await?;
 
@@ -225,11 +267,10 @@ pub async fn get_fragmented_indexes(
                     pi.indrelid AS table_oid,
                     s.relname AS tablename,
                     s.indexrelname AS indexname,
+                    s.indexrelid AS index_oid,
                     pg_relation_size(s.indexrelid) / 8192 AS relpages,
                     COALESCE(s.idx_tup_read, 0) AS idx_tup_read,
-                    COALESCE(s.idx_scan, 0) AS idx_scan,
-                    pc.relpages::bigint AS index_pages,
-                    pc.reltuples::float8 AS index_tuples
+                    COALESCE(s.idx_scan, 0) AS idx_scan
                 FROM pg_stat_user_indexes s
                 JOIN pg_index pi ON s.indexrelid = pi.indexrelid
                 JOIN pg_class pc ON s.indexrelid = pc.oid
@@ -250,9 +291,8 @@ pub async fn get_fragmented_indexes(
                 ii.schemaname,
                 ii.tablename,
                 ii.indexname,
+                ii.index_oid,
                 ii.relpages,
-                ii.index_pages,
-                ii.index_tuples,
                 ii.idx_scan,
                 ts.n_live_tup,
                 ts.n_dead_tup,
@@ -267,55 +307,94 @@ pub async fn get_fragmented_indexes(
         .await?;
 
     let mut result = Vec::new();
+    // Once a pgstatindex probe fails (extension missing, permissions, ...),
+    // stop probing for the rest of the cycle: warn once, do not spam.
+    let mut bloat_probe_disabled = false;
+
     for row in &rows {
         let relpages: i64 = row.get("relpages");
-        let index_pages: i64 = row.get("index_pages");
-        let index_tuples: f64 = row.get("index_tuples");
+        let index_oid: u32 = row.get("index_oid"); // pg_stat_user_indexes.indexrelid (oid)
         let n_live_tup: i64 = row.get("n_live_tup");
         let n_dead_tup: i64 = row.get("n_dead_tup");
         let n_mod_since_analyze: i64 = row.get("n_mod_since_analyze");
         let idx_scan: i64 = row.get("idx_scan");
 
-        let mut frag_score: f64 = 0.0;
-
-        // Criterion 1: dead tuples ratio (50%)
+        // ── Criterion A (legacy): catalog statistics ────────────────────
+        // 1. dead tuples ratio (50%)
         let total_tuples = (n_live_tup + n_dead_tup) as f64;
         let dead_ratio = if total_tuples > 0.0 {
             n_dead_tup as f64 / total_tuples
         } else {
             0.0
         };
-        frag_score += dead_ratio * 0.5;
+        let mut legacy_score = dead_ratio * 0.5;
 
-        // Criterion 2: unanalyzed modifications (30%)
+        // 2. unanalyzed modifications (30%)
         let mod_ratio = if n_live_tup > 0 {
             (n_mod_since_analyze as f64 / n_live_tup as f64).min(1.0)
         } else {
             0.0
         };
-        frag_score += mod_ratio * 0.3;
+        legacy_score += mod_ratio * 0.3;
 
-        // Criterion 3: large index never scanned (20%)
+        // 3. large index never scanned (20%)
         if idx_scan == 0 && relpages > 100 {
-            frag_score += 0.2;
+            legacy_score += 0.2;
         }
 
-        let fragmentation_pct = (frag_score * 100.0).min(100.0);
-
-        // avg_leaf_density: tuples/pages ratio of the index, normalized over 100
-        // (PostgreSQL B-tree targets ~90% fill of leaf pages)
-        let avg_leaf_density = if index_tuples > 0.0 && index_pages > 0 {
-            (index_tuples / index_pages as f64 / 100.0).clamp(0.0, 1.0)
+        // ── Criterion B (physical): measured leaf fill ──────────────────
+        // `pgstatindex` performs a FULL INDEX SCAN per call, so we only
+        // measure indexes above 100 pages (cost guard). On the first
+        // failure we disable probing for the cycle (graceful fallback).
+        //
+        // NB: the parameter type is declared explicitly (Oid): the OID is
+        // passed to the `pgstatindex(regclass)` overload — an untyped $1
+        // would resolve to the `pgstatindex(text)` overload and the driver
+        // would reject the integer.
+        let leaf_density: Option<f64> = if use_index_bloat
+            && !bloat_probe_disabled
+            && relpages > 100
+        {
+            let params = [(&index_oid as &(dyn ToSql + Sync), Type::OID)];
+            match client
+                .query_typed_opt(
+                    "SELECT (pgstatindex($1::regclass)).avg_leaf_density",
+                    &params,
+                )
+                .await
+            {
+                Ok(r) => r
+                    .and_then(|r| r.get::<_, Option<f64>>(0))
+                    // pgstattuple returns a PERCENT (0..100); normalize to 0..1
+                    .map(|d| d / 100.0)
+                    .filter(|d| d.is_finite()),
+                Err(e) => {
+                    warn!(
+                            "pgstattuple probe failed for {}.{}: {e} — physical bloat \
+                             detection disabled for this cycle (falling back to the legacy heuristic)",
+                            row.get::<_, String>("schemaname"),
+                            row.get::<_, String>("indexname"),
+                        );
+                    bloat_probe_disabled = true;
+                    None
+                }
+            }
         } else {
-            1.0
+            None
         };
+
+        // Final score: the strongest signal wins (no regression possible —
+        // the legacy score alone is the fallback when pgstattuple is absent).
+        let bloat_score = leaf_density.map(bloat_score_from_leaf_density);
+        let frag_score = bloat_score.map_or(legacy_score, |b| legacy_score.max(b));
+        let fragmentation_pct = (frag_score * 100.0).min(100.0);
 
         result.push(FragmentationInfo {
             schemaname: row.get("schemaname"),
             tablename: row.get("tablename"),
             indexname: row.get("indexname"),
             relpages,
-            avg_leaf_density,
+            leaf_density,
             fragmentation_pct,
         });
     }
@@ -351,6 +430,15 @@ fn is_column_covered_by_index(indexdef: &str, column_name: &str) -> bool {
     }
     false
 }
+
+/// Exclusion filter for `pg_stat_statements` SARGable candidates: removes
+/// the daemon's own catalog queries and any query on a system schema.
+///
+/// NB — this is evaluated by PostgreSQL's ARE dialect, not PCRE:
+///   - `\y` is the word boundary (`\b` is a LITERAL BACKSPACE — a `\bpg_`
+///     filter therefore silently never matched);
+///   - `[\s\S]` spans newlines (a plain `.` does not).
+const SARGABLE_SYSTEM_QUERY_FILTER: &str = r"^(SELECT|WITH)[\s\S]*\y(pg_|information_schema\.)";
 
 /// Detect SARGable queries with no index covering the filtered column.
 ///
@@ -388,7 +476,7 @@ pub async fn get_missing_sargable_indexes(
             "#,
             &[
                 &r"^(CREATE|ALTER|DROP|DELETE|INSERT|UPDATE|BEGIN|COMMIT|ROLLBACK|EXPLAIN|ANALYZE|VACUUM|GRANT|REVOKE|SET|SHOW)".to_string(),
-                &r"^(SELECT|WITH).*\bpg_".to_string(),
+                &SARGABLE_SYSTEM_QUERY_FILTER.to_string(),
                 &min_calls,
                 &max_queries,
             ],
@@ -1152,11 +1240,127 @@ mod tests {
     }
 
     #[test]
+    fn test_sargable_system_query_filter_live() {
+        // Regression: the exclusion filter must ACTUALLY match in
+        // PostgreSQL's ARE dialect. The previous `\bpg_` version never
+        // matched (`\b` is a literal backspace in ARE, not a word
+        // boundary) and the daemon's own high-call queries crowded real
+        // user queries out of the candidate window.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let pool = rt.block_on(async {
+            let mut c = deadpool_postgres::Config::new();
+            c.host = Some("/var/run/postgresql".to_string());
+            c.port = Some(5432);
+            c.user = Some("postgres".to_string());
+            c.dbname = Some("pgindexai_demo".to_string());
+            c.create_pool(
+                Some(deadpool_postgres::Runtime::Tokio1),
+                tokio_postgres::NoTls,
+            )
+            .ok()
+        });
+        let Some(pool) = pool else {
+            eprintln!("SKIP test_sargable_system_query_filter_live: no local PostgreSQL");
+            return;
+        };
+        let excluded = |query: &str| {
+            rt.block_on(async {
+                let client = pool.get().await.unwrap();
+                client
+                    .query_one("SELECT $1 ~* $2", &[&query, &SARGABLE_SYSTEM_QUERY_FILTER])
+                    .await
+                    .unwrap()
+                    .get::<_, bool>(0)
+            })
+        };
+        // Daemon-internal queries → MUST be excluded (multi-line and single-line)
+        assert!(excluded(
+            "WITH index_info AS (\n SELECT s.schemaname\n FROM pg_stat_user_indexes s\n WHERE s.schemaname = 'public')"
+        ));
+        assert!(excluded(
+            "SELECT table_schema, table_name, column_name, data_type, is_nullable\nFROM information_schema.columns\nWHERE table_schema = ANY($1)"
+        ));
+        assert!(excluded(
+            "SELECT now() - pg_postmaster_start_time() >= make_interval(mins => 1)"
+        ));
+        // User queries → must NOT be excluded
+        assert!(!excluded(
+            "SELECT id, customer_id, total_amount FROM orders WHERE shipping_method = $1"
+        ));
+        // Word boundary: a user table with a `pg`-like name must survive
+        assert!(!excluded("SELECT * FROM my_spg_table WHERE x = 1"));
+    }
+
+    #[test]
     fn test_truncate_query_multibyte_safe() {
         let long = "中".repeat(300);
         let t = truncate_query(&long);
         assert!(t.len() <= 200 + 3); // 200 + "..."
         assert!(t.ends_with("..."));
         // No panic = cut on a valid character boundary
+    }
+
+    // ── bloat_score_from_leaf_density ─────────────────────────────────
+    // Anchors below were measured on PostgreSQL 16 / pgstattuple 1.5.
+
+    #[test]
+    fn test_bloat_score_healthy_indexes_score_near_zero() {
+        // Measured leaf fills of healthy (freshly built) indexes:
+        // 89.80, 89.83, 89.92, 90.05 — all must score well below the
+        // 50 % proposal threshold.
+        for d in [0.8980, 0.8983, 0.8992, 0.9005, 0.95, 1.0] {
+            assert!(
+                bloat_score_from_leaf_density(d) < 0.02,
+                "healthy fill {d} should score < 0.02"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bloat_score_worst_case_scores_at_most_one() {
+        // 50 % churn + VACUUM anchors: 45.06 % (clean table), and the
+        // demo acceptance state: 45.13 % (pkey), 45.87 %, 46.64 %, 51.97 %
+        // — all score ~1.0 (the maximum).
+        for d in [0.4506, 0.4513, 0.4587, 0.4664, 0.5197] {
+            assert!(
+                bloat_score_from_leaf_density(d) > 0.84,
+                "worst-case fill {d} should score > 0.84"
+            );
+        }
+        // At and below the worst-case anchor → clamped to exactly 1.0
+        assert!((bloat_score_from_leaf_density(0.45) - 1.0).abs() < 1e-9);
+        assert!((bloat_score_from_leaf_density(0.30) - 1.0).abs() < 1e-9);
+        assert!((bloat_score_from_leaf_density(0.0) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_bloat_score_all_demo_acceptance_values_pass_threshold() {
+        // Real densities measured on the demo database in the acceptance
+        // scenario (50 % churn → VACUUM → ANALYZE), against the 50 %
+        // threshold of sql/pgindexai.test.yaml.
+        for d in [0.4513, 0.4587, 0.4664, 0.5197] {
+            let score = bloat_score_from_leaf_density(d) * 100.0;
+            assert!(score >= 50.0, "density {d} → score {score} must be >= 50");
+        }
+        // The worst case of the demo (idx_items_order, 51.97 % fill):
+        let s = bloat_score_from_leaf_density(0.5197) * 100.0;
+        assert!((s - 84.5).abs() < 0.2, "expected ~84.5, got {s}");
+    }
+
+    #[test]
+    fn test_bloat_score_linear_interpolation() {
+        // 67.5 % is exactly the midpoint of [45 %, 90 %] → 0.5
+        assert!((bloat_score_from_leaf_density(0.675) - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_bloat_score_nan_and_out_of_range_are_safe() {
+        // NaN / infinities must never leak into the score (no panic, no NaN)
+        assert_eq!(bloat_score_from_leaf_density(f64::NAN), 0.0);
+        assert_eq!(bloat_score_from_leaf_density(f64::INFINITY), 0.0);
+        assert_eq!(bloat_score_from_leaf_density(f64::NEG_INFINITY), 0.0);
+        // Out-of-range inputs are clamped to [0, 1]
+        assert!((bloat_score_from_leaf_density(-0.5) - 1.0).abs() < 1e-9);
+        assert_eq!(bloat_score_from_leaf_density(1.5), 0.0);
     }
 }

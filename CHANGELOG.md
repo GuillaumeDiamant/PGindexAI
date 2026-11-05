@@ -5,6 +5,59 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Vacuum-resistant fragmentation detection (physical bloat criterion)**: when
+  the optional `pgstattuple` extension is installed, detector #2 now also
+  measures the actual B-tree leaf page fill (`pgstatindex()`, one full index
+  scan per index above 100 pages — cost guard) and maps it to a score with
+  empirically calibrated anchors (healthy ≈ 90 % fill → 0, worst case ≈ 45 % → 1,
+  linear in between). Unlike the catalog statistics, this is **not reset by
+  VACUUM/ANALYZE/autovacuum** — a bloated index is now detected even after
+  maintenance has reclaimed the dead tuples.
+- **`thresholds.use_index_bloat`** config knob (default `true`): set to `false`
+  to restore the previous behavior (legacy heuristic only).
+- **Startup check for `pgstattuple`** — warn-only (absence does not degrade the
+  daemon; detector #2 falls back to the legacy heuristic, and a probe failure
+  disables only the physical criterion for the current cycle).
+- `sql/demo_schema.sql` now also runs `CREATE EXTENSION IF NOT EXISTS pgstattuple`,
+  so detector #2's physical criterion works out of the box in the demo.
+
+### Fixed
+
+- **Detector #2 was blind to bloat after VACUUM/ANALYZE**: the legacy score is
+  built from `n_dead_tup` / `n_mod_since_analyze`, which autovacuum resets — a
+  physically bloated index (half-empty leaf pages) scored 0. The final score is
+  now `max(legacy, physical)`, with the legacy heuristic untouched as the
+  fallback (no regression when `pgstattuple` is absent).
+- `FragmentationInfo.leaf_density` was an **estimate** derived from
+  `pg_class.reltuples/relpages` (unreliable — e.g. multi-TID leaf items make it
+  look like > 100 % "density"); it is now the **measured** leaf fill (0..1
+  fraction), or `None` when the probe is unavailable.
+- **Detector #3 (SARGable) could be blinded by the daemon's own queries**: the
+  `pg_stat_statements` filter that excludes the daemon's internal catalog
+  queries used `\b` as a "word boundary" — but in PostgreSQL's regex dialect
+  `\b` is a **literal backspace**, so the filter never matched. The daemon's
+  own high-call queries then dominated the `calls × time` ranking window and
+  could push real user queries out of it (demo: 0 `CREATE INDEX` proposals
+  instead of 4 — and it worsens the longer the daemon runs). Fixed with the
+  correct ARE syntax (`\y` word boundary + `[\s\S]` to span newlines),
+  extended to `information_schema`, plus a safety-net skip of `pg_catalog` /
+  `information_schema` / `pg_toast` tables in the proposal loop and a live
+  regression test.
+
+### Changed
+
+- `sql/README.md` — "Triggering the fragmentation detector" rewritten: honest
+  documentation of the legacy criterion's limitation (counters reset by
+  VACUUM/ANALYZE), the new scoring, the vacuum-proof trigger recipe (churn →
+  VACUUM → 4 verified `REINDEX` proposals), the autovacuum caveat, the
+  pgstattuple prerequisite and the `use_index_bloat` knob.
+- `README.md` — fragmentation detector section and configuration reference
+  updated to match.
+
 ## [0.1.2] - 2026-11-04
 
 ### Added

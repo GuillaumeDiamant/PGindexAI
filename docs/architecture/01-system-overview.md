@@ -170,12 +170,14 @@ on the strength of the evidence.
 
 ### 5.2 Fragmented indexes
 
-**Source** : `pg_stat_user_indexes` + `pg_index` + `pg_class` + `pg_am` + `pg_stat_user_tables`
+**Source** : `pg_stat_user_indexes` + `pg_index` + `pg_class` + `pg_am` + `pg_stat_user_tables` (+ optionally `pgstattuple`)
 
 **Scope (new)**: **B-tree indexes only** (`amname = 'btree'`) —
 GiST/GIN/SP-GiST/BRIN indexes do not have the same notion of fragmentation.
 
-**Heuristic score** (weighted multi-criteria):
+**Score** = `max(legacy, physical)` — the strongest signal wins:
+
+*Legacy heuristic* (catalog statistics — **reset by VACUUM/ANALYZE**):
 
 | Criterion | Weight |
 |---------|-------------|
@@ -183,10 +185,15 @@ GiST/GIN/SP-GiST/BRIN indexes do not have the same notion of fragmentation.
 | `n_mod_since_analyze / n_live_tup` (capped at 1.0) | 30 % |
 | Bonus: large unscanned index (`idx_scan = 0` AND `relpages > 100`) | 20 % |
 
+*Physical bloat* (optional, `pgstattuple`, `use_index_bloat`): measured leaf
+fill via `pgstatindex()` (indexes > 100 pages — cost guard), mapped linearly —
+healthy ≈ 90 % → 0, worst case ≈ 45 % → 1. **Not reset by VACUUM/ANALYZE** —
+the only criterion that sees bloat left by autovacuum.
+
 **Decision threshold**: `fragmentation_pct ≥ thresholds.fragmentation_pct` (default 70 %)
 
-**avg_leaf_density**: `index_tuples / index_pages / 100` bounded to `[0, 1]`
-(proxy for tuples/page density; PostgreSQL B-tree targets ~90 % fill)
+**leaf_density**: measured leaf fill (0..1 fraction), `None` when the probe
+is unavailable (no extension / index < 100 pages / probe failure)
 
 **Proposed action**: `REINDEX INDEX CONCURRENTLY schema.index`
 

@@ -31,6 +31,11 @@ thresholds:
                            # of an unused index — the counters are reset on
                            # PG restart: do not go too low.
   fragmentation_pct: 70    # % of fragmentation triggering a REINDEX CONCURRENTLY (1..=100)
+  use_index_bloat: true    # Physical bloat detection via pgstattuple (leaf fill
+                           # measured on indexes > 100 pages — one full index scan
+                           # per index). false = legacy heuristic only (blind to
+                           # bloat left by VACUUM). Requires: CREATE EXTENSION
+                           # pgstattuple + superuser or pg_stat_scan_tables.
   min_sargable_rows: 100   # Min. executions (pg_stat_statements.calls) for a
                            # query to be a candidate for a SARGable index (>= 1)
   min_confidence: 0.7      # Minimum Laya confidence to apply (0.0..=1.0)

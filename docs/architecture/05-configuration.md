@@ -57,6 +57,7 @@ thresholds:
   cycle_seconds: 60                # Cycle frequency (1..=86400)
   unused_minutes: 10080            # Observation window (default 7 days)
   fragmentation_pct: 70            # Fragmentation % (1..=100)
+  use_index_bloat: true            # Physical bloat via pgstattuple (leaf fill)
   min_sargable_rows: 100           # Min. executions (pg_stat_statements.calls)
   min_confidence: 0.7              # Min. Laya confidence for APPLY (0.0..=1.0)
   max_proposals_per_cycle: 20      # Proposal budget per cycle (1..=1000)
@@ -129,6 +130,7 @@ index_logging:
 | `thresholds.cycle_seconds` | `60` | `1..=86400` |
 | `thresholds.unused_minutes` | `10080` (7 d) | `>= 1` |
 | `thresholds.fragmentation_pct` | `70` | `1..=100` |
+| `thresholds.use_index_bloat` | `true` | bool |
 | `thresholds.min_sargable_rows` | `100` | `>= 1` |
 | `thresholds.min_confidence` | `0.7` | `0.0..=1.0` |
 | `thresholds.max_proposals_per_cycle` | `20` | `1..=1000` |
@@ -180,6 +182,7 @@ The client uses **rustls** (`tokio-postgres-rustls`). Consequences:
 | `pg_pool.wait_timeout_ms` | If the pool is saturated, the wait is bounded |
 | `density_by_type.*` | Used only for the **size estimation** of future indexes sent to the Laya decision context — no effect on detection |
 | `thresholds.unused_minutes` | **Minimum observation window**: if the PG server has been up for less than this delay, the "unused indexes" analysis is skipped (the `pg_stat_*` counters are reset at restart) |
+| `thresholds.use_index_bloat` | `true` = the fragmentation detector also measures **physical B-tree bloat** via `pgstattuple` (the only criterion that survives VACUUM/ANALYZE/autovacuum). `false` = legacy catalog-statistics heuristic only. Absence of the extension never degrades the daemon — it only disables this criterion (warning at startup) |
 | `thresholds.min_confidence` | Laya confidence threshold; **below it, the proposal is ignored (no heuristic fallback)** |
 | `thresholds.max_proposals_per_cycle` | Each detector is bounded in SQL (`LIMIT`) **and** the total list is truncated to this budget with a warning (dropped proposals will be re-detected on the next cycle) |
 | `thresholds.ddl_timeout_seconds` | Bounds the duration of `CONCURRENTLY` builds (`statement_timeout` per session, reset afterwards); `0` = unlimited. Keep it generous: a too-short timeout on a large table would create a build→cancelled→retry loop |

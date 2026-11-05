@@ -9,7 +9,7 @@ required. Everything here is safe to run repeatedly: it creates its own
 
 | File               | What it does |
 |--------------------|--------------|
-| `demo_schema.sql`  | Creates the `pgindexai_demo` database, **5 tables** (≈ 772k rows) and **23 indexes**, and enables `pg_stat_statements`. |
+| `demo_schema.sql`  | Creates the `pgindexai_demo` database, **5 tables** (≈ 772k rows) and **23 indexes**, and enables `pg_stat_statements` + `pgstattuple`. |
 | `demo_workload.sql`| **8 phases** of realistic queries + heavy DML that put the 3 detectors in a position to find something. |
 | `pgindexai.test.yaml` | Ready-to-use test config (peer-auth `postgres` user, lowered thresholds, no log file). |
 
@@ -18,7 +18,7 @@ required. Everything here is safe to run repeatedly: it creates its own
 | # | Detector | What the demo makes it find | Action the daemon proposes |
 |---|----------|------------------------------|----------------------------|
 | 1 | **Unused indexes** | Indexes never scanned since the counters' reset (`idx_scan = 0`), e.g. `idx_products_stock`, `idx_customers_city` | `DROP INDEX IF EXISTS …` |
-| 2 | **Fragmented indexes** | B-tree indexes on `orders`/`order_items` after heavy DML *(timing-dependent — see below)* | `REINDEX INDEX CONCURRENTLY …` |
+| 2 | **Fragmented indexes** | Physically bloated B-trees on `order_items` after churn — leaf fill measured via `pgstattuple`, so it fires **even after VACUUM/ANALYZE** | `REINDEX INDEX CONCURRENTLY …` |
 | 3 | **Unindexed SARGable queries** | High-frequency filterable columns with no covering index, e.g. `orders.shipping_method`, `users.is_active` | `CREATE INDEX …` |
 
 > **No-fallback guarantee:** the daemon *detects, generates and logs* proposals
@@ -38,6 +38,17 @@ required. Everything here is safe to run repeatedly: it creates its own
   file).
   - Required for detector **#3**. Without it the daemon runs in **degraded**
     mode (detectors #1 and #2 still work).
+- **`pgstattuple`** (optional, recommended): powers the **physical bloat
+  criterion** of detector **#2** (measured B-tree leaf fill — the only
+  criterion that survives VACUUM/ANALYZE/autovacuum).
+  - `demo_schema.sql` creates it in the demo database automatically (no-op if
+    already present). No `shared_preload_libraries` entry needed — it is a
+    regular contrib extension.
+  - Since pgstattuple 1.5, the calling role must be a **superuser** or a
+    member of **`pg_stat_scan_tables`** (the test config connects as
+    `postgres`, so it works out of the box).
+  - Without it, detector #2 degrades gracefully to the legacy heuristic alone
+    — see [Triggering the fragmentation detector](#triggering-the-fragmentation-detector).
 - **The binary**: build it (`cargo build --release`) or use the installed
   `pgindexai` (`install.sh` places it at `/usr/local/bin/pgindexai`).
 - **(Optional) Laya server** on a local port — **required only to apply DDL**.
@@ -74,7 +85,7 @@ psql -U postgres -v ON_ERROR_STOP=1 -f sql/demo_schema.sql
 
 This:
 - creates the `pgindexai_demo` database (skips creation if it already exists),
-- enables `pg_stat_statements` (no-op if already present),
+- enables `pg_stat_statements` and `pgstattuple` (no-ops if already present),
 - creates **5 tables** and loads **≈ 772k rows**,
 - creates **23 indexes** (several intentionally left unused),
 - runs `ANALYZE` and prints a summary.
@@ -154,20 +165,20 @@ output is plain log lines you can read directly; if you switch to
 
 ## What to expect (verified output)
 
-On a freshly loaded demo, `pgindexai run --dry-run` produces **7 or 8 proposals**
-(3 `CREATE` + 4 or 5 `DROP`). Both variants are verified; the difference is
+On a freshly loaded demo, `pgindexai run --dry-run` produces **8 or 9 proposals**
+(4 `CREATE` + 4 or 5 `DROP`). Both variants are verified; the difference is
 `idx_items_date`, see below. Example of the 8-proposal run:
 
 ```
 INFO  Analysis complete: 8 proposals generated
-INFO  Proposal: [DROP INDEX]   idx_items_date      on public.order_items  (1761280 bytes)
 INFO  Proposal: [DROP INDEX]   idx_customers_email on public.customers   ( 696320 bytes)
 INFO  Proposal: [DROP INDEX]   idx_products_sku    on public.products    ( 180224 bytes)
 INFO  Proposal: [DROP INDEX]   idx_customers_city  on public.customers   (  98304 bytes)
 INFO  Proposal: [DROP INDEX]   idx_products_stock  on public.products    (  90112 bytes)
 INFO  Proposal: [CREATE INDEX] SARGable public.orders.shipping_method (1000 calls, varchar)
-INFO  Proposal: [CREATE INDEX] SARGable public.users.is_active        ( 800 calls, boolean)
+INFO  Proposal: [CREATE INDEX] SARGable public.orders.total_amount    ( 800 calls, numeric)
 INFO  Proposal: [CREATE INDEX] SARGable public.products.is_active     ( 800 calls, boolean)
+INFO  Proposal: [CREATE INDEX] SARGable public.users.is_active        ( 800 calls, boolean)
 INFO  DRY-RUN: skipping Laya + DDL — 8 proposal(s) NOT applied
 ```
 
@@ -181,14 +192,17 @@ Reading it:
   and drops out of the list (verified: 3 scans / 250 004 tuples in one run →
   4 `DROP`s total; 0 scans in another run → 5 `DROP`s). Both outcomes are
   correct daemon behavior.
-- **3 × `CREATE INDEX`** → detector #3 found three high-frequency filterable
-  columns with no covering index. `orders.shipping_method` is the intended
-  "missing index" target; `users.is_active` / `products.is_active` are
-  legitimate low-selectivity booleans the detector also surfaces. (The
-  workload also prepares `orders.total_amount` as a second missing-index
-  target — phase 7e; whether it makes the top-N candidate set depends on the
-  `calls × mean_exec_time` ranking, so the exact set can vary.)
-- **`REINDEX`** (detector #2) may be **absent** right after a fresh load — see
+- **4 × `CREATE INDEX`** → detector #3 found four high-frequency filterable
+  columns with no covering index. `orders.shipping_method` and
+  `orders.total_amount` (phase 7e) are the intended "missing index" targets;
+  `users.is_active` / `products.is_active` are legitimate low-selectivity
+  booleans the detector also surfaces. (The other SARGable columns of the
+  workload — `orders.status`, `products.category`, `users.role`,
+  `customers.country` — already have covering indexes in the demo schema and
+  are correctly *not* proposed.)
+- **`REINDEX`** (detector #2) is **absent** right after a fresh load — the
+  indexes are healthy (~90 % leaf fill, score ≈ 0) and the legacy counters are
+  ~0 after the final `ANALYZE`. Churn + `VACUUM` to trigger it — see
   [Triggering the fragmentation detector](#triggering-the-fragmentation-detector).
 
 ## Verifying the DDL was actually applied (after a non-dry run)
@@ -217,25 +231,82 @@ SQL
 
 ## Triggering the fragmentation detector
 
-Detector #2 scores fragmentation from **table** statistics
-(`n_dead_tup`, `n_mod_since_analyze`). The workload runs `VACUUM FULL` (phase 6)
-and ends with `ANALYZE`, which **leaves those counters at ~0** — so a freshly
-loaded demo usually does **not** cross the fragmentation threshold. That is
-expected, not a bug.
+Detector #2 combines two criteria; the **final score is the maximum of the two**
+(the strongest signal wins, and the legacy criterion alone is the fallback):
 
-To make the daemon propose a `REINDEX`, generate post-analyze churn on a big
-table and then run the cycle (verified — produces 4 `REINDEX` proposals):
+| Criterion | Source | Reset by VACUUM / ANALYZE? |
+|-----------|--------|----------------------------|
+| **A — catalog statistics** (legacy): dead-tuple ratio (50 %) + modifications-since-analyze (30 %) + large never-scanned bonus (20 %) | `pg_stat_user_tables` | **Yes** — the counters return to ~0, so the score drops to ~0 |
+| **B — physical bloat** (optional, `pgstattuple`): measured B-tree leaf page fill | `pgstatindex()` — one full index scan per call, only on indexes > 100 pages (cost guard) | **No** — the free space stays on the leaf pages until a REINDEX |
+
+Criterion B is mapped to a 0–1 score with empirically calibrated anchors
+(PostgreSQL 16 / pgstattuple 1.5, measured on real data, 100k–250k-row tables):
+
+- **healthy index ≈ 90 % leaf fill** (measured 89.8 – 90.1 %) → score ≈ 0
+- **worst case ≈ 45 %** (50 % of the rows churned, then VACUUM — the index is
+  ≈ 2× the size of the healthy one; REINDEX reclaims about half) → score = 1
+- in between: linear (e.g. 67.5 % fill → 0.5)
+
+> **Honest limitation of criterion A:** PostgreSQL resets `n_dead_tup` and
+> `n_mod_since_analyze` on VACUUM/ANALYZE — and **autovacuum does both in
+> production**. A physically bloated index (leaf pages half full) therefore
+> scores **0** with the legacy heuristic right after autovacuum ran. Criterion B
+> exists precisely to close that blind spot. When `pgstattuple` is missing — or
+> `use_index_bloat: false`, or the probe fails — the detector degrades
+> gracefully to criterion A alone (the pre-v0.2 behavior; the daemon does not
+> degrade, it only warns at startup).
+
+### Recommended recipe (vacuum-proof)
+
+The workload ends with `VACUUM FULL` + `ANALYZE`, so a freshly loaded demo does
+**not** cross the fragmentation threshold (expected, not a bug). To make the
+daemon propose `REINDEX`es, churn a big table **and let maintenance run** — the
+dead tuples are reclaimed (criterion A goes blind) but the leaf pages stay half
+empty (criterion B catches them). Verified — produces exactly 4 `REINDEX`
+proposals:
 
 ```bash
-# create churn: delete ~half of order_items (dead tuples + modifications
-# since the last ANALYZE)
+# 1. Churn: delete ~half of order_items
 psql -U postgres -d pgindexai_demo -c "DELETE FROM order_items WHERE id % 2 = 0;"
 
+# 2. Let maintenance run — this is the point of the test:
+#    criterion A's counters reset, criterion B still sees the bloat
+psql -U postgres -d pgindexai_demo -c "VACUUM ANALYZE order_items;"
+
+# 3. Analyze
+pgindexai run --dry-run -c sql/pgindexai.test.yaml | grep -i 'REINDEX'
+```
+
+Verified output (leaf fill measured by the daemon via pgstattuple):
+
+```
+INFO  Proposal: [REINDEX] Index public.order_items_pkey  fragmentation at 99.7% (threshold: 50%). Pages: 689, leaf fill: 45.1% (healthy ~90%).
+INFO  Proposal: [REINDEX] Index public.idx_items_order   fragmentation at 84.5% (threshold: 50%). Pages: 550, leaf fill: 52.0% (healthy ~90%).
+INFO  Proposal: [REINDEX] Index public.idx_items_product fragmentation at 98.1% (threshold: 50%). Pages: 220, leaf fill: 45.9% (healthy ~90%).
+INFO  Proposal: [REINDEX] Index public.idx_items_date    fragmentation at 96.4% (threshold: 50%). Pages: 215, leaf fill: 46.6% (healthy ~90%).
+```
+
+> **Autovacuum caveat:** on a real (non-demo) database autovacuum may run
+> between your churn and the analysis cycle — that is fine, that is exactly the
+> scenario the physical criterion is built for. If you specifically want to test
+> the *legacy-only* path (criterion A), stop autovacuum interfering for the
+> test: `ALTER TABLE order_items SET (autovacuum_enabled = false);`
+
+### Legacy-only recipe (no `pgstattuple` installed)
+
+Without the extension, criterion A must do the scoring, so its counters must
+**not** be reset — churn, and do **not** VACUUM/ANALYZE (and disable autovacuum
+for the test, see above):
+
+```bash
+psql -U postgres -d pgindexai_demo -c "DELETE FROM order_items WHERE id % 2 = 0;"
 # do NOT VACUUM/ANALYZE — the counters must stay high
 pgindexai run --dry-run -c sql/pgindexai.test.yaml | grep -i 'REINDEX'
 ```
 
-Verified output:
+Verified output (legacy score = 50 % dead-tuple ratio + 30 %
+modifications-since-analyze + the 20 % never-scanned bonus for the pkey and
+`idx_items_date`):
 
 ```
 INFO  Proposal: [REINDEX] Index public.order_items_pkey fragmentation at 75.0% (threshold: 50%).
@@ -243,11 +314,6 @@ INFO  Proposal: [REINDEX] Index public.idx_items_order  fragmentation at 55.0% (
 INFO  Proposal: [REINDEX] Index public.idx_items_product fragmentation at 55.0% (threshold: 50%).
 INFO  Proposal: [REINDEX] Index public.idx_items_date    fragmentation at 75.0% (threshold: 50%).
 ```
-
-How the score is built (50 % dead-tuple ratio + 30 % modifications-since-analyze
-+ a 20 % bonus for large never-scanned indexes), with the test config's
-`fragmentation_pct: 50`: the `order_items` indexes cross the line — `idx_items_date`
-and the pkey even get the bonus.
 
 ---
 
@@ -279,9 +345,12 @@ for a fast, local, no-secret test:
 
 - connects as **`postgres`** (peer auth, **no password** needed) — simplest for
   a local test; the daemon and the demo objects are then both owned by the same
-  role, so DDL permissions always work;
+  role, so DDL permissions always work (and `postgres` can call
+  `pgstatindex()` — superuser);
 - lowers the thresholds so the detectors fire quickly
   (`unused_minutes: 1`, `fragmentation_pct: 50`);
+- enables the physical bloat criterion (`use_index_bloat: true`) —
+  `demo_schema.sql` installs `pgstattuple` in the demo database;
 - disables the index-operation log file (no `/var/log` write needed).
 
 To test with the **dedicated `pgindexai` role** instead (closer to production),
@@ -318,6 +387,7 @@ thresholds:
   cycle_seconds: 30
   unused_minutes: 1             # LOW for the test (default 10080 = 7 days)
   fragmentation_pct: 50         # LOWER for the test (default 70)
+  use_index_bloat: true         # physical bloat via pgstattuple (installed by demo_schema.sql)
   min_sargable_rows: 100
   min_confidence: 0.7
   max_proposals_per_cycle: 20
@@ -361,8 +431,16 @@ restarted, the gate suppresses it (to avoid false-positive DROPs). For testing,
 set `unused_minutes: 1` (as the test config does).
 
 ### No `REINDEX` proposals (detector #2 silent)
-See [Triggering the fragmentation detector](#triggering-the-fragmentation-detector)
-— it is intentionally timing-dependent.
+Two possible causes — see
+[Triggering the fragmentation detector](#triggering-the-fragmentation-detector)
+for the recipes:
+- **`pgstattuple` missing** (or `use_index_bloat: false`) → only the legacy
+  heuristic runs, and it is blind right after VACUUM/ANALYZE (counters reset).
+  Install the extension: `CREATE EXTENSION IF NOT EXISTS pgstattuple;` (or
+  `psql -f sql/demo_schema.sql` again on the demo database).
+- **The index is below the 100-page cost guard** — `pgstatindex()` performs a
+  full index scan per call, so small indexes are not physically measured (the
+  legacy criterion can still score them).
 
 ### No `CREATE INDEX` proposals (detector #3 silent)
 - **`pg_stat_statements` missing** → the daemon is in **degraded** mode and

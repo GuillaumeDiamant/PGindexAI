@@ -172,7 +172,12 @@ impl Analyzer {
     async fn analyze_fragmentation(
         &self,
     ) -> Result<Vec<Proposal>, Box<dyn std::error::Error + Sync + Send>> {
-        let fragmented = queries::get_fragmented_indexes(&self.pool, self.cap() as i64).await?;
+        let fragmented = queries::get_fragmented_indexes(
+            &self.pool,
+            self.cap() as i64,
+            self.config.thresholds.use_index_bloat,
+        )
+        .await?;
         let mut proposals = Vec::new();
         let threshold_pct = self.config.thresholds.fragmentation_pct;
 
@@ -185,15 +190,28 @@ impl Analyzer {
                     continue;
                 }
 
-                let reason = format!(
-                    "Index {}.{} fragmentation at {:.1}% (threshold: {}%). Pages: {}, avg leaf density: {:.2}.",
-                    idx.schemaname,
-                    idx.indexname,
-                    idx.fragmentation_pct,
-                    threshold_pct,
-                    idx.relpages,
-                    idx.avg_leaf_density
-                );
+                // When the physical bloat criterion (pgstattuple) was
+                // available, surface the measured leaf fill — the real
+                // evidence behind the score.
+                let reason = match idx.leaf_density {
+                    Some(d) => format!(
+                        "Index {}.{} fragmentation at {:.1}% (threshold: {}%). Pages: {}, leaf fill: {:.1}% (healthy ~90%).",
+                        idx.schemaname,
+                        idx.indexname,
+                        idx.fragmentation_pct,
+                        threshold_pct,
+                        idx.relpages,
+                        d * 100.0
+                    ),
+                    None => format!(
+                        "Index {}.{} fragmentation at {:.1}% (threshold: {}%). Pages: {}.",
+                        idx.schemaname,
+                        idx.indexname,
+                        idx.fragmentation_pct,
+                        threshold_pct,
+                        idx.relpages
+                    ),
+                };
 
                 let ddl = format!(
                     "REINDEX INDEX CONCURRENTLY {}.{}",
@@ -232,9 +250,18 @@ impl Analyzer {
         let mut proposals = Vec::new();
 
         for miss in missing {
-            // Ignore system catalogs (pg_*): we never index monitoring views
-            if miss.tablename.starts_with("pg_") {
-                debug!("Skipping system catalog table: {}", miss.tablename);
+            // Ignore system catalogs (pg_* tables) and system schemas:
+            // we never index monitoring views or information_schema views.
+            if miss.tablename.starts_with("pg_")
+                || matches!(
+                    miss.schemaname.as_str(),
+                    "pg_catalog" | "information_schema" | "pg_toast"
+                )
+            {
+                debug!(
+                    "Skipping system table {}.{}",
+                    miss.schemaname, miss.tablename
+                );
                 continue;
             }
 

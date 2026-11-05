@@ -218,6 +218,12 @@ pub struct Thresholds {
     /// Fragmentation threshold for proposing a rebuild (1..=100).
     #[serde(default = "default_fragmentation")]
     pub fragmentation_pct: u64,
+    /// Physical B-tree bloat detection via pgstattuple (`pgstatindex`,
+    /// full index scan on indexes above 100 pages). When `false` — or
+    /// when the extension is missing / the probe fails — the detector
+    /// falls back to the legacy heuristic alone (previous behavior).
+    #[serde(default = "default_true")]
+    pub use_index_bloat: bool,
     /// Minimum number of EXECUTIONS (pg_stat_statements.calls) of a query
     /// for it to be a candidate for a SARGable index.
     /// (The historical name `min_sargable_rows` is kept for compatibility.)
