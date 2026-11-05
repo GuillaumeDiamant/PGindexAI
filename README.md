@@ -71,7 +71,7 @@ Automate the full PostgreSQL index optimization cycle:
 | **DaemonState** (`src/state.rs`) | `Healthy` / `Degraded` state — degrades missing-index detection if `pg_stat_statements` is absent |
 | **Naming** (`src/naming.rs`) | `idx_<table>_<col>` convention, identifier validation, 63-byte limit (short hash) |
 | **Detector : Unused Indexes** | Identifies indexes never scanned **since the last restart** + observation-window gate (server uptime) |
-| **Detector : Fragmentation** | **B-tree indexes only**; multi-criteria score (dead tuples 50%, unanalyzed modifications 30%, unused-index bonus 20%) |
+| **Detector : Fragmentation** | **B-tree indexes only**; `score = max(legacy catalog statistics, pgstattuple physical leaf fill)` — the physical criterion is the only one that survives VACUUM/ANALYZE |
 | **Detector : Missing SARGable** | AST parser (sqlparser) over `pg_stat_statements` + real types (`information_schema`) + `null_frac` (`pg_stats`) + target densities |
 | **Laya Client** (`src/laya/`) | HTTP communication with the Laya server (`/v1/systemone`) — `deep_health()` (real test payload), `decision()` |
 | **DDL Engine** (`src/ddl.rs`) | **Online** execution: `CONCURRENTLY` in auto-commit (CREATE/REINDEX), DROP in BEGIN/COMMIT, post-DDL validation + cleanup of INVALID indexes |
@@ -104,13 +104,36 @@ AND indisunique = false
 
 ### 2. Fragmented indexes
 
-PostgreSQL does not provide `avg_leaf_density` directly. PGindexAI uses a multi-criteria heuristic score on **B-tree indexes only** (`pg_am.amname = 'btree'` — GiST/GIN/BRIN indexes do not have the same notion of fragmentation):
+PGindexAI scores **B-tree indexes only** (`pg_am.amname = 'btree'` — GiST/GIN/BRIN indexes do not have the same notion of fragmentation). Two criteria are combined and **the final score is the maximum of the two** (the strongest signal wins; the legacy criterion alone is the fallback):
+
+**Criterion A — catalog statistics** (works with no extra extension):
 
 | Criterion | Weight |
 |---------|-------------|
 | `n_dead_tup / (n_live_tup + n_dead_tup)` | 50 % |
 | `n_mod_since_analyze / n_live_tup` (capped at 1.0) | 30 % |
 | Bonus: large unscanned index (`idx_scan = 0` AND `relpages > 100`) | 20 % |
+
+> **Known limitation:** these counters are **reset by VACUUM / ANALYZE** — and
+> autovacuum does both in production. A physically bloated index (leaf pages
+> half full) scores **0** with this criterion right after autovacuum ran.
+> Criterion B exists to close that blind spot.
+
+**Criterion B — physical bloat** (optional, requires the `pgstattuple` extension):
+
+The measured B-tree leaf page fill (`pgstatindex().avg_leaf_density`, one full
+index scan — only performed on indexes above **100 pages**, as a cost guard),
+mapped to a 0–1 score with empirically calibrated anchors:
+
+- healthy index ≈ **90 %** leaf fill → score ≈ 0
+- worst case ≈ **45 %** (50 % of the rows churned, then VACUUM — index ≈ 2× the healthy size) → score = 1
+- in between: linear
+
+The free space left by VACUUM stays on the leaf pages until a REINDEX — this
+criterion is **not reset by VACUUM/ANALYZE/autovacuum**. When `pgstattuple` is
+missing, `use_index_bloat: false`, or the probe fails, the detector degrades
+gracefully to criterion A alone (previous behavior; the daemon warns at startup
+but does not degrade).
 
 **Trigger threshold:** `score ≥ thresholds.fragmentation_pct` (default 70 %)
 
@@ -124,7 +147,8 @@ Analyzes `pg_stat_statements` to identify columns usable in an index, using a **
 Filters:
   - calls ≥ thresholds.min_sargable_rows (100)
   - !~ ^(CREATE|ALTER|DROP|DELETE|INSERT|UPDATE|BEGIN|COMMIT|...)
-  - !~ ^(SELECT|WITH).*\bpg_
+  - !~ ^(SELECT|WITH)[\s\S]*\y(pg_|information_schema\.)
+     (PostgreSQL ARE: `\y` is the word boundary, `\b` a literal backspace)
   - multi-schema scope (analysis.schemas, new)
 
 Detected SARGable patterns (AST):
@@ -180,6 +204,8 @@ thresholds:
   cycle_seconds: 60             # Analysis cycle frequency
   unused_minutes: 10080         # Observation window before a DROP proposal (7 days)
   fragmentation_pct: 70         # Fragmentation % that triggers a REBUILD
+  use_index_bloat: true         # Physical bloat detection via pgstattuple (leaf fill);
+                                # false = legacy catalog-statistics heuristic only
   min_sargable_rows: 100        # Minimum executions (pg_stat_statements.calls)
   min_confidence: 0.7           # Minimum Laya confidence to apply
   max_proposals_per_cycle: 20   # Proposal budget per cycle
@@ -444,7 +470,7 @@ Each cycle (default 60s):
 1. [Unused Indexes]  → server uptime gate (≥ unused_minutes)
                       → pg_stat_user_indexes → indexes never scanned
 
-2. [Fragmentation]   → pg_class + pg_am (btree) → multi-criteria heuristic score
+2. [Fragmentation]   → pg_class + pg_am (btree) → max(legacy stats, pgstattuple leaf fill)
 
 3. [SARGable]        → pg_stat_statements → parse AST (sqlparser)
                       → real types + null_frac + density → missing index

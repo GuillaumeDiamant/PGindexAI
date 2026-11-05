@@ -217,7 +217,7 @@ weigh its confidence on the strength of the evidence.
 > are cast (`relpages::bigint`, `reltuples::float8`) because the
 > postgres-types driver requires strict types (INT4/FLOAT4 are not widened).
 
-**Sources**: `pg_stat_user_indexes` + `pg_index` + `pg_class` + `pg_am` + `pg_stat_user_tables`
+**Sources**: `pg_stat_user_indexes` + `pg_index` + `pg_class` + `pg_am` + `pg_stat_user_tables` (+ optionally `pgstattuple` for the physical criterion)
 
 ```sql
 WITH index_info AS (
@@ -226,11 +226,10 @@ WITH index_info AS (
         pi.indrelid AS table_oid,
         s.relname AS tablename,
         s.indexrelname AS indexname,
+        s.indexrelid AS index_oid,
         pg_relation_size(s.indexrelid) / 8192 AS relpages,
         COALESCE(s.idx_tup_read, 0) AS idx_tup_read,
-        COALESCE(s.idx_scan, 0) AS idx_scan,
-        pc.relpages::bigint AS index_pages,
-        pc.reltuples::float8 AS index_tuples
+        COALESCE(s.idx_scan, 0) AS idx_scan
     FROM pg_stat_user_indexes s
     JOIN pg_index pi ON s.indexrelid = pi.indexrelid
     JOIN pg_class pc ON s.indexrelid = pc.oid
@@ -251,9 +250,8 @@ SELECT
     ii.schemaname,
     ii.tablename,
     ii.indexname,
+    ii.index_oid,
     ii.relpages,
-    ii.index_pages,
-    ii.index_tuples,
     ii.idx_scan,
     ts.n_live_tup,
     ts.n_dead_tup,
@@ -264,29 +262,55 @@ ORDER BY ii.relpages DESC
 LIMIT $1;   -- max_proposals_per_cycle (SQL-side budget, default 20)
 ```
 
-**Fragmentation score** (multi-criteria heuristic):
+**Fragmentation score** — final score = `max` of two criteria (the strongest
+signal wins; the legacy criterion alone is the fallback):
 
 ```
-frag_score = dead_ratio * 0.5
-            + min(mod_ratio, 1.0) * 0.3
-            + (idx_scan == 0 AND relpages > 100 ? 0.2 : 0.0)
+legacy_score = dead_ratio * 0.5
+             + min(mod_ratio, 1.0) * 0.3
+             + (idx_scan == 0 AND relpages > 100 ? 0.2 : 0.0)
 
+bloat_score  = clamp((0.90 − leaf_fill) / 0.45, 0, 1)   # if the pgstattuple probe succeeded
+
+frag_score = max(legacy_score, bloat_score)              # legacy_score alone when the probe is unavailable
 fragmentation_pct = min(frag_score * 100, 100)
 ```
 
-| Criterion | Formula | Weight |
+| Legacy criterion | Formula | Weight |
 |---------|---------|-------------|
 | Dead tuples | `n_dead_tup / (n_live_tup + n_dead_tup)` | 50% |
 | Non-analyzed modifications | `n_mod_since_analyze / n_live_tup` | 30% |
 | Non-scanned bonus | `idx_scan == 0 AND relpages > 100` | 20% |
 
+> **Known limitation of the legacy criterion**: these counters are **reset
+> by VACUUM / ANALYZE** — and autovacuum does both in production — so a
+> physically bloated index scores 0 right after maintenance. The physical
+> criterion below exists to close that blind spot.
+
+**Physical bloat criterion** (optional — `pgstattuple` extension,
+`thresholds.use_index_bloat`, default `true`):
+
+```
+leaf_fill = (pgstatindex(index_oid::regclass)).avg_leaf_density / 100.0
+```
+
+- `pgstatindex()` performs a **full index scan per call** → only measured on
+  indexes above **100 pages** (cost guard);
+- the parameter is passed as OID (`query_typed_opt` + `Type::OID` +
+  `$1::regclass` cast — an untyped `$1` would resolve to the `text` overload);
+- empirically calibrated anchors (PG 16 / pgstattuple 1.5, measured):
+  healthy index ≈ **90 %** fill → 0, worst case (50 % churn + VACUUM) ≈
+  **45 %** → 1, linear in between;
+- **not reset by VACUUM/ANALYZE** — the free space stays on the leaf pages
+  until a REINDEX;
+- first probe failure → warning + the criterion is disabled for the cycle
+  (graceful fallback, the daemon does not degrade).
+
 An index is proposed for REINDEX if `fragmentation_pct ≥ thresholds.fragmentation_pct` (default 70 %).
 
-**Estimated average density** (context sent to Laya):
-
-```
-avg_leaf_density = min(max(index_tuples / index_pages / 100, 0.0), 1.0)
-```
+**Measured leaf fill** (context sent to Laya):
+`FragmentationInfo.leaf_density` — 0..1 fraction, or `None` when the probe
+is unavailable (no extension / index < 100 pages / probe failure).
 
 ---
 
@@ -312,7 +336,7 @@ SELECT
 FROM pg_stat_statements s
 WHERE s.calls >= $3   -- thresholds.min_sargable_rows
   AND s.query !~* $1  -- ^(CREATE|ALTER|DROP|DELETE|INSERT|UPDATE|BEGIN|COMMIT|ROLLBACK|EXPLAIN|ANALYZE|VACUUM|GRANT|REVOKE|SET|SHOW)
-  AND s.query !~* $2  -- ^(SELECT|WITH).*\bpg_   (system catalogs excluded)
+  AND s.query !~* $2  -- ^(SELECT|WITH)[\s\S]*\y(pg_|information_schema\.)   (system catalogs excluded — PG ARE: \y = word boundary)
 ORDER BY (s.calls * GREATEST(s.mean_exec_time, 0.1)) DESC
 LIMIT $4             -- max_proposals_per_cycle (SQL-side budget)
 ```

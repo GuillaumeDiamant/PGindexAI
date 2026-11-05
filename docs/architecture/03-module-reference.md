@@ -208,7 +208,7 @@ return applied
 | Type | Key fields |
 |------|-------------|
 | `UnusedIndexInfo` | `schemaname`, `tablename`, `indexname`, `indexdef`, `idx_scan`, `idx_tup_read`, `idx_tup_fetch`, `size_bytes`, **`installed_at`** (server startup) |
-| `FragmentationInfo` | `schemaname`, `tablename`, `indexname`, `relpages`, `avg_leaf_density`, `fragmentation_pct` |
+| `FragmentationInfo` | `schemaname`, `tablename`, `indexname`, `relpages`, **`leaf_density`** (`Option<f64>`, measured 0..1), `fragmentation_pct` |
 | `MissingSargableIndex` | `schemaname`, `tablename`, `query_text`, `call_count`, `mean_exec_time_ms`, `min/max_exec_time_ms`, `sargable_columns` |
 | `SargableColumn` | `column_name`, **`column_type`**, **`is_nullable`**, **`null_frac`**, `filter_expr`, **`density_bucket`** |
 | `TableCardinality` | **`reltuples`**, **`relpages`** |
@@ -220,7 +220,8 @@ return applied
 | `observation_window_ok()` | `(pool, min_minutes) → bool` | **NEW** — `now() - pg_postmaster_start_time() >= make_interval(mins => $1)`; gate for the unused analysis |
 | `get_unused_indexes()` | `(pool, max_rows) → Vec<UnusedIndexInfo>` | `pg_stat_user_indexes` + `pg_index` (`idx_scan = 0 AND idx_tup_read = 0 AND indisvalid AND NOT indisprimary AND NOT indisunique`) + **`LIMIT $2`** (SQL-side budget) |
 | `get_existing_indexes()` | `(pool, schemas) → HashMap<(schema, table), Vec<(name, def)>>` | `pg_indexes` excluding system schemas, **multi-schema filtering on the Rust side** |
-| `get_fragmented_indexes()` | `(pool, max_rows) → Vec<FragmentationInfo>` | **B-tree only** (`pg_am`); 3-criteria score (dead 50%, mod 30%, bonus 20%); `::bigint`/`::float8` casts; **`LIMIT`** |
+| `get_fragmented_indexes()` | `(pool, max_rows, use_index_bloat) → Vec<FragmentationInfo>` | **B-tree only** (`pg_am`); score = **max**(legacy: dead 50% + mod 30% + bonus 20%, physical: `pgstattuple` leaf fill on indexes > 100 pages); **`LIMIT`** |
+| `bloat_score_from_leaf_density()` | `(d: f64) → f64` | **NEW** — maps a measured leaf fill (0..1) to a 0..1 score: `clamp((0.90 − d) / 0.45, 0, 1)`; anchors (PG 16 / pgstattuple 1.5, measured): healthy ≈ 90 % → 0, worst case ≈ 45 % → 1; NaN-safe |
 | `get_missing_sargable_indexes()` | `(pool, schemas, min_calls, max_queries) → Vec<MissingSargableIndex>` | `pg_stat_statements` (`calls ≥ min_calls`, **`LIMIT max_queries`**) → **sqlparser AST parse** → multi-schema scope → uncovered columns → **real types + `null_frac` enrichment** |
 | `get_table_cardinality()` | `(pool, schema, table) → TableCardinality` | `pg_class` via `to_regclass(format('%I.%I', $1::text, $2::text))`; `reltuples::float8`, `relpages::bigint` |
 | `index_exists()` | `(pool, schema, name) → bool` | `pg_indexes WHERE schemaname = $1 AND indexname = $2` |

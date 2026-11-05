@@ -17,6 +17,16 @@ WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = 'pgindexai_demo')
 -- Without it, the daemon runs in DEGRADED mode (missing-index detection off).
 CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
 
+-- ── Extension: pgstattuple (optional, used by the fragmentation detector) ─
+-- Powers the PHYSICAL bloat criterion of detector #2 (measured B-tree leaf
+-- fill — robust against VACUUM/ANALYZE, unlike the pg_stat_* counters).
+-- No-op if already present. Without it, detector #2 degrades gracefully to
+-- the legacy heuristic alone (see sql/README.md, "Triggering the
+-- fragmentation detector").
+-- Note: since pgstattuple 1.5, calling pgstatindex() requires SUPERUSER or
+-- membership in pg_stat_scan_tables (the test config connects as postgres).
+CREATE EXTENSION IF NOT EXISTS pgstattuple;
+
 -- ── Table: customers ─────────────────────────────────────────────────────
 DROP TABLE IF EXISTS orders, products, order_items, users CASCADE;
 

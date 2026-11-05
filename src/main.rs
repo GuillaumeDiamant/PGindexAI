@@ -74,6 +74,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
         warn!("Missing-index detection is DISABLED until the extension is installed.");
     }
 
+    // Check that pgstattuple is installed (OPTIONAL extension).
+    // Absence does NOT degrade the daemon: the fragmentation detector
+    // falls back to the legacy heuristic (which is blind to bloat left
+    // behind by VACUUM — see the physical bloat criterion in queries.rs).
+    check_pgstattuple(&pool).await;
+
     // Create the Laya client
     let laya = laya::LayaClient::new(&cfg.laya.url, cfg.laya.timeout_seconds);
 
@@ -244,5 +250,34 @@ async fn check_pg_stat_statements(
     } else {
         info!("pg_stat_statements is active");
         Ok(DaemonState::Healthy)
+    }
+}
+
+/// Check that pgstattuple is installed (OPTIONAL extension).
+/// Absence does NOT change the daemon state: the fragmentation detector
+/// degrades gracefully to the legacy heuristic (dead tuples + unanalyzed
+/// modifications), which underestimates bloat after VACUUM/ANALYZE.
+async fn check_pgstattuple(pool: &deadpool_postgres::Pool) {
+    let Ok(client) = pool.get().await else {
+        return;
+    };
+    let Ok(row) = client
+        .query_opt(
+            "SELECT 1 FROM pg_extension WHERE extname = 'pgstattuple'",
+            &[],
+        )
+        .await
+    else {
+        return;
+    };
+    if row.is_none() {
+        warn!("pgstattuple is NOT installed: PHYSICAL BLOAT detection is DISABLED.");
+        warn!("The fragmentation detector falls back to the legacy heuristic, which is");
+        warn!("blind to bloat left behind by VACUUM/ANALYZE (dead-tuple counters are reset).");
+        warn!("To enable:  CREATE EXTENSION pgstattuple;");
+        warn!("(since pgstattuple 1.5, the connection user must be a SUPERUSER");
+        warn!("or a member of pg_stat_scan_tables to call pgstatindex()).");
+    } else {
+        info!("pgstattuple is active (physical bloat detection enabled)");
     }
 }
