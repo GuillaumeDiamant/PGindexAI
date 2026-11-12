@@ -35,6 +35,11 @@ pub struct ActionQuestion {
 #[derive(Debug, Deserialize)]
 pub struct LayaResponse {
     pub answers: Answers,
+    /// Token accounting is OPTIONAL: the decision (`answers`) is what drives
+    /// the action. `#[serde(default)]` keeps a response parseable when a
+    /// Laya build omits `usage` (otherwise the whole cycle would fail at
+    /// deserialization even though the decision itself is valid and present).
+    #[serde(default)]
     pub usage: Usage,
 }
 
@@ -49,7 +54,7 @@ pub struct ActionAnswer {
     pub confidence: f64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 pub struct Usage {
     pub input_tokens: u32,
 }
@@ -134,4 +139,30 @@ where
         "REINDEX" => DecisionAction::RebuildIndex,
         _ => DecisionAction::Ignore,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: `usage` is OPTIONAL. A Laya response that omits it must
+    /// still deserialize — the decision (`answers`) is what drives the
+    /// action; before the fix the whole cycle failed at this point.
+    #[test]
+    fn test_response_without_usage_deserializes() {
+        let json = r#"{"answers": {"action": {"choice": "REINDEX", "confidence": 0.91}}}"#;
+        let resp: LayaResponse = serde_json::from_str(json).expect("missing usage must be OK");
+        assert_eq!(resp.answers.action.choice, "REINDEX");
+        assert!((resp.answers.action.confidence - 0.91).abs() < 1e-9);
+        assert_eq!(resp.usage.input_tokens, 0, "default = 0 tokens");
+    }
+
+    /// A response WITH `usage` still parses (no regression of the happy path).
+    #[test]
+    fn test_response_with_usage_deserializes() {
+        let json = r#"{"answers": {"action": {"choice": "IGNORE", "confidence": 0.2}},
+                       "usage": {"input_tokens": 42}}"#;
+        let resp: LayaResponse = serde_json::from_str(json).expect("usage must be OK");
+        assert_eq!(resp.usage.input_tokens, 42);
+    }
 }

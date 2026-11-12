@@ -27,7 +27,7 @@ actions:
 # Decision thresholds
 thresholds:
   cycle_seconds: 60        # Analysis cycle frequency (1..=86400)
-  unused_minutes: 10080    # Observation window (default 7 days) before DROP
+  unused_minutes: 10080    # Observation window (default 7 days) before DROP (max: 525600 = 1 year)
                            # of an unused index — the counters are reset on
                            # PG restart: do not go too low.
   fragmentation_pct: 70    # % of fragmentation triggering a REINDEX CONCURRENTLY (1..=100)
@@ -81,7 +81,7 @@ density_by_type:
 # Logging
 logging:
   level: "info"
-  format: "json"   # json | text
+  format: "json"   # json | plain ("text" is also accepted)
 
 # History of index operations (0640 file, rotation included)
 index_logging:

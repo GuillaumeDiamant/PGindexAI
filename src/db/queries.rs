@@ -95,10 +95,24 @@ pub async fn observation_window_ok(
     min_observation_minutes: u64,
 ) -> Result<bool, Box<dyn std::error::Error + Sync + Send>> {
     let client = pool.get().await?;
+    // `i32` because make_interval's `mins` argument is a 32-bit integer.
+    // `try_from` REJECTS a value beyond `i32::MAX` with a loud error —
+    // never a silent `u64 → i32` wrap into a NEGATIVE interval, which
+    // would make this check ALWAYS true and let "unused index" detection
+    // (and DROPs) fire right after a server restart, exactly when the
+    // pg_stat_* counters were just reset.
+    // `Config::validate` already caps `unused_minutes` at 525 600 (1 year),
+    // so in practice the value is always in range — belt-and-braces.
+    let mins: i32 = i32::try_from(min_observation_minutes).map_err(|_| {
+        format!(
+            "thresholds.unused_minutes {min_observation_minutes} exceeds the 32-bit range supported by make_interval (max {})",
+            i32::MAX
+        )
+    })?;
     let row = client
         .query_one(
             "SELECT now() - pg_postmaster_start_time() >= make_interval(mins => $1)",
-            &[&(min_observation_minutes as i32)],
+            &[&mins],
         )
         .await?;
     Ok(row.get::<_, bool>(0))
@@ -243,6 +257,23 @@ pub fn bloat_score_from_leaf_density(d: f64) -> f64 {
     ((HEALTHY_FILL - d) / (HEALTHY_FILL - WORST_FILL)).clamp(0.0, 1.0)
 }
 
+/// Legacy (catalog-based) fragmentation score (0..1):
+/// dead-tuples ratio × 0.5 + unanalyzed-modifications ratio × 0.3
+/// + a 0.2 bonus when the index is large (> 100 pages) and never scanned.
+///
+/// **Single source of truth** for this weighting: used by BOTH the initial
+/// analysis (`get_fragmented_indexes`) and the post-REINDEX re-validation
+/// (`Analyzer::get_index_fragmentation`). Keeping the weights in one place
+/// guarantees the two stay in sync — if one drifts, the re-validation
+/// would contradict the original decision.
+pub fn legacy_frag_score(dead_ratio: f64, mod_ratio: f64, idx_scan: i64, relpages: i64) -> f64 {
+    let mut score = dead_ratio * 0.5 + mod_ratio * 0.3;
+    if idx_scan == 0 && relpages > 100 {
+        score += 0.2;
+    }
+    score
+}
+
 /// Fetch the fragmented B-tree indexes
 ///
 /// Two criteria are combined, final score = `max` of the two:
@@ -331,6 +362,9 @@ pub async fn get_fragmented_indexes(
         let idx_scan: i64 = row.get("idx_scan");
 
         // ── Criterion A (legacy): catalog statistics ────────────────────
+        // Weighting (50/30/20) lives in `legacy_frag_score` — the single
+        // source of truth shared with the post-REINDEX re-validation.
+        //
         // 1. dead tuples ratio (50%)
         let total_tuples = (n_live_tup + n_dead_tup) as f64;
         let dead_ratio = if total_tuples > 0.0 {
@@ -338,7 +372,6 @@ pub async fn get_fragmented_indexes(
         } else {
             0.0
         };
-        let mut legacy_score = dead_ratio * 0.5;
 
         // 2. unanalyzed modifications (30%)
         let mod_ratio = if n_live_tup > 0 {
@@ -346,12 +379,9 @@ pub async fn get_fragmented_indexes(
         } else {
             0.0
         };
-        legacy_score += mod_ratio * 0.3;
 
-        // 3. large index never scanned (20%)
-        if idx_scan == 0 && relpages > 100 {
-            legacy_score += 0.2;
-        }
+        // 3. large index never scanned (20%) — folded into legacy_frag_score
+        let legacy_score = legacy_frag_score(dead_ratio, mod_ratio, idx_scan, relpages);
 
         // ── Criterion B (physical): measured leaf fill ──────────────────
         // `pgstatindex` performs a FULL INDEX SCAN per call, so we only
@@ -417,13 +447,44 @@ pub async fn get_fragmented_indexes(
     Ok(result)
 }
 
-/// Check whether a column is already covered in first position by an
-/// existing index on the table (indexdef parsing, no execution)
+/// Check whether a column is already covered by an existing index on the
+/// table (indexdef parsing, no execution).
+///
+/// The indexdef is parsed with `sqlparser`: robust against partial-index
+/// predicates `WHERE (…)`, expression indexes, `COLLATE`/`ASC`/`DESC`,
+/// `INCLUDE (…)`, `WITH (…)`. A bare `Identifier` in the column list counts
+/// as coverage; an **expression** column (e.g. `lower(email)`) does NOT
+/// cover a bare column (the index serves a different predicate).
+///
+/// Fallback (indexdef not parseable by sqlparser): the trailing
+/// `WHERE …` predicate — which always comes *after* the column list — is
+/// stripped before extracting the last parenthesized group.
 fn is_column_covered_by_index(indexdef: &str, column_name: &str) -> bool {
-    // The indexdef looks like: CREATE INDEX idx ON schema.table USING btree (col1, col2)
-    let upper = indexdef.to_uppercase();
+    let target = column_name.to_lowercase();
+
+    // ── Primary path: real parsing ─────────────────────────────────────
+    let dialect = sqlparser::dialect::PostgreSqlDialect {};
+    let dialect_ref: &dyn sqlparser::dialect::Dialect = &dialect;
+    if let Ok(statements) = sqlparser::parser::Parser::parse_sql(dialect_ref, indexdef) {
+        if let Some(sqlparser::ast::Statement::CreateIndex(ci)) = statements.first() {
+            return ci.columns.iter().any(|col| {
+                matches!(
+                    &col.expr,
+                    sqlparser::ast::Expr::Identifier(id)
+                        if id.value.to_lowercase() == target
+                )
+            });
+        }
+    }
+
+    // ── Fallback: string extraction, WHERE clause removed ──────────────
+    let stripped = match indexdef.rfind(" WHERE ") {
+        Some(pos) => &indexdef[..pos],
+        None => indexdef,
+    };
+    let upper = stripped.to_uppercase();
     if let Some(paren_open) = upper.rfind('(') {
-        let inner = &indexdef[paren_open + 1..];
+        let inner = &stripped[paren_open + 1..];
         if let Some(paren_close) = inner.find(')') {
             let columns = &inner[..paren_close];
             for col in columns.split(',') {
@@ -433,7 +494,7 @@ fn is_column_covered_by_index(indexdef: &str, column_name: &str) -> bool {
                     .trim_matches(|c| c == ' ' || c == '\t');
                 // Strip the operator/class (e.g.: col DESC, col COLLATE ...)
                 let col_name = cleaned.split_whitespace().next().unwrap_or(cleaned);
-                if col_name.to_lowercase() == column_name.to_lowercase() {
+                if col_name.to_lowercase() == target {
                     return true;
                 }
             }
@@ -1053,13 +1114,46 @@ pub fn resolve_index_method(operator: &str, data_type: &str) -> &'static str {
     "gin"
 }
 
-/// Check whether a LIKE pattern is a prefix ('abc%') → SARGable
+/// Check whether a LIKE pattern is B-tree SARGable:
+/// - a plain literal (`'abc'`) — equivalent to `=`, or
+/// - a literal prefix + a single TRAILING `%` (`'abc%'`).
+///
+/// Any other wildcard defeats a B-tree scan:
+/// - leading `%` (`'%abc'`) or mid-string `%` (`'ab%cd'`) → trigram GIN only,
+/// - single-char `_` (`'ab_cd'`) → matches any character, no prefix.
+///
+/// Backslash-escaped `\%` / `\_` are LITERALS (not wildcards) and allowed.
+///
+/// NB: `pattern` is the sqlparser AST — for a `LIKE` with a non-literal
+/// pattern (e.g. `LIKE other_col`) it is not a `Value` → not SARGable.
 fn like_pattern_is_prefix(pattern: &sqlparser::ast::Expr) -> bool {
     if let sqlparser::ast::Expr::Value(sqlparser::ast::Value::SingleQuotedString(s)) = pattern {
-        !s.starts_with('%') && !s.starts_with("\\%")
+        like_prefix_is_sargable(s)
     } else {
         false
     }
+}
+
+/// Core wildcard check on the unquoted pattern value.
+///
+/// Scan rules (left to right):
+/// - `\x` → literal `x`, skip both characters (escaped wildcards are fine);
+/// - `%` → SARGable only if it is the LAST character AND at least one
+///   unescaped literal precedes it (`'%'` alone matches everything);
+/// - `_` → never SARGable (single-char wildcard);
+/// - end of input with no wildcard → exact match, SARGable.
+fn like_prefix_is_sargable(s: &str) -> bool {
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => i += 2,
+            '%' => return i == chars.len() - 1 && i > 0,
+            '_' => return false,
+            _ => i += 1,
+        }
+    }
+    true
 }
 
 // ─────────────────────────────────────────────
@@ -1638,5 +1732,100 @@ mod tests {
         // Out-of-range inputs are clamped to [0, 1]
         assert!((bloat_score_from_leaf_density(-0.5) - 1.0).abs() < 1e-9);
         assert_eq!(bloat_score_from_leaf_density(1.5), 0.0);
+    }
+
+    // ── like_prefix_is_sargable (wildcards anywhere defeat a B-tree) ───
+
+    #[test]
+    fn test_like_prefix_sargable_cases() {
+        // SARGable: plain literal, or literal prefix + single trailing %
+        assert!(like_prefix_is_sargable("abc"));
+        assert!(like_prefix_is_sargable("abc%"));
+        assert!(like_prefix_is_sargable("a%"));
+        // Escaped wildcards are LITERALS → still SARGable
+        assert!(like_prefix_is_sargable(r"ab\%")); // literal "ab%"
+        assert!(like_prefix_is_sargable(r"ab\_%")); // literal "ab_%"
+
+        // NOT SARGable: leading %, mid-string %, single-char _
+        assert!(!like_prefix_is_sargable("%")); // matches everything
+        assert!(!like_prefix_is_sargable("%abc"));
+        assert!(!like_prefix_is_sargable("ab%cd")); // regression: mid %
+        assert!(!like_prefix_is_sargable("ab_%")); // _ defeats the prefix
+        assert!(!like_prefix_is_sargable("ab_cd%"));
+    }
+
+    #[test]
+    fn test_like_mid_wildcard_is_not_proposed_end_to_end() {
+        // Regression: `LIKE 'ab%cd'` used to be marked SARGable → a B-tree
+        // was proposed that PostgreSQL can never use for that predicate.
+        let set = colset("SELECT * FROM public.t WHERE code LIKE 'ab%cd'");
+        assert!(!set.contains(&("public".to_string(), "t".to_string(), "code".to_string())));
+        // And the genuine prefix still is proposed
+        let set = colset("SELECT * FROM public.t WHERE code LIKE 'ab%'");
+        assert!(set.contains(&("public".to_string(), "t".to_string(), "code".to_string())));
+    }
+
+    // ── is_column_covered_by_index (partial / expression indexes) ──────
+
+    #[test]
+    fn test_index_coverage_simple_columns() {
+        let def = "CREATE INDEX idx ON public.t USING btree (a, b DESC)";
+        assert!(is_column_covered_by_index(def, "a"));
+        assert!(is_column_covered_by_index(def, "b"));
+        assert!(!is_column_covered_by_index(def, "c"));
+        // Case-insensitive
+        assert!(is_column_covered_by_index(def, "A"));
+    }
+
+    #[test]
+    fn test_index_coverage_partial_index_where_parens() {
+        // Regression (rfind('(') bug): the LAST paren group is inside the
+        // WHERE clause, not the column list. The column list is (a) — the
+        // WHERE mentions column b, which must NOT count as coverage.
+        let def = "CREATE INDEX idx ON public.t USING btree (a) WHERE (b > 5)";
+        assert!(is_column_covered_by_index(def, "a"));
+        assert!(!is_column_covered_by_index(def, "b"));
+
+        // Same column on both sides: coverage comes from the column list
+        let def = "CREATE INDEX idx ON public.t USING btree (a) WHERE a IS NULL";
+        assert!(is_column_covered_by_index(def, "a"));
+        assert!(!is_column_covered_by_index(def, "b"));
+    }
+
+    #[test]
+    fn test_index_coverage_expression_index() {
+        // An expression index does NOT cover the bare column underneath
+        // (it serves a different predicate: lower(email) ≠ email).
+        let def = "CREATE INDEX idx ON public.t USING btree ((lower(email)))";
+        assert!(!is_column_covered_by_index(def, "email"));
+    }
+
+    #[test]
+    fn test_index_coverage_unique_and_include() {
+        let def = "CREATE UNIQUE INDEX idx ON public.t USING btree (a) INCLUDE (b) WHERE c > 0";
+        assert!(is_column_covered_by_index(def, "a"));
+        // b is in INCLUDE (covered columns) — the check is about the
+        // *key* columns; conservatively we do not count it.
+        assert!(!is_column_covered_by_index(def, "c"));
+    }
+
+    // ── legacy_frag_score (shared 50/30/20 weighting) ──────────────────
+
+    #[test]
+    fn test_legacy_frag_score_weights() {
+        // All signals at maximum: 0.5 + 0.3 + 0.2 = 1.0
+        assert!((legacy_frag_score(1.0, 1.0, 0, 101) - 1.0).abs() < 1e-9);
+        // Only the dead-tuples ratio
+        assert!((legacy_frag_score(1.0, 0.0, 1, 10) - 0.5).abs() < 1e-9);
+        // Only the unanalyzed-modifications ratio
+        assert!((legacy_frag_score(0.0, 1.0, 1, 10) - 0.3).abs() < 1e-9);
+        // Large index (> 100 pages) never scanned → 0.2 bonus
+        assert!((legacy_frag_score(0.0, 0.0, 0, 101) - 0.2).abs() < 1e-9);
+        // Never scanned but SMALL (≤ 100 pages) → no bonus
+        assert_eq!(legacy_frag_score(0.0, 0.0, 0, 100), 0.0);
+        // Scanned, even if large → no bonus
+        assert_eq!(legacy_frag_score(0.0, 0.0, 1, 10_000), 0.0);
+        // Never exceeds 1.0
+        assert!(legacy_frag_score(1.0, 1.0, 0, 10_000) <= 1.0);
     }
 }
