@@ -360,7 +360,10 @@ alias (`a.status` → the table of alias `a`). A **non-qualified** column
 is accepted only if the query references only ONE table — conservative
 behavior that avoids false positives (ambiguous column dropped, debug log).
 
-**Recognized operators (SARGable)**:
+**Recognized operators (SARGable)** — the operator **and** the column's real type
+resolve the index method (`resolve_index_method`):
+
+*B-tree* (scalar equality / range — any scalar type):
 
 | Pattern | Condition |
 |---------|-----------|
@@ -371,6 +374,23 @@ behavior that avoids false positives (ambiguous column dropped, debug log).
 | `col LIKE 'pref…%'` / `col ILIKE 'pref…%'` | **prefix** pattern (no leading `%`) |
 | `AND` / `OR` / nested parentheses | recursive traversal |
 
+*GIN* (containment / key-existence / full-text / overlap):
+
+| Pattern | Column type |
+|---------|-------------|
+| `col @> v` | jsonb, hstore, array |
+| `col ? v`, `col ?& v`, `col ?| v`, `col @? v` | jsonb (hstore: `@>`, `?`) |
+| `col && v` | array |
+| `col @@ tsquery` | tsvector |
+
+*GIST* (geometry / ranges):
+
+| Pattern | Column type |
+|---------|-------------|
+| `col @@ v` | geometry / geography |
+| `col && v` | geometry / geography (bbox) |
+| `col @> v` | range types (`int4range`, `tsrange`, …) |
+
 **Rejected (non-SARGable)**:
 - `NOT ( … )`, `col IS DISTINCT FROM …` (negation / unboundable semantics)
 - `col NOT IN (…)`, `col NOT BETWEEN …`
@@ -378,6 +398,8 @@ behavior that avoids false positives (ambiguous column dropped, debug log).
 - Column-vs-column comparison: `a.col = b.col`
 - `LIKE`/`ILIKE` with a wildcard at the start (`'%…'`) or a non-literal pattern
 - `col NOT LIKE …`
+- `col <@ v` (reverse containment) — the indexable side is the RIGHT operand,
+  never the left column, so it is intentionally not detected
 
 #### 2.3.2 Filtering of covered columns
 
@@ -397,8 +419,8 @@ For the remaining candidate columns, the daemon loads:
 
 | Data | Source | Use |
 |--------|--------|-------|
-| real `data_type` (e.g. `character varying`) | `information_schema.columns` | Laya context + density bucket |
-| `is_nullable` | `information_schema.columns` | Filtered index decision |
+| real `data_type` (e.g. `character varying`, `text[]`, `int4range`) | `format_type(atttypid, atttypmod)` via `pg_attribute` (`information_schema.data_type` is too lossy — it reports `ARRAY` / `USER-DEFINED`) | Laya context + density bucket + **index method** |
+| `is_nullable` | `pg_attribute` | Filtered index decision |
 | `null_frac` | `pg_stats` (`null_frac::float8`) | If > 0.10 → `WHERE col IS NOT NULL` |
 | table `reltuples` / `relpages` | `pg_class` (`to_regclass`) | Estimated size of the future index |
 
@@ -419,12 +441,28 @@ For the remaining candidate columns, the daemon loads:
 
 All densities are configurable (`density_by_type.*`).
 
+**Index method resolution** (`resolve_index_method`, from the (operator, real
+type) pair):
+
+```
+scalar operator ( =, <, >, IN, BETWEEN, LIKE, IS [NOT] NULL )        → btree
+@> / @@ / && / ? / ?& / ?| / @?  + geometry|geography|*range         → gist
+@> / @@ / && / ? / ?& / ?| / @?  + jsonb|hstore|*[]|tsvector         → gin
+@> / @@ / && / ? / ?& / ?| / @?  + unknown type                      → gin (best-effort)
+```
+
 **Estimated size of the future index** (sent to the decision context):
 
 ```
-est_pages = ceil(reltuples / density_bucket)
-est_bytes = est_pages × 8192
+est_pages  = ceil(reltuples / density_bucket)
+size_factor = gin → density_by_type.gin_size_factor (3.0)
+              gist → density_by_type.gist_size_factor (2.0)
+              btree → 1.0
+est_bytes  = est_pages × 8192 × size_factor
 ```
+
+All densities **and** the GIN/GIST size factors are configurable
+(`density_by_type.*`).
 
 ---
 

@@ -28,6 +28,7 @@ thresholds:
   unused_minutes: 1             # LOW for the test (default 10080 = 7 days)
   fragmentation_pct: 50         # LOWER for the test (default 70)
   use_index_bloat: true         # physical bloat via pgstattuple (installed in the demo DB)
+  use_gin_gist_detection: true  # GIN/GIST detection ON (jsonb/hstore/arrays → GIN, ranges → GIST)
   min_sargable_rows: 100
   min_confidence: 0.7
   max_proposals_per_cycle: 20

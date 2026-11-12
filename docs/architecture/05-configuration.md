@@ -58,6 +58,7 @@ thresholds:
   unused_minutes: 10080            # Observation window (default 7 days)
   fragmentation_pct: 70            # Fragmentation % (1..=100)
   use_index_bloat: true            # Physical bloat via pgstattuple (leaf fill)
+  use_gin_gist_detection: true     # GIN/GIST index-need detection (jsonb/arrays/tsvector → GIN, geometry/ranges → GIST)
   min_sargable_rows: 100           # Min. executions (pg_stat_statements.calls)
   min_confidence: 0.7              # Min. Laya confidence for APPLY (0.0..=1.0)
   max_proposals_per_cycle: 20      # Proposal budget per cycle (1..=1000)
@@ -80,6 +81,8 @@ pg_pool:
 # Target density per column type
 # (tuples/page targeted — used for the estimated
 # size of future indexes sent to Laya)
+# + GIN/GIST size factors (GIN/GIST indexes are
+# typically larger than a B-tree on the same data)
 # ─────────────────────────────────────────────
 density_by_type:
   int4: 200
@@ -92,6 +95,8 @@ density_by_type:
   uuid: 100
   bool: 300
   default_density: 50
+  gin_size_factor: 3.0             # × est_bytes for GIN indexes
+  gist_size_factor: 2.0            # × est_bytes for GIST indexes
 
 # ─────────────────────────────────────────────
 # Logging (tracing)
@@ -131,6 +136,7 @@ index_logging:
 | `thresholds.unused_minutes` | `10080` (7 d) | `>= 1` |
 | `thresholds.fragmentation_pct` | `70` | `1..=100` |
 | `thresholds.use_index_bloat` | `true` | bool |
+| `thresholds.use_gin_gist_detection` | `true` | bool |
 | `thresholds.min_sargable_rows` | `100` | `>= 1` |
 | `thresholds.min_confidence` | `0.7` | `0.0..=1.0` |
 | `thresholds.max_proposals_per_cycle` | `20` | `1..=1000` |
@@ -139,6 +145,8 @@ index_logging:
 | `pg_pool.max_size` | `16` | `1..=512` |
 | `pg_pool.wait_timeout_ms` | `30000` | `100..=600000` |
 | `density_by_type.*` | see §2 | `> 0` and finite |
+| `density_by_type.gin_size_factor` | `3.0` | `> 0` and finite |
+| `density_by_type.gist_size_factor` | `2.0` | `> 0` and finite |
 | `logging.level` | `info` | tracing level |
 | `logging.format` | `json` | `json` \| `text` |
 | `index_logging.enabled` | `true` | bool |
@@ -181,8 +189,10 @@ The client uses **rustls** (`tokio-postgres-rustls`). Consequences:
 | `analysis.schemas: [a, b]` | Only the listed schemas |
 | `pg_pool.wait_timeout_ms` | If the pool is saturated, the wait is bounded |
 | `density_by_type.*` | Used only for the **size estimation** of future indexes sent to the Laya decision context — no effect on detection |
+| `density_by_type.gin_size_factor` / `.gist_size_factor` | Multiplicative factor on the size estimate for **GIN** / **GIST** proposals (these access methods are typically larger than a B-tree on the same data). `btree` proposals use a factor of `1.0` — their estimate is unchanged |
 | `thresholds.unused_minutes` | **Minimum observation window**: if the PG server has been up for less than this delay, the "unused indexes" analysis is skipped (the `pg_stat_*` counters are reset at restart) |
 | `thresholds.use_index_bloat` | `true` = the fragmentation detector also measures **physical B-tree bloat** via `pgstattuple` (the only criterion that survives VACUUM/ANALYZE/autovacuum). `false` = legacy catalog-statistics heuristic only. Absence of the extension never degrades the daemon — it only disables this criterion (warning at startup) |
+| `thresholds.use_gin_gist_detection` | `true` = detector #3 also detects the GIN/GIST operator patterns (`jsonb @>/?/?&/?|/@?`, `tsvector @@`, arrays `@>/&&`, geometry `@@/&&`, ranges `@>`) and proposes **`USING gin` / `USING gist`** indexes. `false` = detector #3 restricted to classic B-tree SARGable patterns (the pre-GIN/GIST behavior) |
 | `thresholds.min_confidence` | Laya confidence threshold; **below it, the proposal is ignored (no heuristic fallback)** |
 | `thresholds.max_proposals_per_cycle` | Each detector is bounded in SQL (`LIMIT`) **and** the total list is truncated to this budget with a warning (dropped proposals will be re-detected on the next cycle) |
 | `thresholds.ddl_timeout_seconds` | Bounds the duration of `CONCURRENTLY` builds (`statement_timeout` per session, reset afterwards); `0` = unlimited. Keep it generous: a too-short timeout on a large table would create a build→cancelled→retry loop |
@@ -196,7 +206,7 @@ Config loading fails with:
 |--------|-------|
 | `Read(path, err)` | File missing or inaccessible |
 | `Parse(path, err)` | Invalid YAML (indentation, syntax) or unexpected type |
-| `Validation("...")` | Value inconsistency (list of errors concatenated) — e.g. `cycle_seconds = 0`, `min_confidence = 1.5`, unsupported `ssl_mode` |
+| `Validation("...")` | Value inconsistency (list of errors concatenated) — e.g. `cycle_seconds = 0`, `min_confidence = 1.5`, unsupported `ssl_mode`, `density_by_type.gin_size_factor` not `> 0` or not finite |
 
 Validation errors are **accumulated**: all inconsistencies are
 reported at once, not just the first one encountered.

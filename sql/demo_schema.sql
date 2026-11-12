@@ -110,6 +110,29 @@ CREATE TABLE users (
 CREATE INDEX idx_users_role ON users(role);
 CREATE INDEX idx_users_login ON users(last_login);
 
+-- ── Table: events (GIN target — jsonb payload + text[] tags) ─────────────
+-- NO index on payload / tags: the SARGable detector should propose a GIN
+-- index when the workload filters with `@>` (containment) / `&&` (overlap).
+CREATE TABLE events (
+    id          SERIAL       PRIMARY KEY,
+    type        VARCHAR(40)  NOT NULL DEFAULT 'generic',
+    payload     JSONB        NOT NULL DEFAULT '{}'::jsonb,
+    tags        TEXT[]       NOT NULL DEFAULT '{}',
+    occurred_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+-- Intentionally NO index on payload or tags (GIN candidate).
+
+-- ── Table: bookings (GIST target — int4range period) ─────────────────────
+-- NO index on period: the detector should propose a GIST index when the
+-- workload filters with `period @> <range>` (range containment).
+CREATE TABLE bookings (
+    id          SERIAL       PRIMARY KEY,
+    room        VARCHAR(40)  NOT NULL DEFAULT 'A1',
+    period      INT4RANGE,
+    created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+-- Intentionally NO index on period (GIST candidate).
+
 -- ── Data: customers ──────────────────────────────────────────────────────
 INSERT INTO customers (email, first_name, last_name, country, city)
 SELECT
@@ -161,12 +184,43 @@ SELECT
     random() > 0.15
 FROM generate_series(1, 2000) g;
 
+-- ── Data: events (jsonb + array payload) ─────────────────────────────────
+INSERT INTO events (type, payload, tags, occurred_at)
+SELECT
+    (ARRAY['login','logout','click','purchase','error','signup'])[1 + (g % 6)],
+    jsonb_build_object(
+        'type',   (ARRAY['login','logout','click','purchase','error','signup'])[1 + (g % 6)],
+        'user_id', 1 + (g % 2000),
+        'ip',       '10.0.' || (g % 255) || '.' || (1 + g % 254),
+        'ok',       (g % 10) <> 0
+    ),
+    CASE (g % 6)
+        WHEN 0 THEN ARRAY['auth','web']
+        WHEN 1 THEN ARRAY['billing','web']
+        WHEN 2 THEN ARRAY['search']
+        WHEN 3 THEN ARRAY['mobile','auth']
+        WHEN 4 THEN ARRAY['web']
+        ELSE ARRAY['batch','billing']
+    END,
+    NOW() - make_interval(days => (random() * 30)::int)
+FROM generate_series(1, 30000) g;
+
+-- ── Data: bookings (int4range periods) ───────────────────────────────────
+INSERT INTO bookings (room, period, created_at)
+SELECT
+    (ARRAY['A1','A2','B1','B2','C1'])[1 + (g % 5)],
+    int4range(1 + (g % 100), 1 + (g % 100) + 1 + (g % 8)),
+    NOW() - make_interval(days => (random() * 60)::int)
+FROM generate_series(1, 20000) g;
+
 -- ── Statistics ───────────────────────────────────────────────────────────
 ANALYZE customers;
 ANALYZE products;
 ANALYZE orders;
 ANALYZE order_items;
 ANALYZE users;
+ANALYZE events;
+ANALYZE bookings;
 
 -- ── Summary ──────────────────────────────────────────────────────────────
 DO $$

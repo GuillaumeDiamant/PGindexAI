@@ -46,7 +46,7 @@ pub async fn run_in_transaction(
         // the connection returns to the pool in its initial state.
         if timeout_secs > 0 {
             client
-                .simple_query(&format!("SET statement_timeout = {timeout_secs}s"))
+                .simple_query(&format!("SET statement_timeout = '{timeout_secs}s'"))
                 .await?;
         }
         let result = client.execute(ddl, &[]).await;
@@ -68,10 +68,10 @@ pub async fn run_in_transaction(
         // it resets automatically on COMMIT / ROLLBACK, so the pooled connection
         // stays clean (no manual RESET needed, unlike the CONCURRENTLY branch).
         if timeout_secs > 0 {
-            tx.simple_query(&format!("SET LOCAL statement_timeout = {timeout_secs}s"))
+            tx.simple_query(&format!("SET LOCAL statement_timeout = '{timeout_secs}s'"))
                 .await
                 .map_err(|e| format!("SET LOCAL statement_timeout failed: {e}"))?;
-            tx.simple_query(&format!("SET LOCAL lock_timeout = {timeout_secs}s"))
+            tx.simple_query(&format!("SET LOCAL lock_timeout = '{timeout_secs}s'"))
                 .await
                 .map_err(|e| format!("SET LOCAL lock_timeout failed: {e}"))?;
         }
@@ -100,7 +100,8 @@ fn is_concurrent_ddl(ddl: &str) -> bool {
 /// - existence pre-check (idempotence)
 /// - post-commit validation of VALIDITY (indisvalid) — an interrupted
 ///   CONCURRENTLY build leaves an INVALID index that must be cleaned up
-/// - structured logging
+/// - structured logging (the index METHOD — btree/gin/gist — is always
+///   explicit, in both the daemon log and the audit entry)
 pub async fn execute_create_index(
     pool: &Pool,
     ddl: &str,
@@ -108,9 +109,13 @@ pub async fn execute_create_index(
     writer: &IndexLogWriter,
     confidence: Option<f64>,
     reason: Option<String>,
+    index_method: Option<&str>,
 ) -> Result<DdlOutcome, Box<dyn std::error::Error + Sync + Send>> {
     let index_name = extract_index_name(ddl);
     let schema = extract_schema_from_ddl(ddl);
+    // The index access method (btree | gin | gist) — always made explicit
+    // in the daemon log and the audit trail.
+    let method = index_method.unwrap_or("btree").to_string();
     if let Some(ref name) = index_name {
         if queries::index_exists(pool, &schema, name).await? {
             // Idempotent no-op: logged as "skipped" (no longer "success")
@@ -124,6 +129,7 @@ pub async fn execute_create_index(
                     "skipped (index already exists)",
                 )
                 .with_ddl(ddl.to_string())
+                .with_index_method(method.clone())
                 .with_metadata(
                     confidence.unwrap_or(0.0),
                     0,
@@ -137,7 +143,7 @@ pub async fn execute_create_index(
         }
     }
 
-    info!("Executing CREATE INDEX: {ddl}");
+    info!("Executing CREATE INDEX (index method: {method}): {ddl}");
 
     let object = index_name.clone().unwrap_or_else(|| "unknown".to_string());
     let start = Instant::now();
@@ -166,6 +172,7 @@ pub async fn execute_create_index(
                             format!("validation_error: {err}"),
                         )
                         .with_ddl(ddl.to_string())
+                        .with_index_method(method.clone())
                         .with_metadata(
                             confidence.unwrap_or(0.0),
                             0,
@@ -180,7 +187,7 @@ pub async fn execute_create_index(
             }
 
             info!(
-                "CREATE INDEX successful ({} rows affected) in {:.2}ms",
+                "CREATE INDEX (index method: {method}) successful ({} rows affected) in {:.2}ms",
                 rows,
                 duration.as_secs_f64() * 1000.0
             );
@@ -194,6 +201,7 @@ pub async fn execute_create_index(
                     "success",
                 )
                 .with_ddl(ddl.to_string())
+                .with_index_method(method)
                 .with_metadata(
                     confidence.unwrap_or(0.0),
                     0, // Size unknown before creation
@@ -231,6 +239,7 @@ pub async fn execute_create_index(
                     format!("error: {e}"),
                 )
                 .with_ddl(ddl.to_string())
+                .with_index_method(method)
                 .with_metadata(
                     confidence.unwrap_or(0.0),
                     0,
@@ -492,15 +501,31 @@ pub async fn execute_reindex(
 /// of LAYA (standard vs filtered) determines the variant executed — not the
 /// variant simply generated at analysis (both paths must
 /// produce strictly identical DDL).
+///
+/// `index_method` is the access method: "btree" (no `USING` clause —
+/// PostgreSQL default), "gin" (`USING gin`) or "gist" (`USING gist`).
+///
+/// NOTE — the index **name** is NOT schema-qualified: PostgreSQL forbids a
+/// schema prefix on the index in `CREATE INDEX` ("No schema name can be
+/// included here; the index is always created in the same schema as its
+/// parent table"). The **table** name IS schema-qualified — that is what
+/// places the index in the intended schema. A `schema.index` name is a
+/// syntax error (verified on PG 16).
 pub fn build_create_index_ddl(
     schema: &str,
     index_name: &str,
     table: &str,
     column: &str,
     filtered: bool,
+    index_method: &str,
 ) -> String {
+    let using = if index_method.eq_ignore_ascii_case("btree") {
+        String::new()
+    } else {
+        format!(" USING {index_method}")
+    };
     let base = format!(
-        "CREATE INDEX CONCURRENTLY IF NOT EXISTS {schema}.{index_name} ON {schema}.{table} ({column})"
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS {index_name} ON {schema}.{table}{using} ({column})"
     );
     if filtered {
         format!("{base} WHERE {column} IS NOT NULL")
@@ -769,32 +794,177 @@ mod tests {
 
     #[test]
     fn test_build_create_index_ddl_standard() {
-        let ddl = build_create_index_ddl("public", "idx_orders_status", "orders", "status", false);
+        let ddl = build_create_index_ddl(
+            "public",
+            "idx_orders_status",
+            "orders",
+            "status",
+            false,
+            "btree",
+        );
         assert_eq!(
             ddl,
-            "CREATE INDEX CONCURRENTLY IF NOT EXISTS public.idx_orders_status ON public.orders (status)"
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_orders_status ON public.orders (status)"
         );
     }
 
     #[test]
     fn test_build_create_index_ddl_filtered() {
-        let ddl = build_create_index_ddl("public", "idx_orders_status", "orders", "status", true);
+        let ddl = build_create_index_ddl(
+            "public",
+            "idx_orders_status",
+            "orders",
+            "status",
+            true,
+            "btree",
+        );
         assert_eq!(
             ddl,
-            "CREATE INDEX CONCURRENTLY IF NOT EXISTS public.idx_orders_status ON public.orders (status) WHERE status IS NOT NULL"
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_orders_status ON public.orders (status) WHERE status IS NOT NULL"
         );
+    }
+
+    #[test]
+    fn test_build_create_index_ddl_gin_gist() {
+        // GIN: `USING gin` between the table and the column list
+        let ddl = build_create_index_ddl(
+            "public",
+            "idx_events_payload",
+            "events",
+            "payload",
+            false,
+            "gin",
+        );
+        assert_eq!(
+            ddl,
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_payload ON public.events USING gin (payload)"
+        );
+        // GIST: `USING gist`
+        let ddl = build_create_index_ddl(
+            "public",
+            "idx_bookings_period",
+            "bookings",
+            "period",
+            true,
+            "gist",
+        );
+        assert_eq!(
+            ddl,
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bookings_period ON public.bookings USING gist (period) WHERE period IS NOT NULL"
+        );
+        // btree (explicit) is byte-identical to the pre-GIN/GIST DDL (no USING)
+        let ddl = build_create_index_ddl("public", "idx_x", "t", "c", false, "btree");
+        assert!(!ddl.contains("USING"));
     }
 
     #[test]
     fn test_build_create_index_ddl_roundtrip_extraction() {
         // The DDL produced by the builder remain extractable (name + schema)
         for filtered in [false, true] {
-            let ddl = build_create_index_ddl("billing", "idx_events_ts", "events", "ts", filtered);
+            let ddl = build_create_index_ddl(
+                "billing",
+                "idx_events_ts",
+                "events",
+                "ts",
+                filtered,
+                "btree",
+            );
             assert_eq!(extract_index_name(&ddl), Some("idx_events_ts".to_string()));
             assert_eq!(extract_schema_from_ddl(&ddl), "billing");
             if filtered {
                 assert!(is_concurrent_ddl(&ddl));
             }
         }
+    }
+
+    #[test]
+    fn test_execute_create_index_audit_log_states_method() {
+        // End-to-end: the audit entry for a GIN CREATE INDEX must state the
+        // index method explicitly (`"index_method":"gin"`) and carry the
+        // `USING gin` DDL — the audit trail must make clear which kind of
+        // index was built. Skips gracefully when no local PostgreSQL is up.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let pool = rt.block_on(async {
+            let mut c = deadpool_postgres::Config::new();
+            c.host = Some("/var/run/postgresql".to_string());
+            c.port = Some(5432);
+            c.user = Some("postgres".to_string());
+            c.dbname = Some("postgres".to_string());
+            c.create_pool(
+                Some(deadpool_postgres::Runtime::Tokio1),
+                tokio_postgres::NoTls,
+            )
+            .ok()
+        });
+        let Some(pool) = pool else {
+            eprintln!(
+                "SKIP test_execute_create_index_audit_log_states_method: no local PostgreSQL"
+            );
+            return;
+        };
+
+        let log_file = std::env::temp_dir()
+            .join(format!("pgindexai_audit_test_{}", std::process::id()))
+            .to_string_lossy()
+            .to_string();
+        let _ = std::fs::remove_file(&log_file);
+
+        const CLEANUP: &str = "DROP INDEX IF EXISTS public.idx_pgindexai_audit_probe_payload; DROP TABLE IF EXISTS public.pgindexai_audit_probe;";
+        let res = rt.block_on(async {
+            // Deterministic start: remove any leftovers from a previous run
+            let setup = pool.get().await?;
+            let _ = setup.batch_execute(CLEANUP).await;
+            setup
+                .execute(
+                    "CREATE TABLE IF NOT EXISTS pgindexai_audit_probe (id serial primary key, payload jsonb)",
+                    &[],
+                )
+                .await?;
+            drop(setup);
+            let ddl = build_create_index_ddl(
+                "public",
+                "idx_pgindexai_audit_probe_payload",
+                "pgindexai_audit_probe",
+                "payload",
+                false,
+                "gin",
+            );
+            let writer = IndexLogWriter::new(true, "standard", &log_file, 0, 1);
+            let outcome = execute_create_index(
+                &pool,
+                &ddl,
+                30,
+                &writer,
+                Some(0.9),
+                Some("GIN audit-log probe".to_string()),
+                Some("gin"),
+            )
+            .await?;
+            // Best-effort cleanup (leave the demo DB as we found it)
+            let cleanup = pool.get().await?;
+            let _ = cleanup.batch_execute(CLEANUP).await;
+            Ok::<_, Box<dyn std::error::Error + Sync + Send>>(outcome)
+        });
+        let outcome = res.expect("execute_create_index failed");
+        assert_eq!(
+            outcome,
+            DdlOutcome::Applied,
+            "expected the GIN index to be created"
+        );
+
+        let content = std::fs::read_to_string(&log_file).unwrap_or_default();
+        let _ = std::fs::remove_file(&log_file);
+        assert!(
+            content.contains("\"index_method\":\"gin\""),
+            "audit log must state the GIN index method, got: {content}"
+        );
+        assert!(
+            content.contains("\"operation\":\"CREATE\""),
+            "audit log missing the CREATE operation: {content}"
+        );
+        assert!(
+            content.contains("USING gin"),
+            "audit log DDL should carry USING gin: {content}"
+        );
     }
 }

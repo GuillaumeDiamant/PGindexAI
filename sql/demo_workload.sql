@@ -10,6 +10,18 @@
    ============================================================================ */
 
 -- ─────────────────────────────────────────────
+-- pg_stat_statements tracking (required for detector #3)
+-- ─────────────────────────────────────────────
+-- Detector #3 (SARGable / missing-index) reads pg_stat_statements. By
+-- default `pg_stat_statements.track = top` records only TOP-LEVEL
+-- statements, so the workload queries below (issued inside PL/pgSQL DO
+-- blocks via EXECUTE) would NOT be recorded as individual queries — the
+-- detector would see nothing. `track = all` records them too. Requires
+-- superuser (this demo runs as the `postgres` superuser). Without it,
+-- detector #3 is blind to the workload.
+SET pg_stat_statements.track = 'all';
+
+-- ─────────────────────────────────────────────
 -- Phase 0: User workload (generates pg_stat_statements)
 -- ─────────────────────────────────────────────
 SELECT '=== Phase 0: User workload (generates pg_stat_statements) ===';
@@ -376,6 +388,48 @@ BEGIN
     FOR j IN 1..1000 LOOP
         EXECUTE 'SELECT id, email FROM customers WHERE country = $1'
         USING 'France';
+    END LOOP;
+END $$;
+
+-- ─────────────────────────────────────────────
+-- Phase 8: GIN/GIST workload (jsonb / array / range)
+-- ─────────────────────────────────────────────
+-- Triggers the GIN/GIST detector (detector #3, extended):
+--   events.payload @> {...}  → GIN (jsonb containment)
+--   events.tags   && ARRAY   → GIN (array overlap)
+--   bookings.period @> range → GIST (range containment)
+SELECT '=== Phase 8: GIN/GIST workload (jsonb / array / range) ===';
+
+-- 8a: 2000 jsonb containment queries (GIN target — events.payload, NO INDEX)
+DO $$
+DECLARE
+    j INT;
+BEGIN
+    FOR j IN 1..2000 LOOP
+        EXECUTE 'SELECT id, type, occurred_at FROM events WHERE payload @> $1'
+        USING '{"type":"login","ok":true}'::jsonb;
+    END LOOP;
+END $$;
+
+-- 8b: 1500 array overlap queries (GIN target — events.tags, NO INDEX)
+DO $$
+DECLARE
+    j INT;
+BEGIN
+    FOR j IN 1..1500 LOOP
+        EXECUTE 'SELECT id, type FROM events WHERE tags && $1'
+        USING ARRAY['web']::text[];
+    END LOOP;
+END $$;
+
+-- 8c: 1500 range containment queries (GIST target — bookings.period, NO INDEX)
+DO $$
+DECLARE
+    j INT;
+BEGIN
+    FOR j IN 1..1500 LOOP
+        EXECUTE 'SELECT id, room FROM bookings WHERE period @> $1'
+        USING int4range(j % 100, (j % 100) + 5);
     END LOOP;
 END $$;
 

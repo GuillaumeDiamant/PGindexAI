@@ -151,45 +151,70 @@ Filters:
      (PostgreSQL ARE: `\y` is the word boundary, `\b` a literal backspace)
   - multi-schema scope (analysis.schemas, new)
 
-Detected SARGable patterns (AST):
-  - col = v, col > v, col < v, col >= v, col <= v   (value is not a column)
-  - col IN (...) / col BETWEEN a AND b              (non-negated)
-  - col IS NULL / col IS NOT NULL
-  - col LIKE 'pref…%' / ILIKE                      (prefix pattern)
-  - AND / OR / nested parentheses (recursive traversal)
+Detected SARGable patterns (AST) — the operator AND the column's real
+type resolve the index method (`resolve_index_method`):
+
+  B-tree (scalar equality / range — any scalar type)
+    - col = v, col > v, col < v, col >= v, col <= v   (value is not a column)
+    - col IN (...) / col BETWEEN a AND b              (non-negated)
+    - col IS NULL / col IS NOT NULL
+    - col LIKE 'pref…%' / ILIKE                      (prefix pattern)
+    - AND / OR / nested parentheses (recursive traversal)
+
+  GIN (containment / key-existence / full-text / overlap)
+    - jsonb   : col @> v,  col ? v,  col ?& v,  col ?| v,  col @? v
+    - hstore  : col @> v,  col ? v
+    - array   : col @> v,  col && v
+    - tsvector: col @@ tsquery
+
+  GIST (geometry / ranges)
+    - geometry / geography : col @@ v  (spatial predicate),  col && v  (bbox)
+    - range types (int4range, tsrange, …) : col @> v  (range containment)
 
 Rejected (non-SARGable):
   - NOT (…), IS DISTINCT FROM, col NOT IN/BETWEEN/LIKE
   - Functions on the column (LOWER(col), UPPER(col), CAST(col AS …))
   - Column-to-column comparison
   - LIKE/ILIKE with a leading wildcard ('%…')
+  - col <@ v  (reverse containment) — the indexable side is the RIGHT
+    operand, never the left column, so it is intentionally not detected
 ```
 
-**Enrichment (new)**: for each candidate column, the daemon loads
-the **real type** (`information_schema.columns`), the **nullability**, the
-**NULL fraction** (`pg_stats.null_frac`) and the table **cardinality**
-(`pg_class.reltuples`) to estimate the size of the future index via the
-**target density of the type** (`density_by_type.*`).
+**Enrichment**: for each candidate column, the daemon loads the
+**real type** (`format_type(atttypid, atttypmod)` via `pg_attribute` —
+`information_schema.data_type` is too lossy for arrays / user types), the
+**nullability**, the **NULL fraction** (`pg_stats.null_frac`) and the table
+**cardinality** (`pg_class.reltuples`) to resolve the index method and
+estimate the size of the future index via the **target density of the type**
+(`density_by_type.*`). A GIN/GIST index is typically larger than a B-tree, so
+the estimate is multiplied by a configurable size factor
+(`density_by_type.gin_size_factor`, `.gist_size_factor`).
 
-**Proposed action:** `CREATE INDEX idx_table_column ON table(column)`
-If `null_frac > 0.10` → filtered index: `WHERE column IS NOT NULL`
+**Proposed action:** `CREATE INDEX [CONCURRENTLY] idx_table_column ON
+table [USING gin|gist] (column)` — `USING gin` / `USING gist` is emitted
+only for GIN/GIST columns (B-tree DDL is unchanged: no `USING`).
+If `null_frac > 0.10` → filtered index: `WHERE column IS NOT NULL`.
 Validated index name: ≤ 63 bytes (truncation + short hash if needed).
+Toggle: `thresholds.use_gin_gist_detection` (default `true`) — set to `false`
+to restrict detector #3 to B-tree proposals (pre-GIN/GIST behavior).
+The chosen method is explicit in every CREATE audit/daemon log entry
+(`index_method`: `btree` / `gin` / `gist`).
 
-> **Known limitation — B-tree only:** the generated DDL has no `USING` clause,
-> so every proposed index is a **B-tree** (PostgreSQL default). The detector
-> recognizes exactly the scalar predicates a B-tree accelerates (`=`, range,
-> `IN`, `BETWEEN`, prefix `LIKE`, `IS [NOT] NULL`) — and nothing else.
-> Consequently **no GIN or GIST index is ever proposed**:
+> **Known limitations (honest):**
 >
-> - **GIN workloads are out of scope**: `jsonb @>`, `tsvector @@` (full-text
->   search), array `@>`/`&&` predicates are not recognized as SARGable and
->   produce no proposal
-> - **GIST workloads are out of scope**: geometry (e.g. PostGIS), range types
->
-> This mirrors detector #2, where the constraint is technical:
-> `pgstatindex()` is a B-tree-only function, so bloat scoring also covers
-> B-tree indexes exclusively. A workload dominated by GIN/GIST operators will
-> receive no proposals from PGindexAI — index such columns manually.
+> - **Detection is operator + type driven, not function driven.** Only the
+>   native operators above are recognized. A workload that calls a *function*
+>   (e.g. PostGIS `ST_DWithin(geom, …)`, `ST_Contains(…)`) is **not**
+>   detected — only the `@@` / `&&` / `@>` operators are. Express the
+>   predicate in operator form, or index such columns manually.
+> - **Unknown column type + GIN/GIST operator → best-effort GIN.** If the
+>   column type cannot be resolved (a domain / composite type) but the
+>   operator is a GIN/GIST one, PGindexAI defaults to **GIN**. Review the
+>   proposal before applying it.
+> - **GIN/GIST bloat is not covered by detector #2.** Detector #2 scores
+>   physical bloat with `pgstatindex()`, a **B-tree-only** function, so a
+>   bloated GIN/GIST index is not flagged for REINDEX there (it can still be
+>   dropped by detector #1 when unused).
 
 ## ⚙️ Configuration
 
