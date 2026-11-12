@@ -111,6 +111,14 @@ pub struct Proposal {
     /// Laya payloads / older proposals that predate GIN/GIST detection.
     #[serde(default)]
     pub index_method: Option<String>,
+    /// NULL-predicate polarity for CREATE INDEX: `Some("IS NULL")` or
+    /// `Some("IS NOT NULL")`, `None` for any other predicate.
+    /// Drives the Laya criteria: a `WHERE col IS NOT NULL` partial index
+    /// cannot serve an `IS NULL` workload, so that option is withheld for
+    /// `IS NULL` proposals (see `analyzer::apply_proposals`).
+    /// Additive field — `#[serde(default)]` keeps backward compatibility.
+    #[serde(default)]
+    pub null_predicate: Option<String>,
 }
 
 fn serialize_action<S>(action: &DecisionAction, serializer: S) -> Result<S::Ok, S::Error>

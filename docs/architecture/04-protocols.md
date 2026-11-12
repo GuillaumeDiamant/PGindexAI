@@ -370,7 +370,7 @@ resolve the index method (`resolve_index_method`):
 | `col = v`, `col > v`, `col < v`, `col >= v`, `col <= v` | column side: column reference; value side: **not** a column |
 | `col IN (v1, …, vn)` (non-negated) | all elements non-columns |
 | `col BETWEEN a AND b` (non-negated) | bounds non-columns |
-| `col IS NULL` / `col IS NOT NULL` | — |
+| `col IS NULL` / `col IS NOT NULL` | **selectivity-gated** (`null_predicate_plan`): proposed only while the predicate selects < 50 % of the table (else the planner seq-scans → the index would ping-pong); `IS NULL` → standard B-tree, `IS NOT NULL` → filtered `WHERE col IS NOT NULL` |
 | `col LIKE 'pref…%'` / `col ILIKE 'pref…%'` | **prefix** pattern (no leading `%`) |
 | `AND` / `OR` / nested parentheses | recursive traversal |
 
