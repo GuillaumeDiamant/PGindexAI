@@ -358,7 +358,7 @@ Structured JSONL file, by default at `/var/log/pgindexai/index_operations.log`:
 | `pg_stat_statements` absent | Daemon `DEGRADED`: unused + fragmentation active, missing-index detection **disabled** (no data source) |
 | Laya unreachable / invalid response | **No DDL applied** — proposals generated and logged, application deferred to the next cycle (no fallback) |
 | PostgreSQL server restarted less than `unused_minutes` ago | "Unused indexes" analysis **skipped** for the cycle (no false detection) |
-| Non-B-tree index | Fragmentation detectors only propose B-tree indexes |
+| Non-B-tree index (GIN/GIST/SP-GiST/BRIN) | **Out of scope for both detectors**: #2 technically (`pgstatindex()` is B-tree-only) and #3 by design (no `USING` clause in the generated DDL → B-tree proposals only). GIN workloads (`jsonb @>`, `tsvector @@`, arrays) and GIST workloads (geometry, ranges) receive **no proposals** — index them manually |
 | Laya offline at startup | `deep_health()` FAILED → explicit warning; the daemon continues (observation mode) |
 | Index name > 63 bytes | Truncated + short hash suffix (FNV-1a base 36) — identifier always valid |
 | `ssl_mode ≠ disable` + unvalidatable certificate (chain or hostname) | **Connection refused** (rustls always validates chain + hostname) — no "accept-insecure" mode |
