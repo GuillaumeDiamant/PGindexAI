@@ -57,6 +57,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pgstattuple prerequisite and the `use_index_bloat` knob.
 - `README.md` — fragmentation detector section and configuration reference
   updated to match.
+- `README.md` — detector #3 section: documented the **B-tree-only scope** —
+  the generated DDL carries no `USING` clause, so proposals are always B-tree
+  indexes. GIN workloads (`jsonb @>`, `tsvector @@`, arrays) and GIST
+  workloads (geometry, ranges) are out of scope and receive no proposals.
+- `docs/architecture/01-system-overview.md` — behavioral-guarantees table
+  now states the B-tree-only scope for both detector #2 (technical:
+  `pgstatindex()` is B-tree-only) and detector #3 (by design).
 
 ## [0.1.2] - 2026-11-04
 

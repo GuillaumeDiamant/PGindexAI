@@ -175,6 +175,22 @@ the **real type** (`information_schema.columns`), the **nullability**, the
 If `null_frac > 0.10` → filtered index: `WHERE column IS NOT NULL`
 Validated index name: ≤ 63 bytes (truncation + short hash if needed).
 
+> **Known limitation — B-tree only:** the generated DDL has no `USING` clause,
+> so every proposed index is a **B-tree** (PostgreSQL default). The detector
+> recognizes exactly the scalar predicates a B-tree accelerates (`=`, range,
+> `IN`, `BETWEEN`, prefix `LIKE`, `IS [NOT] NULL`) — and nothing else.
+> Consequently **no GIN or GIST index is ever proposed**:
+>
+> - **GIN workloads are out of scope**: `jsonb @>`, `tsvector @@` (full-text
+>   search), array `@>`/`&&` predicates are not recognized as SARGable and
+>   produce no proposal
+> - **GIST workloads are out of scope**: geometry (e.g. PostGIS), range types
+>
+> This mirrors detector #2, where the constraint is technical:
+> `pgstatindex()` is a B-tree-only function, so bloat scoring also covers
+> B-tree indexes exclusively. A workload dominated by GIN/GIST operators will
+> receive no proposals from PGindexAI — index such columns manually.
+
 ## ⚙️ Configuration
 
 File: `~/.config/PGindexAI/PGindexAI.yaml`
