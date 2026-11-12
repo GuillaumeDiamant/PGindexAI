@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Observation window could be silently disabled by a config typo**
+  (`thresholds.unused_minutes`). The value was cast `u64 → i32` before being
+  sent to `make_interval(mins => …)`; a value beyond the 32-bit range wrapped
+  into a *negative* interval, making the check **always true** — so "unused
+  index" detection (and therefore DROPs) could fire immediately after a server
+  restart, exactly when the `pg_stat_*` counters had just been reset. `unused_minutes`
+  now has an upper bound (`<= 525600`, i.e. 1 year) enforced by `Config::validate`,
+  and the query parameter is now `i64` so any out-of-range value is rejected
+  loudly by PostgreSQL instead of wrapping.
+- **`is_column_covered_by_index` mis-parsed partial and expression indexes.**
+  It used `rfind('(')`, which — for a partial index — landed inside the
+  `WHERE (…)​` predicate instead of the column list, so a column mentioned only
+  in the predicate was wrongly considered "covered" (missed proposal) or a real
+  key column was missed (false CREATE). The indexdef is now parsed with
+  `sqlparser`; a bare column in the key list counts as coverage, an expression
+  column does not. A string-based fallback (WHERE clause stripped) remains for
+  indexdefs sqlparser cannot parse.
+- **`LIKE` with a mid-string wildcard was wrongly proposed as SARGable.**
+  `'ab%cd'` (and `'ab_cd'`) used to pass the prefix check, leading to a B-tree
+  proposal PostgreSQL can never use for that predicate. A pattern is now
+  SARGable only if it is a plain literal or a literal prefix with a single
+  trailing `%`; any other `%`/`_` wildcard (unless backslash-escaped) rejects it.
+- **Fragmentation 50/30/20 weighting was duplicated** across the initial analysis
+  (`get_fragmented_indexes`) and the post-REINDEX re-validation
+  (`get_index_fragmentation`). The weights now live in a single function,
+  `legacy_frag_score`, so the two can no longer drift apart.
+- **A Laya response missing `usage` used to fail the whole cycle** at
+  deserialization even though the decision (`answers`) — the only field that
+  drives the action — was present. `usage` is now optional (`#[serde(default)]`).
+- **`logging.format` was not validated.** A typo silently degraded to the plain
+  format at runtime (main.rs only compares `== "json"`). Invalid values are now
+  rejected at startup (accepted: `json`, `plain`, `text`).
+
+### Documentation
+
+- Documented the new `thresholds.unused_minutes` upper bound (max `525600`).
+- Clarified the accepted `logging.format` values across the README, the config
+  template, and the configuration reference.
+
 ## [0.2.0] - 2026-11-12
 
 ### Added

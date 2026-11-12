@@ -103,7 +103,7 @@ density_by_type:
 # ─────────────────────────────────────────────
 logging:
   level: "info"                    # trace | debug | info | warn | error
-  format: "json"                   # json | text
+  format: "json"                   # json | plain ("text" is also accepted)
 
 # ─────────────────────────────────────────────
 # Index operation logging (audit trail)
@@ -133,7 +133,7 @@ index_logging:
 | `actions.drop_unused` | `true` | bool |
 | `actions.rebuild_fragmented` | `true` | bool |
 | `thresholds.cycle_seconds` | `60` | `1..=86400` |
-| `thresholds.unused_minutes` | `10080` (7 d) | `>= 1` |
+| `thresholds.unused_minutes` | `10080` (7 d) | `1 ..= 525600` (1 year) |
 | `thresholds.fragmentation_pct` | `70` | `1..=100` |
 | `thresholds.use_index_bloat` | `true` | bool |
 | `thresholds.use_gin_gist_detection` | `true` | bool |
@@ -148,7 +148,7 @@ index_logging:
 | `density_by_type.gin_size_factor` | `3.0` | `> 0` and finite |
 | `density_by_type.gist_size_factor` | `2.0` | `> 0` and finite |
 | `logging.level` | `info` | tracing level |
-| `logging.format` | `json` | `json` \| `text` |
+| `logging.format` | `json` | `json` \| `plain` (or `text`) |
 | `index_logging.enabled` | `true` | bool |
 | `index_logging.verbosity` | `minimal` | `minimal` \| `standard` \| `verbose` |
 | `index_logging.log_file` | `""` (stdout) | path |

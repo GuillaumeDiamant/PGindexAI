@@ -48,6 +48,15 @@ impl Config {
         if t.unused_minutes < 1 {
             errs.push("thresholds.unused_minutes must be >= 1".to_string());
         }
+        // Upper bound: `observation_window_ok` sends this value to
+        // `make_interval(mins => …)`. Beyond ~4 000 years the value would
+        // not fit a 32-bit integer — and a silent wrap (u64 → i32) would
+        // turn the check into an ALWAYS-TRUE condition, enabling
+        // "unused index" detection (and DROPs) right after a server
+        // restart, exactly when counters were just reset. 525 600 = 1 year.
+        if t.unused_minutes > 525_600 {
+            errs.push("thresholds.unused_minutes must be <= 525600 (1 year)".to_string());
+        }
         if !(1..=100).contains(&t.fragmentation_pct) {
             errs.push("thresholds.fragmentation_pct must be in [1, 100]".to_string());
         }
@@ -140,6 +149,17 @@ impl Config {
             errs.push(format!(
                 "logging.level '{}' invalid (expected one of: trace, debug, info, warn, error, off)",
                 self.logging.level
+            ));
+        }
+        // `format` is compared case-sensitively against "json" at runtime
+        // (main.rs); everything else renders as plain text. A typo used to
+        // silently degrade to the plain format — now rejected. "plain" and
+        // "text" are both documented variants of the non-JSON format
+        // (README: "plain", config comment: "text") and both accepted.
+        if !matches!(self.logging.format.as_str(), "json" | "plain" | "text") {
+            errs.push(format!(
+                "logging.format '{}' invalid (expected one of: json, plain, text)",
+                self.logging.format
             ));
         }
         if !matches!(
@@ -804,6 +824,109 @@ index_logging:
         assert!(
             err.to_string().contains("index_logging.verbosity"),
             "invalid verbosity must be rejected, got: {err}"
+        );
+    }
+
+    /// Regression: `logging.format` is validated. Before the fix a typo
+    /// (`jsonn`) silently degraded to the plain format at runtime
+    /// (main.rs only compares `== "json"`).
+    #[test]
+    fn test_invalid_log_format_is_rejected() {
+        let config_with = |format: &str| -> Config {
+            let yaml = format!(
+                r#"
+postgresql:
+  host: localhost
+  port: 5432
+  user: pgindexai
+  database: pgindexai_demo
+  ssl_mode: disable
+laya:
+  url: http://127.0.0.1:8080
+actions:
+  create_index: true
+  drop_unused: true
+  rebuild_fragmented: true
+thresholds:
+  cycle_seconds: 60
+logging:
+  level: info
+  format: {format}
+"#
+            );
+            let value: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+            serde_yaml::from_value(value).unwrap()
+        };
+
+        // Both documented values are accepted
+        assert!(config_with("json").validate().is_ok());
+        assert!(config_with("text").validate().is_ok());
+
+        // A typo must be rejected (used to silently switch to plain format)
+        let err = config_with("jsonn").validate().unwrap_err();
+        assert!(
+            err.to_string().contains("logging.format"),
+            "invalid format must be rejected, got: {err}"
+        );
+    }
+
+    /// Regression: `thresholds.unused_minutes` has an UPPER bound.
+    ///
+    /// Before the fix only `>= 1` was checked: a value beyond the 32-bit
+    /// integer range silently wrapped `u64 → i32` inside
+    /// `observation_window_ok` (e.g. 3_000_000_000 → -1294967296), turning
+    /// the observation-window check into an ALWAYS-TRUE condition — the
+    /// "unused index" detection (and therefore DROPs) could then fire
+    /// immediately after a server restart, exactly when the pg_stat_*
+    /// counters had just been reset.
+    #[test]
+    fn test_unused_minutes_bounds() {
+        let config_with = |minutes: u64| -> Config {
+            let yaml = format!(
+                r#"
+postgresql:
+  host: localhost
+  port: 5432
+  user: pgindexai
+  database: pgindexai_demo
+  ssl_mode: disable
+laya:
+  url: http://127.0.0.1:8080
+actions:
+  create_index: true
+  drop_unused: true
+  rebuild_fragmented: true
+thresholds:
+  cycle_seconds: 60
+  unused_minutes: {minutes}
+"#
+            );
+            let value: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+            serde_yaml::from_value(value).unwrap()
+        };
+
+        // Valid range accepted
+        assert!(config_with(1).validate().is_ok());
+        assert!(config_with(10_080).validate().is_ok());
+        assert!(config_with(525_600).validate().is_ok(), "1 year is allowed");
+
+        // Below the lower bound
+        let err = config_with(0).validate().unwrap_err();
+        assert!(
+            err.to_string().contains("unused_minutes must be >= 1"),
+            "got: {err}"
+        );
+
+        // Beyond the upper bound (used to wrap into a negative interval)
+        let err = config_with(525_601).validate().unwrap_err();
+        assert!(
+            err.to_string().contains("unused_minutes must be <= 525600"),
+            "got: {err}"
+        );
+        let err = config_with(3_000_000_000).validate().unwrap_err();
+        assert!(
+            err.to_string().contains("unused_minutes must be <= 525600"),
+            "got: {err}"
         );
     }
 }

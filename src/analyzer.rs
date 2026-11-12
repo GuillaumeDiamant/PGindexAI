@@ -740,6 +740,10 @@ impl Analyzer {
                 let n_dead_tup: i64 = r.get("n_dead_tup");
                 let n_mod_since_analyze: i64 = r.get("n_mod_since_analyze");
 
+                // Same legacy weighting as the initial analysis — via the
+                // shared `queries::legacy_frag_score` (single source of
+                // truth for the 50/30/20 weights), so the post-REINDEX
+                // re-validation can never drift from the original decision.
                 let total = (n_live_tup + n_dead_tup) as f64;
                 let dead_ratio = if total > 0.0 {
                     n_dead_tup as f64 / total
@@ -751,13 +755,11 @@ impl Analyzer {
                 } else {
                     0.0
                 };
-                let unused_big = if idx_scan == 0 && relpages > 100 {
-                    0.2
-                } else {
-                    0.0
-                };
 
-                Ok(((dead_ratio * 0.5 + mod_ratio * 0.3 + unused_big) * 100.0).min(100.0))
+                Ok(
+                    (queries::legacy_frag_score(dead_ratio, mod_ratio, idx_scan, relpages) * 100.0)
+                        .min(100.0),
+                )
             } else {
                 Ok(0.0)
             }
