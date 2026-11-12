@@ -2,7 +2,8 @@
 //!
 //! Three verbosity levels:
 //! - **minimal**: timestamp, CRUD type, duration, schema, object name
-//! - **standard**: + DDL/DML of the modified index
+//! - **standard**: + DDL/DML of the modified index (+ index access method
+//!   for CREATE: btree / gin / gist)
 //! - **verbose**: + technical metadata (confidence, size, fragmentation, reason)
 //!
 //! Rotation: if `max_size > 0`, the current file is renamed `.1`, `.1` → `.2`, …
@@ -57,6 +58,11 @@ pub struct IndexOperationLog {
     // standard+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ddl_statement: Option<String>,
+    /// Index access method for CREATE operations: "btree" | "gin" | "gist"
+    /// (always set on CREATE INDEX entries — the audit trail must state
+    /// explicitly which kind of index was built).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_method: Option<String>,
     // verbose+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub confidence: Option<f64>,
@@ -84,6 +90,7 @@ impl IndexOperationLog {
             duration_ms: duration.as_secs_f64() * 1000.0,
             status: status.into(),
             ddl_statement: None,
+            index_method: None,
             confidence: None,
             index_size_bytes: None,
             fragmentation_pct: None,
@@ -94,6 +101,12 @@ impl IndexOperationLog {
     /// Standard level: adds the DDL/DML
     pub fn with_ddl(mut self, ddl: impl Into<String>) -> Self {
         self.ddl_statement = Some(ddl.into());
+        self
+    }
+
+    /// Standard level: adds the index access method (CREATE INDEX only).
+    pub fn with_index_method(mut self, method: impl Into<String>) -> Self {
+        self.index_method = Some(method.into());
         self
     }
 
@@ -355,11 +368,14 @@ mod tests {
             Duration::from_millis(200),
             "success",
         )
-        .with_ddl("CREATE INDEX idx_new ON public.orders (status)");
+        .with_ddl("CREATE INDEX idx_new ON public.orders (status)")
+        .with_index_method("btree");
         let json = log.to_json();
         assert!(json.contains("\"operation\":\"CREATE\""));
         assert!(json.contains("\"ddl_statement\""));
         assert!(json.contains("CREATE INDEX idx_new"));
+        // The index access method must be explicit in the audit trail
+        assert!(json.contains("\"index_method\":\"btree\""));
         writer.log(log);
     }
 

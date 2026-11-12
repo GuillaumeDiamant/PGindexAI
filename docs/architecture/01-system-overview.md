@@ -69,9 +69,9 @@ PGindexAI is a **standalone daemon** that continuously monitors a PostgreSQL dat
 | **Naming** | `src/naming.rs` | `idx_<table>_<col>` convention, identifier validation, 63-byte limit, short hash (FNV-1a base 36) |
 | **Detector : Unused Indexes** | `src/db/queries.rs::get_unused_indexes` | Indexes never scanned **since the last restart** (`idx_scan = 0`, `idx_tup_read = 0`) + observation-window gate |
 | **Detector : Fragmentation** | `src/db/queries.rs::get_fragmented_indexes` | **B-tree indexes only**; heuristic score (dead 50 %, mod 30 %, unscanned bonus 20 %) |
-| **Detector : SARGable** | `src/db/queries.rs::get_missing_sargable_indexes` | Real AST parser (sqlparser) + real types (`information_schema`) + `null_frac` (`pg_stats`) + target densities |
+| **Detector : SARGable** | `src/db/queries.rs::get_missing_sargable_indexes` | Real AST parser (sqlparser) + real types (`format_type`) + `null_frac` (`pg_stats`) + target densities; resolves **B-tree / GIN / GIST** from (operator, type) |
 | **LayaClient** | `src/laya/mod.rs` | HTTP client — **`deep_health()`** (real test payload, validated response), `decision()`, `build_payload()` |
-| **DDL Engine** | `src/ddl.rs` | **Online** execution: `CONCURRENTLY` in auto-commit (CREATE/REINDEX), DROP in BEGIN/COMMIT, post-DDL validation + cleanup of INVALID indexes |
+| **DDL Engine** | `src/ddl.rs` | **Online** execution: `CONCURRENTLY` in auto-commit (CREATE/REINDEX), DROP in BEGIN/COMMIT, post-DDL validation + cleanup of INVALID indexes; emits `USING gin\|gist` when the method is not B-tree |
 | **IndexLog Writer** | `src/index_log.rs` | Structured history of operations (JSON, file rotation) |
 | **Config** | `src/config.rs` | YAML loading — multi-schema, pool, densities by type, thresholds |
 | **db Pool** | `src/db/mod.rs` | deadpool-postgres pool — **configurable max size + wait timeout** + **rustls TLS** (chain + hostname always validated, web PKI roots + optional PEM) |
@@ -199,7 +199,7 @@ is unavailable (no extension / index < 100 pages / probe failure)
 
 ### 5.3 SARGable queries without index
 
-**Source** : `pg_stat_statements` + **sqlparser-rs** parser (new) + `information_schema.columns` + `pg_stats` + `pg_class`
+**Source** : `pg_stat_statements` + **sqlparser-rs** parser (new) + real types (`format_type` via `pg_attribute`) + `pg_stats` + `pg_class`
 
 **Filters**:
 - `calls > 10` (minimum observed)
@@ -207,12 +207,25 @@ is unavailable (no extension / index < 100 pages / probe failure)
 - Exclusion of DDL, system queries, `pg_*` catalogs
 - **Multi-schema scope**: non-empty `analysis.schemas` → only these tables
 
-**SARGable detected (AST)**:
+**SARGable detected (AST)** — the operator **and** the column's real type
+resolve the index method (`resolve_index_method`):
+
+*B-tree* (scalar equality / range — any scalar type):
 - `col = v`, `col > v`, `col < v`, `col >= v`, `col <= v` (value not a column)
 - `col IN (v1, …)` (non-negated), `col BETWEEN a AND b` (non-negated)
 - `col IS [NOT] NULL`
 - `col LIKE 'pref…%'` / `ILIKE` (**prefix** pattern only)
 - `AND` / `OR` / nested parentheses (recursive traversal)
+
+*GIN* (containment / key-existence / full-text / overlap):
+- `jsonb`: `col @> v`, `col ? v`, `col ?& v`, `col ?| v`, `col @? v`
+- `hstore`: `col @> v`, `col ? v`
+- array: `col @> v`, `col && v`
+- `tsvector`: `col @@ tsquery`
+
+*GIST* (geometry / ranges):
+- geometry / geography: `col @@ v` (spatial), `col && v` (bbox)
+- range types (`int4range`, `tsrange`, …): `col @> v` (containment)
 
 **Rejected (non-SARGable)**:
 - `NOT ( … )`, `IS [NOT] DISTINCT FROM`
@@ -220,20 +233,31 @@ is unavailable (no extension / index < 100 pages / probe failure)
 - Functions on the column (`LOWER(col)`, `UPPER(col)`, `CAST(col …)`)
 - Column-to-column comparison
 - `LIKE`/`ILIKE` with a leading wildcard or non-literal pattern
+- `col <@ v` (reverse containment) — the indexable side is the RIGHT operand,
+  never the left column, so it is intentionally not detected
 
-**Enrichment (new)**: for each candidate column, the daemon loads
-the **real type** (`information_schema.columns`), the **nullability**, the
-**NULL fraction** (`pg_stats.null_frac`), and the table **cardinality**
-(`pg_class.reltuples`) to estimate the size of the future index via the
-**target density of the type bucket** (`density_by_type.*`).
+**Enrichment**: for each candidate column, the daemon loads the **real type**
+(`format_type(atttypid, atttypmod)` via `pg_attribute` — `information_schema.data_type`
+is too lossy for arrays / user types), the **nullability**, the **NULL fraction**
+(`pg_stats.null_frac`), and the table **cardinality** (`pg_class.reltuples`) to
+resolve the index method and estimate the size of the future index via the
+**target density of the type bucket** (`density_by_type.*`). A GIN/GIST index is
+typically larger than a B-tree, so the estimate is multiplied by a configurable
+size factor (`density_by_type.gin_size_factor`, `.gist_size_factor`).
 
 **Existing index**: check via `pg_indexes` — columns already covered
 (1st position) are filtered.
 
 **Proposed action**:
-- Standard: `CREATE INDEX CONCURRENTLY IF NOT EXISTS schema.idx_table_col ON schema.table(col)`
+- Standard: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_table_col ON schema.table(col)`
+- GIN/GIST: `… ON schema.table USING gin (col)` / `… USING gist (col)` (emitted
+  only for GIN/GIST columns — B-tree DDL has no `USING`)
 - Filtered (if `null_frac > 0.10`): `… WHERE col IS NOT NULL`
-- Index name: `idx_<table>_<col>` validated (≤ 63 bytes, short hash if needed)
+- Index name: `idx_<table>_<col>` validated (≤ 63 bytes, short hash if needed);
+  **not** schema-qualified (PostgreSQL forbids it — the index is created in the
+  table's schema)
+- Toggle: `thresholds.use_gin_gist_detection` (default `true`) — `false`
+  restricts detector #3 to B-tree proposals
 
 ## 6. Laya decision
 
@@ -358,7 +382,7 @@ Structured JSONL file, by default at `/var/log/pgindexai/index_operations.log`:
 | `pg_stat_statements` absent | Daemon `DEGRADED`: unused + fragmentation active, missing-index detection **disabled** (no data source) |
 | Laya unreachable / invalid response | **No DDL applied** — proposals generated and logged, application deferred to the next cycle (no fallback) |
 | PostgreSQL server restarted less than `unused_minutes` ago | "Unused indexes" analysis **skipped** for the cycle (no false detection) |
-| Non-B-tree index (GIN/GIST/SP-GiST/BRIN) | **Out of scope for both detectors**: #2 technically (`pgstatindex()` is B-tree-only) and #3 by design (no `USING` clause in the generated DDL → B-tree proposals only). GIN workloads (`jsonb @>`, `tsvector @@`, arrays) and GIST workloads (geometry, ranges) receive **no proposals** — index them manually |
+| Non-B-tree index (GIN/GIST/SP-GiST/BRIN) | **Detector #2 (bloat): B-tree only** — `pgstatindex()` is a B-tree-only function, so physical bloat scoring covers B-tree indexes exclusively (a bloated GIN/GIST index is not flagged for REINDEX there; it can still be dropped by detector #1 when unused). **Detector #3 (SARGable): B-tree + GIN + GIST** — resolves the access method from the (operator, real column type) pair and emits `USING gin` / `USING gist` (toggle `use_gin_gist_detection`). Detection is operator- not function-driven (e.g. PostGIS `ST_DWithin` is not detected — only the `@@`/`&&`/`@>` operators); an unknown column type with a GIN/GIST operator defaults to GIN (best-effort) |
 | Laya offline at startup | `deep_health()` FAILED → explicit warning; the daemon continues (observation mode) |
 | Index name > 63 bytes | Truncated + short hash suffix (FNV-1a base 36) — identifier always valid |
 | `ssl_mode ≠ disable` + unvalidatable certificate (chain or hostname) | **Connection refused** (rustls always validates chain + hostname) — no "accept-insecure" mode |

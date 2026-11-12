@@ -9,8 +9,8 @@ required. Everything here is safe to run repeatedly: it creates its own
 
 | File               | What it does |
 |--------------------|--------------|
-| `demo_schema.sql`  | Creates the `pgindexai_demo` database, **5 tables** (≈ 772k rows) and **23 indexes**, and enables `pg_stat_statements` + `pgstattuple`. |
-| `demo_workload.sql`| **8 phases** of realistic queries + heavy DML that put the 3 detectors in a position to find something. |
+| `demo_schema.sql`  | Creates the `pgindexai_demo` database, **7 tables** (≈ 782k rows — including the GIN/GIST candidates `events` and `bookings`) and **23 indexes**, and enables `pg_stat_statements` + `pgstattuple`. |
+| `demo_workload.sql`| **9 phases** of realistic queries + heavy DML that put the 3 detectors in a position to find something, including a **GIN/GIST workload** (jsonb containment, array overlap, range containment). |
 | `pgindexai.test.yaml` | Ready-to-use test config (peer-auth `postgres` user, lowered thresholds, no log file). |
 
 ## What the demo lets you verify
@@ -19,7 +19,7 @@ required. Everything here is safe to run repeatedly: it creates its own
 |---|----------|------------------------------|----------------------------|
 | 1 | **Unused indexes** | Indexes never scanned since the counters' reset (`idx_scan = 0`), e.g. `idx_products_stock`, `idx_customers_city` | `DROP INDEX IF EXISTS …` |
 | 2 | **Fragmented indexes** | Physically bloated B-trees on `order_items` after churn — leaf fill measured via `pgstattuple`, so it fires **even after VACUUM/ANALYZE** | `REINDEX INDEX CONCURRENTLY …` |
-| 3 | **Unindexed SARGable queries** | High-frequency filterable columns with no covering index, e.g. `orders.shipping_method`, `users.is_active` | `CREATE INDEX …` |
+| 3 | **Unindexed SARGable queries** | High-frequency filterable columns with no covering index: B-tree scalar columns (`orders.shipping_method`, `users.is_active`) **and GIN/GIST columns** (`events.payload` jsonb, `events.tags` text[], `bookings.period` int4range) | `CREATE INDEX … [USING gin\|gist] …` |
 
 > **No-fallback guarantee:** the daemon *detects, generates and logs* proposals
 > even with no Laya server available — but it only **applies** DDL when Laya is
@@ -62,7 +62,7 @@ required. Everything here is safe to run repeatedly: it creates its own
 # 1. Load the demo schema (creates pgindexai_demo + data + pg_stat_statements)
 psql -U postgres -v ON_ERROR_STOP=1 -f sql/demo_schema.sql
 
-# 2. Run the workload (8 phases — a few minutes)
+# 2. Run the workload (9 phases — a few minutes)
 psql -U postgres -d pgindexai_demo -v ON_ERROR_STOP=1 -f sql/demo_workload.sql
 
 # 3. Analyze and PRINT proposals only (no side effects)
@@ -86,7 +86,10 @@ psql -U postgres -v ON_ERROR_STOP=1 -f sql/demo_schema.sql
 This:
 - creates the `pgindexai_demo` database (skips creation if it already exists),
 - enables `pg_stat_statements` and `pgstattuple` (no-ops if already present),
-- creates **5 tables** and loads **≈ 772k rows**,
+- creates **7 tables** and loads **≈ 782k rows** — the 5 classic tables
+  (customers, products, orders, order_items, users) **plus the GIN/GIST
+  candidates** `events` (jsonb `payload` + `text[]` `tags`) and `bookings`
+  (int4range `period`), the latter two **without any index** on those columns,
 - creates **23 indexes** (several intentionally left unused),
 - runs `ANALYZE` and prints a summary.
 
@@ -99,6 +102,8 @@ NOTICE:    order_items: 500000 rows
 NOTICE:    orders: 200000 rows
 NOTICE:    products: 5000 rows
 NOTICE:    users: 2000 rows
+NOTICE:    events: 30000 rows
+NOTICE:    bookings: 20000 rows
 NOTICE:  === Index ===
 NOTICE:    customers_email_key: 680 kB
 NOTICE:    idx_products_stock: 88 kB
@@ -111,14 +116,25 @@ NOTICE:    idx_products_stock: 88 kB
 psql -U postgres -d pgindexai_demo -v ON_ERROR_STOP=1 -f sql/demo_workload.sql
 ```
 
-Takes a few minutes (≈ 17,000 query iterations + `VACUUM FULL`). The phases:
+Takes a few minutes (≈ 22,000 query iterations + `VACUUM FULL`). The phases:
 
 | Phase | What it does | Feeds detector |
 |-------|--------------|----------------|
 | 0 | Baseline queries across all tables (some on unindexed columns) | #3 (SARGable) |
 | 1–5 | Realistic search / report / join workloads (use existing indexes) | keeps some indexes "used" |
 | 6 | **Heavy DML**: mass DELETE + INSERT + UPDATE, then `VACUUM FULL`, plus a partial index on `orders(status)` (a *candidate* unused index — the phase 7 `status` filters may still use it) | #1 (unused) + #2 (fragmentation) |
-| 7 | **Repetitive SARGable queries** (`EXECUTE … USING`) to build up `pg_stat_statements.calls` above the threshold | #3 (SARGable) |
+| 7 | **Repetitive B-tree SARGable queries** (`EXECUTE … USING`) to build up `pg_stat_statements.calls` above the threshold | #3 (SARGable) |
+| 8 | **Repetitive GIN/GIST queries** (`EXECUTE … USING`): `events.payload @> {…}` ×2000 (jsonb containment → **GIN**), `events.tags && ARRAY[…]` ×1500 (array overlap → **GIN**), `bookings.period @> int4range(…)` ×1500 (range containment → **GIST**) | #3 (SARGable — GIN/GIST) |
+
+> **`pg_stat_statements.track = 'all'` is required for phases 7–8.** The
+> repetitive queries run inside PL/pgSQL `DO` blocks via
+> `EXECUTE … USING`; with the default `track = 'top'`, pg_stat_statements only
+> records top-level statements — the `DO` block as a whole, **not** the
+> individual `EXECUTE`d queries — so detector #3 would see nothing. The file
+> therefore starts with `SET pg_stat_statements.track = 'all';` (a per-session
+> GUC — no server restart, but it requires the **superuser** role, which is why
+> the demo runs as `postgres`). If you build your own workload, add the same
+> `SET` before the loops.
 
 The file ends with a final `ANALYZE` and four diagnostic reports (index usage /
 scans = 0, fragmentation density, top queries by exec time, unused indexes) so
@@ -165,22 +181,29 @@ output is plain log lines you can read directly; if you switch to
 
 ## What to expect (verified output)
 
-On a freshly loaded demo, `pgindexai run --dry-run` produces **8 or 9 proposals**
-(4 `CREATE` + 4 or 5 `DROP`). Both variants are verified; the difference is
-`idx_items_date`, see below. Example of the 8-proposal run:
+On a freshly loaded demo, `pgindexai run --dry-run` produces **11 or 12
+proposals** (7 `CREATE` + 4 or 5 `DROP`). Both variants are verified; the
+difference is `idx_items_date`, see below. Example of the 11-proposal run:
 
 ```
-INFO  Analysis complete: 8 proposals generated
+INFO  Analysis complete: 11 proposals generated
 INFO  Proposal: [DROP INDEX]   idx_customers_email on public.customers   ( 696320 bytes)
 INFO  Proposal: [DROP INDEX]   idx_products_sku    on public.products    ( 180224 bytes)
 INFO  Proposal: [DROP INDEX]   idx_customers_city  on public.customers   (  98304 bytes)
 INFO  Proposal: [DROP INDEX]   idx_products_stock  on public.products    (  90112 bytes)
-INFO  Proposal: [CREATE INDEX] SARGable public.orders.shipping_method (1000 calls, varchar)
-INFO  Proposal: [CREATE INDEX] SARGable public.orders.total_amount    ( 800 calls, numeric)
-INFO  Proposal: [CREATE INDEX] SARGable public.products.is_active     ( 800 calls, boolean)
-INFO  Proposal: [CREATE INDEX] SARGable public.users.is_active        ( 800 calls, boolean)
-INFO  DRY-RUN: skipping Laya + DDL — 8 proposal(s) NOT applied
+INFO  Proposal: [CREATE INDEX] SARGable public.orders.shipping_method (5000 calls, character varying(50)). Proposed B-tree index.
+INFO  Proposal: [CREATE INDEX] SARGable public.orders.total_amount    (3000 calls, numeric(14,2)). Proposed B-tree index.
+INFO  Proposal: [CREATE INDEX] SARGable public.products.is_active     (3000 calls, boolean). Proposed B-tree index.
+INFO  Proposal: [CREATE INDEX] SARGable public.users.is_active        (2000 calls, boolean). Proposed B-tree index.
+INFO  Proposal: [CREATE INDEX] SARGable public.events.payload         (2000 calls, jsonb). Proposed GIN index (×3 GIN size factor).
+INFO  Proposal: [CREATE INDEX] SARGable public.events.tags            (1500 calls, text[]). Proposed GIN index (×3 GIN size factor).
+INFO  Proposal: [CREATE INDEX] SARGable public.bookings.period        (1500 calls, int4range). Proposed GIST index (×2 GIST size factor).
+INFO  DRY-RUN: skipping Laya + DDL — 11 proposal(s) NOT applied
 ```
+
+(The lines above are abbreviated — the daemon also prints the null fraction,
+the target density per type bucket and the estimated index size for each
+proposal.)
 
 Reading it:
 - **4–5 × `DROP INDEX`** → detector #1 found the indexes never scanned. The
@@ -192,14 +215,21 @@ Reading it:
   and drops out of the list (verified: 3 scans / 250 004 tuples in one run →
   4 `DROP`s total; 0 scans in another run → 5 `DROP`s). Both outcomes are
   correct daemon behavior.
-- **4 × `CREATE INDEX`** → detector #3 found four high-frequency filterable
-  columns with no covering index. `orders.shipping_method` and
-  `orders.total_amount` (phase 7e) are the intended "missing index" targets;
-  `users.is_active` / `products.is_active` are legitimate low-selectivity
-  booleans the detector also surfaces. (The other SARGable columns of the
-  workload — `orders.status`, `products.category`, `users.role`,
+- **4 × `CREATE INDEX` (B-tree)** → detector #3 found four high-frequency
+  scalar filterable columns with no covering index. `orders.shipping_method`
+  and `orders.total_amount` (phase 7e) are the intended "missing index"
+  targets; `users.is_active` / `products.is_active` are legitimate
+  low-selectivity booleans the detector also surfaces. (The other SARGable
+  columns of the workload — `orders.status`, `products.category`, `users.role`,
   `customers.country` — already have covering indexes in the demo schema and
   are correctly *not* proposed.)
+- **2 × `CREATE INDEX` (GIN)** + **1 × `CREATE INDEX` (GIST)** → detector #3
+  found the GIN/GIST workload (phase 8) and resolved the access method from
+  the **(operator, column type)** pair: `events.payload @> {…}` on **jsonb**
+  → `USING gin`; `events.tags && ARRAY[…]` on **text[]** → `USING gin`;
+  `bookings.period @> int4range(…)` on **int4range** → `USING gist`. The GIN
+  size factor (×3) and GIST size factor (×2) are applied to the estimated
+  index size — see the "×N size factor" note in each proposal line.
 - **`REINDEX`** (detector #2) is **absent** right after a fresh load — the
   indexes are healthy (~90 % leaf fill, score ≈ 0) and the legacy counters are
   ~0 after the final `ANALYZE`. Churn + `VACUUM` to trigger it — see
@@ -317,6 +347,80 @@ INFO  Proposal: [REINDEX] Index public.idx_items_date    fragmentation at 75.0% 
 
 ---
 
+## Triggering the GIN/GIST detector
+
+Detector #3 resolves the **index access method** from the pair
+**(matched operator, real column type)** — `resolve_index_method` — so the same
+predicate can yield B-tree, GIN or GIST depending on the column it filters:
+
+| Operator | jsonb / hstore / array / tsvector | geometry / geography / `*range` | scalar |
+|----------|-----------------------------------|---------------------------------|--------|
+| `@>`     | **GIN**                           | **GIST**                        | B-tree |
+| `@@`     | **GIN** (tsvector only)           | **GIST**                        | —      |
+| `&&`     | **GIN** (array only)              | **GIST** (geometry only)        | —      |
+| `?`, `?&`, `?|`, `@?` | **GIN** | — | —      |
+| `=`, `<`, `>`, `IN`, `BETWEEN`, `LIKE` (prefix) | — | — | **B-tree** |
+
+The demo feeds this with **phase 8** of the workload (see
+[Step 2](#step-2-run-the-workload)): `events.payload @> {…}` (jsonb, 2000
+calls), `events.tags && ARRAY[…]` (text[], 1500 calls) and
+`bookings.period @> int4range(…)` (1500 calls) — the three columns have **no
+index**, so all three are proposed.
+
+### Recipe
+
+The GIN/GIST workload is part of the standard workload (phase 8 runs
+immediately after phase 7), so the quick start already covers it:
+
+```bash
+psql -U postgres -v ON_ERROR_STOP=1 -f sql/demo_schema.sql
+psql -U postgres -d pgindexai_demo -v ON_ERROR_STOP=1 -f sql/demo_workload.sql
+pgindexai run --dry-run -c sql/pgindexai.test.yaml | grep -iE 'GIN|GIST'
+```
+
+> **If you wrote your own workload**, the `EXECUTE … USING` loops must run
+> with `SET pg_stat_statements.track = 'all';` first (see the note in
+> [Step 2](#step-2-run-the-workload)) — otherwise pg_stat_statements only
+> records the `DO` block and the per-query rows detector #3 needs never exist.
+>
+> **`track = 'all'` requires the superuser role** (the test config connects as
+> `postgres`, so it works out of the box). It is a **per-session** GUC: the
+> `SET` at the top of `demo_workload.sql` only affects that session and is not
+> persisted — no server restart, no config file change.
+
+### Verified output
+
+(Captured on a local PG 16.15 demo — the exact call counts depend on how many
+times the workload was run, since `pg_stat_statements` aggregates across runs;
+the fresh-load values are 2000 / 1500 / 1500 for the three queries.)
+
+```
+INFO  Proposal: [CREATE INDEX] SARGable query on public.events: payload (type: jsonb, 2000 calls, 7.3ms avg, null_frac: 0.00). No covering index. Proposed GIN index (×3 GIN size factor). Target density for default: 50 tuples/page, estimated index size: 14745600 bytes.
+INFO  Proposal: [CREATE INDEX] SARGable query on public.events: tags (type: text[], 2000 calls, 7.3ms avg, null_frac: 0.00). No covering index. Proposed GIN index (×3 GIN size factor). Target density for default: 50 tuples/page, estimated index size: 14745600 bytes.
+INFO  Proposal: [CREATE INDEX] SARGable query on public.bookings: period (type: int4range, 1500 calls, 2.4ms avg, null_frac: 0.00). No covering index. Proposed GIST index (×2 GIST size factor). Target density for default: 50 tuples/page, estimated index size: 6553600 bytes.
+```
+
+The generated DDL (visible in the proposal and in the audit log) is
+`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_payload ON public.events
+USING gin (payload)` etc. — `USING gin` / `USING gist` is emitted only for the
+GIN/GIST proposals; B-tree proposals carry no `USING` clause.
+
+> **Honest limits of the GIN/GIST detection** (also in the main
+> [`README.md`](../README.md)): detection is **operator-driven**, not
+> function-driven — `ST_DWithin(geom, …)` (PostGIS) is *not* detected, only
+> the `@@` / `&&` / `@>` operators are; a GIN/GIST operator on a column type
+> the daemon does not recognize defaults to **GIN** (best-effort); and detector
+> #2 (bloat) remains **B-tree-only** — a bloated GIN/GIST index is not scored
+> for REINDEX there (it can still be dropped by detector #1 when unused).
+
+### Turning it off
+
+Set `thresholds.use_gin_gist_detection: false` to restrict detector #3 to
+classic B-tree SARGable patterns (the pre-GIN/GIST behavior — GIN/GIST
+workloads receive no proposal).
+
+---
+
 ## Resetting the demo (start over)
 
 The demo is idempotent for the tables it drops, but `customers` is **not** in
@@ -351,6 +455,8 @@ for a fast, local, no-secret test:
   (`unused_minutes: 1`, `fragmentation_pct: 50`);
 - enables the physical bloat criterion (`use_index_bloat: true`) —
   `demo_schema.sql` installs `pgstattuple` in the demo database;
+- enables GIN/GIST detection (`use_gin_gist_detection: true`) — phase 8 of the
+  workload feeds it (jsonb / array → GIN, range → GIST);
 - disables the index-operation log file (no `/var/log` write needed).
 
 To test with the **dedicated `pgindexai` role** instead (closer to production),
@@ -388,6 +494,7 @@ thresholds:
   unused_minutes: 1             # LOW for the test (default 10080 = 7 days)
   fragmentation_pct: 50         # LOWER for the test (default 70)
   use_index_bloat: true         # physical bloat via pgstattuple (installed by demo_schema.sql)
+  use_gin_gist_detection: true  # GIN/GIST detection ON (jsonb/hstore/arrays → GIN, ranges → GIST)
   min_sargable_rows: 100
   min_confidence: 0.7
   max_proposals_per_cycle: 20
@@ -451,6 +558,17 @@ for the recipes:
 - The daemon reads `pg_stat_statements` **across databases** (it does not filter
   by `dbid`), so entries recorded in a previous `pgindexai_demo` still count —
   this is why the demo works even right after a reload.
+- **`EXECUTE … USING` workloads invisible** → with the default
+  `pg_stat_statements.track = top`, queries executed inside PL/pgSQL `DO`
+  blocks are recorded as the *block*, not per query. Start the session with
+  `SET pg_stat_statements.track = 'all';` (superuser required, per-session —
+  see [Triggering the GIN/GIST detector](#triggering-the-gin-gist-detector)).
+  The shipped `demo_workload.sql` already does this at the top.
+- **No GIN/GIST proposals on jsonb / array / range columns** → either
+  `thresholds.use_gin_gist_detection: false` (detection restricted to B-tree),
+  or the workload uses an operator outside the recognized set (e.g.
+  `ST_DWithin(…)` instead of `@@` / `&&`) — detection is operator-driven, see
+  the limits note in [Triggering the GIN/GIST detector](#triggering-the-gin-gist-detector).
 
 ### `Laya deep health FAILED … Decisions will be SKIPPED (no fallback)`
 Expected when Laya is not running. The daemon still **prints** all proposals

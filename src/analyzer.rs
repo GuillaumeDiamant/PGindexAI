@@ -162,6 +162,7 @@ impl Analyzer {
                 schema: idx.schemaname,
                 index_name: Some(idx.indexname),
                 column: None,
+                index_method: None, // DROP INDEX: not applicable
             });
         }
 
@@ -227,6 +228,7 @@ impl Analyzer {
                     schema: idx.schemaname,
                     index_name: Some(idx.indexname),
                     column: None,
+                    index_method: None, // REINDEX: not applicable
                 });
             }
         }
@@ -282,6 +284,20 @@ impl Analyzer {
                     continue;
                 }
 
+                // GIN/GIST detection can be disabled (B-tree-only proposals —
+                // the pre-GIN/GIST behavior). `index_method` already encodes
+                // the decision ("btree" for scalar operators, "gin"/"gist"
+                // for containment / full-text / overlap operators).
+                if !col.index_method.eq_ignore_ascii_case("btree")
+                    && !self.config.thresholds.use_gin_gist_detection
+                {
+                    debug!(
+                        "GIN/GIST detection disabled — skipping {}.{} (would be a {} index)",
+                        miss.schemaname, miss.tablename, col.index_method
+                    );
+                    continue;
+                }
+
                 // Explicit naming convention + length validation
                 let idx_name = match naming::generate_index_name(
                     &miss.schemaname,
@@ -305,11 +321,25 @@ impl Analyzer {
                 } else {
                     0
                 };
-                let est_bytes = est_pages.saturating_mul(8192);
+                // GIN/GIST indexes are typically larger than a B-tree for the
+                // same column: apply the configured size factor (1.0 for B-tree).
+                let size_factor = self.gin_gist_size_factor(&col.index_method);
+                let est_bytes = ((est_pages as f64 * 8192.0) * size_factor).ceil() as i64;
 
+                let method_label = match col.index_method.to_ascii_lowercase().as_str() {
+                    "gin" => "GIN",
+                    "gist" => "GIST",
+                    _ => "B-tree",
+                };
+                let factor_note = if size_factor > 1.0 {
+                    format!(" (×{size_factor} {method_label} size factor)")
+                } else {
+                    String::new()
+                };
                 let reason = format!(
                     "SARGable query on {}.{}: {} (type: {}, {} calls, {:.1}ms avg, null_frac: {:.2}). \
-                     No covering index. Target density for {}: {:.0} tuples/page, estimated index size: {} bytes.",
+                     No covering index. Proposed {method_label} index{factor_note}. \
+                     Target density for {}: {:.0} tuples/page, estimated index size: {} bytes.",
                     miss.schemaname,
                     miss.tablename,
                     col.column_name,
@@ -327,13 +357,17 @@ impl Analyzer {
                 // the other variant at apply time, see apply_proposals)
                 let filtered = col.is_nullable && col.null_frac > 0.1;
 
-                // Online DDL: CREATE INDEX CONCURRENTLY (does not block writes)
+                // Online DDL: CREATE INDEX CONCURRENTLY (does not block writes).
+                // The access method (btree/gin/gist) is resolved from
+                // (matched operator, column type) — byte-identical to the
+                // pre-GIN/GIST DDL when the method is btree.
                 let ddl = ddl::build_create_index_ddl(
                     &miss.schemaname,
                     &idx_name,
                     &miss.tablename,
                     &col.column_name,
                     filtered,
+                    &col.index_method,
                 );
 
                 let action = if filtered {
@@ -351,6 +385,7 @@ impl Analyzer {
                     schema: miss.schemaname.clone(),
                     index_name: Some(idx_name),
                     column: Some(col.column_name.clone()),
+                    index_method: Some(col.index_method.clone()),
                 });
             }
         }
@@ -372,6 +407,17 @@ impl Analyzer {
             "uuid" => d.uuid,
             "bool" => d.bool,
             _ => d.default_density,
+        }
+    }
+
+    /// GIN/GIST size factor for the access method (1.0 for B-tree).
+    /// GIN is typically ~3× a B-tree, GIST ~2× (configurable, validated > 0).
+    fn gin_gist_size_factor(&self, method: &str) -> f64 {
+        let d = &self.config.density_by_type;
+        match method.to_ascii_lowercase().as_str() {
+            "gin" => d.gin_size_factor,
+            "gist" => d.gist_size_factor,
+            _ => 1.0,
         }
     }
 
@@ -519,6 +565,7 @@ impl Analyzer {
                                                 &proposal.table,
                                                 column,
                                                 filtered,
+                                                proposal.index_method.as_deref().unwrap_or("btree"),
                                             )
                                         }
                                         _ => proposal.ddl.clone(),
@@ -530,6 +577,7 @@ impl Analyzer {
                                         &self.log_writer,
                                         Some(confidence),
                                         Some(proposal.reason.clone()),
+                                        Some(proposal.index_method.as_deref().unwrap_or("btree")),
                                     )
                                     .await
                                     {
@@ -726,7 +774,9 @@ fn sanitize_reason_field(raw: &str) -> String {
     let cleaned: String = raw
         .chars()
         .take(SANITIZED_MAX_LEN)
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | ' ' | '(' | ')' | ',' | '/'))
+        .filter(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '_' | ' ' | '(' | ')' | ',' | '/' | '[' | ']')
+        })
         .collect();
     if cleaned.is_empty() {
         "unknown".to_string()
@@ -745,7 +795,7 @@ mod tests {
             sanitize_reason_field("character varying"),
             "character varying"
         );
-        assert_eq!(sanitize_reason_field("int[]"), "int"); // brackets removed
+        assert_eq!(sanitize_reason_field("int[]"), "int[]"); // array brackets kept (real type)
         assert_eq!(sanitize_reason_field(""), "unknown");
         assert_eq!(
             sanitize_reason_field("a; DROP TABLE x; --"),

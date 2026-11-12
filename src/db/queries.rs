@@ -53,12 +53,23 @@ pub struct MissingSargableIndex {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SargableColumn {
     pub column_name: String,
-    /// Actual PostgreSQL type (e.g. "integer", "character varying")
+    /// Actual PostgreSQL type (e.g. "integer", "jsonb", "text[]", "int4range") —
+    /// the real type name from `format_type(atttypid, atttypmod)` (not the
+    /// lossy `information_schema.data_type`, which reports "ARRAY" /
+    /// "USER-DEFINED" for arrays and extension types).
     pub column_type: String,
     pub is_nullable: bool,
     pub null_frac: f64,
     /// Density bucket (e.g. "int4", "varchar", "timestamptz", "default")
     pub density_bucket: String,
+    /// The predicate operator that matched this column: "=" / ">" / "IN" /
+    /// "BETWEEN" / "LIKE" / "IS NULL" (classic B-tree SARGable), or one of
+    /// the GIN/GIST-family operators: "@>", "@@", "&&", "?", "?&", "?|", "@?".
+    pub matched_operator: String,
+    /// Resolved index access method: "btree" | "gin" | "gist".
+    /// Computed from (matched_operator, column_type) after type enrichment;
+    /// stays "btree" while the type is unknown (conservative).
+    pub index_method: String,
 }
 
 /// Cardinality of a table (to estimate the size of a future index)
@@ -500,7 +511,7 @@ pub async fn get_missing_sargable_indexes(
             continue;
         };
 
-        for (schemaname, tablename, column) in attributed {
+        for (schemaname, tablename, column, operator) in attributed {
             if !in_scope(&schemaname) {
                 continue;
             }
@@ -545,13 +556,17 @@ pub async fn get_missing_sargable_indexes(
                     is_nullable: true,
                     null_frac: 0.0,
                     density_bucket: "default".to_string(),
+                    matched_operator: operator,
+                    // Resolved after type enrichment (below); conservative
+                    // default while the type is unknown.
+                    index_method: "btree".to_string(),
                 });
                 column_queries.push((schemaname, tablename, column));
             }
         }
     }
 
-    // Enrich with the actual types (information_schema) and null_frac (pg_stats)
+    // Enrich with the actual types (pg_attribute/format_type) and null_frac (pg_stats)
     let column_meta = fetch_column_metadata(pool, &column_queries).await?;
     for miss in by_table.values_mut() {
         for col in miss.sargable_columns.iter_mut() {
@@ -563,7 +578,12 @@ pub async fn get_missing_sargable_indexes(
                 col.column_type = meta.data_type.clone();
                 col.is_nullable = meta.nullable;
                 col.null_frac = meta.null_frac;
-                col.density_bucket = map_pg_type_to_bucket(&meta.data_type);
+                col.density_bucket = map_pg_type_to_bucket(&col.column_type);
+                // Resolve the index method now that the real type is known
+                // ("btree" for scalar operators; "gin"/"gist" for
+                // containment / full-text / overlap operators).
+                col.index_method =
+                    resolve_index_method(&col.matched_operator, &col.column_type).to_string();
             }
         }
     }
@@ -686,21 +706,34 @@ pub async fn cleanup_invalid_indexes(
 // ─────────────────────────────────────────────
 
 /// Parsing result: SARGable columns **attributed to their table**
-/// (schema, table, column).
+/// (schema, table, column, operator).
+///
+/// The fourth element is the operator that matched the predicate
+/// ("btree" for classic scalar comparisons, or a GIN/GIST-family operator:
+/// "@>", "@@", "&&", "?", "?&", "?|", "@?") — the analyzer uses it to
+/// resolve the index method (B-tree / GIN / GIST).
 ///
 /// In case of JOIN, columns are attributed via the aliases (`a.status` →
 /// table of alias `a`); a NON qualified column is only accepted if
 /// the query references only ONE table (otherwise the attribution would be a
 /// false positive — that's the conservative behavior).
-type AttributedColumns = Vec<(String, String, String)>;
+type AttributedColumns = Vec<(String, String, String, String)>;
 
 /// Extract the SARGable columns of a query via sqlparser-rs, with
 /// table attribution (JOIN aliases included).
 ///
-/// SARGable = column compared directly to a value/literal/placeholder
-/// (col = v, col > v, col IN (v1,v2), col BETWEEN a AND b, col IS [NOT] NULL,
-///  col LIKE 'pref%'). Functions on the column (LOWER(col), CAST(col...))
-/// and LIKE '%...' are NOT SARGable.
+/// SARGable = column compared directly to a value/literal/placeholder:
+/// - **B-tree** patterns: `col = v`, `col > v`, `col IN (v1,v2)`,
+///   `col BETWEEN a AND b`, `col IS [NOT] NULL`, `col LIKE 'pref%'`
+/// - **GIN/GIST** patterns: `col @> v` (containment), `col @@ v` (full-text /
+///   intersects), `col && v` (overlap), `col ? v` / `col ?& v` / `col ?| v`
+///   (jsonb/hstore keys), `col @? v` (jsonpath)
+///
+/// Functions on the column (LOWER(col), CAST(col...)) and `LIKE '%...'`
+/// are NOT SARGable. The reverse containment `v <@ col` is NOT collected
+/// (its indexable side is the right operand, not the left column).
+/// The resolved (schema, table, column, operator) tuples let the analyzer
+/// pick the index method (B-tree / GIN / GIST) from the column type.
 fn parse_query_for_sargable(query: &str) -> Option<AttributedColumns> {
     let dialect = sqlparser::dialect::PostgreSqlDialect {};
     let dialect_ref: &dyn sqlparser::dialect::Dialect = &dialect;
@@ -759,10 +792,10 @@ fn parse_query_for_sargable(query: &str) -> Option<AttributedColumns> {
                 }
 
                 if let Some(selection) = &select.selection {
-                    let mut raw: Vec<(Option<String>, String)> = Vec::new(); // (qualifier, column)
+                    let mut raw: Vec<(Option<String>, String, String)> = Vec::new(); // (qualifier, column, operator)
                     collect_sargable(selection, &mut raw);
 
-                    for (qualifier, col) in raw {
+                    for (qualifier, col, op) in raw {
                         let resolved = match &qualifier {
                             // Qualified column: alias or table name
                             Some(q) => tables.iter().find(|(alias, _, t)| {
@@ -774,11 +807,19 @@ fn parse_query_for_sargable(query: &str) -> Option<AttributedColumns> {
                         };
                         if let Some((_, s, t)) = resolved {
                             let (s, t) = (s.clone(), t.clone());
-                            if !out
-                                .iter()
-                                .any(|(s2, t2, c2)| s2 == &s && t2 == &t && c2 == &col)
+                            match out
+                                .iter_mut()
+                                .find(|(s2, t2, c2, _)| s2 == &s && t2 == &t && c2 == &col)
                             {
-                                out.push((s, t, col));
+                                Some(entry) => {
+                                    // Same column matched by a scalar AND a
+                                    // GIN/GIST predicate: the GIN/GIST operator
+                                    // wins (it is the appropriate access method).
+                                    if entry.3 == "btree" && op != "btree" {
+                                        entry.3 = op;
+                                    }
+                                }
+                                None => out.push((s, t, col, op)),
                             }
                         }
                         // Unresolved (subquery, function, unknown alias) → ignored
@@ -795,8 +836,8 @@ fn parse_query_for_sargable(query: &str) -> Option<AttributedColumns> {
     }
 }
 
-/// Walk the expression tree and collect the SARGable (qualifier, column)
-fn collect_sargable(expr: &sqlparser::ast::Expr, out: &mut Vec<(Option<String>, String)>) {
+/// Walk the expression tree and collect the SARGable (qualifier, column, operator)
+fn collect_sargable(expr: &sqlparser::ast::Expr, out: &mut Vec<(Option<String>, String, String)>) {
     use sqlparser::ast::{BinaryOperator, UnaryOperator};
 
     match expr {
@@ -815,7 +856,30 @@ fn collect_sargable(expr: &sqlparser::ast::Expr, out: &mut Vec<(Option<String>, 
                 if let Some(qualified) = expr_as_qualified_column(left) {
                     // SARGable only if the right side is not a column
                     if !expr_is_column_ref(right) {
-                        push_qualified(out, &qualified);
+                        push_qualified(out, &qualified, "btree");
+                    }
+                }
+            }
+            // GIN/GIST-family operators (containment / full-text / overlap /
+            // jsonb key existence):
+            //   col @> v  (jsonb/array/range containment)
+            //   col @@ v  (tsvector full-text | geometry intersects)
+            //   col && v  (array overlap | geometry overlap)
+            //   col ? v / col ?& v / col ?| v  (jsonb/hstore key existence)
+            //   col @? v  (jsonpath existence)
+            // The LEFT side must be a column and the RIGHT side must not be
+            // one. NB: `v <@ col` (ArrowAt) is deliberately EXCLUDED — its
+            // indexable side is the right operand, not the left column.
+            BinaryOperator::AtArrow
+            | BinaryOperator::AtAt
+            | BinaryOperator::PGOverlap
+            | BinaryOperator::Question
+            | BinaryOperator::QuestionAnd
+            | BinaryOperator::QuestionPipe
+            | BinaryOperator::AtQuestion => {
+                if let Some(qualified) = expr_as_qualified_column(left) {
+                    if !expr_is_column_ref(right) {
+                        push_qualified(out, &qualified, gin_gist_op_token(op));
                     }
                 }
             }
@@ -844,7 +908,7 @@ fn collect_sargable(expr: &sqlparser::ast::Expr, out: &mut Vec<(Option<String>, 
         } => {
             if let Some(qualified) = expr_as_qualified_column(expr) {
                 if list.iter().all(|e| !expr_is_column_ref(e)) {
-                    push_qualified(out, &qualified);
+                    push_qualified(out, &qualified, "IN");
                 }
             }
         }
@@ -858,7 +922,7 @@ fn collect_sargable(expr: &sqlparser::ast::Expr, out: &mut Vec<(Option<String>, 
         } => {
             if let Some(qualified) = expr_as_qualified_column(expr) {
                 if !expr_is_column_ref(low) && !expr_is_column_ref(high) {
-                    push_qualified(out, &qualified);
+                    push_qualified(out, &qualified, "BETWEEN");
                 }
             }
         }
@@ -866,7 +930,7 @@ fn collect_sargable(expr: &sqlparser::ast::Expr, out: &mut Vec<(Option<String>, 
         // col IS [NOT] NULL
         sqlparser::ast::Expr::IsNotNull(expr) | sqlparser::ast::Expr::IsNull(expr) => {
             if let Some(qualified) = expr_as_qualified_column(expr) {
-                push_qualified(out, &qualified);
+                push_qualified(out, &qualified, "IS NULL");
             }
         }
 
@@ -879,7 +943,7 @@ fn collect_sargable(expr: &sqlparser::ast::Expr, out: &mut Vec<(Option<String>, 
         } => {
             if let Some(qualified) = expr_as_qualified_column(expr) {
                 if like_pattern_is_prefix(pattern) {
-                    push_qualified(out, &qualified);
+                    push_qualified(out, &qualified, "LIKE");
                 }
             }
         }
@@ -891,7 +955,7 @@ fn collect_sargable(expr: &sqlparser::ast::Expr, out: &mut Vec<(Option<String>, 
         } => {
             if let Some(qualified) = expr_as_qualified_column(expr) {
                 if like_pattern_is_prefix(pattern) {
-                    push_qualified(out, &qualified);
+                    push_qualified(out, &qualified, "LIKE");
                 }
             }
         }
@@ -928,15 +992,65 @@ fn expr_is_column_ref(expr: &sqlparser::ast::Expr) -> bool {
     )
 }
 
-/// Push a (qualifier, column) if it is not already present
-fn push_qualified(out: &mut Vec<(Option<String>, String)>, qualified: &(Option<String>, String)) {
+/// Push a (qualifier, column, operator) if it is not already present
+fn push_qualified(
+    out: &mut Vec<(Option<String>, String, String)>,
+    qualified: &(Option<String>, String),
+    op: &str,
+) {
     if out
         .iter()
-        .any(|(q, c)| q == &qualified.0 && c == &qualified.1)
+        .any(|(q, c, _)| q == &qualified.0 && c == &qualified.1)
     {
         return;
     }
-    out.push(qualified.clone());
+    out.push((qualified.0.clone(), qualified.1.clone(), op.to_string()));
+}
+
+/// Map a GIN/GIST-family `BinaryOperator` to its SQL token (used as the
+/// `matched_operator` of the column).
+fn gin_gist_op_token(op: &sqlparser::ast::BinaryOperator) -> &'static str {
+    use sqlparser::ast::BinaryOperator as B;
+    match op {
+        B::AtArrow => "@>",
+        B::AtAt => "@@",
+        B::PGOverlap => "&&",
+        B::Question => "?",
+        B::QuestionAnd => "?&",
+        B::QuestionPipe => "?|",
+        B::AtQuestion => "@?",
+        _ => "btree",
+    }
+}
+
+/// Resolve the index access method from the matched operator and the
+/// column's real type.
+///
+/// Classic scalar operators (`=`, `>`, `IN`, `BETWEEN`, prefix `LIKE`,
+/// `IS [NOT] NULL`) always target a **B-tree**. Containment / full-text /
+/// overlap operators target GIN or GIST depending on the TYPE:
+///
+/// | operator | jsonb / hstore / `text[]` | tsvector | geometry / geography | `int4range` & co. |
+/// |----------|---------------------------|----------|----------------------|-------------------|
+/// | `@>` `?` `?&` `?|` `@?` `&&` `@@` | **GIN** | **GIN** | **GIST** | **GIST** |
+///
+/// Unknown types with a GIN/GIST operator default to GIN (jsonb is by far
+/// the most common case — documented best-effort).
+pub fn resolve_index_method(operator: &str, data_type: &str) -> &'static str {
+    let is_gin_gist_op = matches!(operator, "@>" | "@@" | "&&" | "?" | "?&" | "?|" | "@?");
+    if !is_gin_gist_op {
+        return "btree";
+    }
+    let t = data_type.to_ascii_lowercase();
+    // GIST: geometry / geography (PostGIS) and range types
+    if t.contains("geometry") || t.contains("geography") || t.ends_with("range") || t == "range" {
+        return "gist";
+    }
+    // GIN: jsonb, hstore, arrays, tsvector
+    if t == "jsonb" || t == "hstore" || t.ends_with("[]") || t == "tsvector" {
+        return "gin";
+    }
+    "gin"
 }
 
 /// Check whether a LIKE pattern is a prefix ('abc%') → SARGable
@@ -984,22 +1098,29 @@ async fn fetch_column_metadata(
         triples.iter().cloned().collect();
 
     for (s, t) in &seen_tables {
+        // `format_type(atttypid, atttypmod)` returns the REAL type name
+        // ("jsonb", "text[]", "int4range", "geometry") — unlike
+        // information_schema.columns.data_type, which reports "ARRAY" for
+        // arrays and "USER-DEFINED" for extension types (hstore, geometry).
+        // The real name is required to resolve the index method
+        // (B-tree / GIN / GIST).
         let rows = client
             .query(
                 r#"
-                SELECT table_schema, table_name, column_name, data_type, is_nullable
-                FROM information_schema.columns
-                WHERE table_schema = $1 AND table_name = $2
+                SELECT a.attname AS column_name,
+                       format_type(a.atttypid, a.atttypmod) AS data_type,
+                       NOT a.attnotnull AS is_nullable
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                JOIN pg_attribute a ON a.attrelid = c.oid
+                WHERE n.nspname = $1 AND c.relname = $2
+                  AND a.attnum > 0 AND NOT a.attisdropped
                 "#,
                 &[s, t],
             )
             .await?;
         for row in rows {
-            let key = (
-                row.get::<_, String>("table_schema"),
-                row.get::<_, String>("table_name"),
-                row.get::<_, String>("column_name"),
-            );
+            let key = (s.clone(), t.clone(), row.get::<_, String>("column_name"));
             if !wanted.contains(&key) {
                 continue;
             }
@@ -1007,7 +1128,7 @@ async fn fetch_column_metadata(
                 key,
                 ColumnMeta {
                     data_type: row.get("data_type"),
-                    nullable: row.get::<_, String>("is_nullable") == "YES",
+                    nullable: row.get::<_, bool>("is_nullable"),
                     null_frac: 0.0,
                 },
             );
@@ -1034,20 +1155,41 @@ async fn fetch_column_metadata(
     Ok(map)
 }
 
-/// Map a PostgreSQL type to a density bucket (config density_by_type)
+/// Map a PostgreSQL type to a density bucket (config density_by_type).
+///
+/// Handles BOTH `information_schema` names ("character varying",
+/// "timestamp with time zone") and `format_type()` names ("varchar",
+/// "timestamptz", "text[]"). Non-B-tree types (jsonb, hstore, tsvector,
+/// arrays, geometry, ranges) fall back to the `default` bucket — they are
+/// size-estimated with the `gin_size_factor` / `gist_size_factor` scaling
+/// applied by the analyzer.
 fn map_pg_type_to_bucket(data_type: &str) -> String {
-    match data_type {
-        "integer" | "smallint" => "int4".to_string(),
-        "bigint" => "int8".to_string(),
-        "double precision" | "real" => "float8".to_string(),
-        "numeric" | "decimal" => "float8".to_string(),
-        "character varying" | "character" | "bpchar" | "char" => "varchar".to_string(),
+    let t = data_type.to_ascii_lowercase();
+    // Strip a size typmod: "character varying(255)" → "character varying"
+    let base = t.split('(').next().unwrap_or(t.as_str()).trim();
+    // Arrays → no B-tree density bucket (GIN territory)
+    if base.ends_with("[]") {
+        return "default".to_string();
+    }
+    match base {
+        "integer" | "int" | "smallint" | "int2" => "int4".to_string(),
+        "bigint" | "int8" => "int8".to_string(),
+        "double precision" | "float8" | "real" | "float4" | "numeric" | "decimal" => {
+            "float8".to_string()
+        }
+        "character varying" | "varchar" | "character" | "bpchar" | "char" => "varchar".to_string(),
         "text" => "text".to_string(),
         "date" => "date".to_string(),
-        "timestamp with time zone" | "timestamp without time zone" => "timestamptz".to_string(),
-        "time with time zone" | "time without time zone" => "timestamptz".to_string(),
+        "timestamptz"
+        | "timestamp with time zone"
+        | "timestamp"
+        | "timestamp without time zone"
+        | "timetz"
+        | "time"
+        | "time with time zone"
+        | "time without time zone" => "timestamptz".to_string(),
         "uuid" => "uuid".to_string(),
-        "boolean" => "bool".to_string(),
+        "boolean" | "bool" => "bool".to_string(),
         _ => "default".to_string(),
     }
 }
@@ -1069,13 +1211,24 @@ fn truncate_query(query: &str) -> String {
 mod tests {
     use super::*;
 
-    /// Returns the set of attributed (schema, table, column)
-    fn cols(query: &str) -> Vec<(String, String, String)> {
+    /// Returns the attributed (schema, table, column, operator) list
+    fn cols(query: &str) -> Vec<(String, String, String, String)> {
         parse_query_for_sargable(query).unwrap_or_default()
     }
 
     fn colset(query: &str) -> std::collections::HashSet<(String, String, String)> {
-        cols(query).into_iter().collect()
+        cols(query)
+            .into_iter()
+            .map(|(s, t, c, _op)| (s, t, c))
+            .collect()
+    }
+
+    /// Returns the operator matched for a column (first occurrence)
+    fn operator_of(query: &str, column: &str) -> Option<String> {
+        cols(query)
+            .into_iter()
+            .find(|(_, _, c, _)| c == column)
+            .map(|(_, _, _, op)| op)
     }
 
     #[test]
@@ -1209,6 +1362,129 @@ mod tests {
              SELECT * FROM c, d WHERE c.status = 'open'"
         )
         .is_empty());
+    }
+
+    // ── GIN/GIST operator detection ────────────────────────────────
+
+    #[test]
+    fn test_gin_gist_operators_are_collected() {
+        // jsonb containment
+        assert_eq!(
+            operator_of(
+                "SELECT * FROM events WHERE payload @> '{\"type\":\"login\"}'",
+                "payload"
+            ),
+            Some("@>".to_string())
+        );
+        // jsonb/hstore key existence
+        assert_eq!(
+            operator_of("SELECT * FROM events WHERE payload ? 'type'", "payload"),
+            Some("?".to_string())
+        );
+        assert_eq!(
+            operator_of("SELECT * FROM events WHERE meta ?& ARRAY['a','b']", "meta"),
+            Some("?&".to_string())
+        );
+        assert_eq!(
+            operator_of("SELECT * FROM events WHERE meta ?| ARRAY['a','b']", "meta"),
+            Some("?|".to_string())
+        );
+        // jsonpath existence
+        assert_eq!(
+            operator_of("SELECT * FROM events WHERE payload @? '$.user'", "payload"),
+            Some("@?".to_string())
+        );
+        // tsvector full-text (RHS is a function, not a column → accepted)
+        assert_eq!(
+            operator_of(
+                "SELECT * FROM posts WHERE search @@ to_tsquery('postgres')",
+                "search"
+            ),
+            Some("@@".to_string())
+        );
+        // array overlap
+        assert_eq!(
+            operator_of("SELECT * FROM posts WHERE tags && ARRAY['sql']", "tags"),
+            Some("&&".to_string())
+        );
+        // range containment
+        assert_eq!(
+            operator_of("SELECT * FROM bookings WHERE period @> 42", "period"),
+            Some("@>".to_string())
+        );
+    }
+
+    #[test]
+    fn test_arrowat_reverse_containment_not_indexable_on_left() {
+        // `v <@ col` and `col <@ literal`: the indexable side is the array
+        // (right operand) — never the left column → no candidate.
+        assert!(cols("SELECT * FROM t WHERE 5 <@ period").is_empty());
+        assert!(cols("SELECT * FROM t WHERE period <@ ARRAY[1,2,3]").is_empty());
+    }
+
+    #[test]
+    fn test_scalar_and_gin_gist_same_column_prefers_gin_gist() {
+        // Same column in a scalar AND a containment predicate → the
+        // GIN/GIST operator wins (it is the appropriate access method).
+        assert_eq!(
+            operator_of(
+                "SELECT * FROM t WHERE payload @> '{}' AND payload = '{}'::jsonb",
+                "payload"
+            ),
+            Some("@>".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_index_method() {
+        // GIN
+        assert_eq!(resolve_index_method("@>", "jsonb"), "gin");
+        assert_eq!(resolve_index_method("?", "hstore"), "gin");
+        assert_eq!(resolve_index_method("@@", "tsvector"), "gin");
+        assert_eq!(resolve_index_method("&&", "text[]"), "gin");
+        assert_eq!(
+            resolve_index_method("@>", "character varying(255)[]"),
+            "gin"
+        );
+        // GIST
+        assert_eq!(resolve_index_method("@>", "int4range"), "gist");
+        assert_eq!(resolve_index_method("@@", "geometry"), "gist");
+        assert_eq!(resolve_index_method("&&", "geometry"), "gist");
+        assert_eq!(resolve_index_method("@@", "geography"), "gist");
+        assert_eq!(resolve_index_method("@>", "timestamptz range"), "gist");
+        // B-tree (scalar operators always)
+        assert_eq!(resolve_index_method("=", "integer"), "btree");
+        assert_eq!(resolve_index_method("IN", "text"), "btree");
+        assert_eq!(
+            resolve_index_method("LIKE", "character varying(100)"),
+            "btree"
+        );
+        assert_eq!(resolve_index_method("btree", "jsonb"), "btree");
+        // GIN/GIST operator + unknown type → best-effort GIN (jsonb is the
+        // overwhelmingly common case)
+        assert_eq!(resolve_index_method("@>", "unknown"), "gin");
+        // Case-insensitive on the type
+        assert_eq!(resolve_index_method("@>", "JSONB"), "gin");
+    }
+
+    #[test]
+    fn test_map_pg_type_to_bucket_handles_format_type_names() {
+        // information_schema names (legacy)
+        assert_eq!(map_pg_type_to_bucket("character varying"), "varchar");
+        assert_eq!(
+            map_pg_type_to_bucket("timestamp with time zone"),
+            "timestamptz"
+        );
+        // format_type names (new source)
+        assert_eq!(map_pg_type_to_bucket("character varying(255)"), "varchar");
+        assert_eq!(map_pg_type_to_bucket("timestamptz"), "timestamptz");
+        assert_eq!(map_pg_type_to_bucket("integer"), "int4");
+        assert_eq!(map_pg_type_to_bucket("bigint"), "int8");
+        // Non-B-tree types → default bucket (GIN/GIST territory)
+        assert_eq!(map_pg_type_to_bucket("jsonb"), "default");
+        assert_eq!(map_pg_type_to_bucket("text[]"), "default");
+        assert_eq!(map_pg_type_to_bucket("int4range"), "default");
+        assert_eq!(map_pg_type_to_bucket("geometry"), "default");
     }
 
     #[test]

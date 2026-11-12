@@ -110,7 +110,7 @@ impl Config {
             errs.push("postgresql.user is empty".to_string());
         }
 
-        let densities: [(&str, f64); 10] = [
+        let densities: [(&str, f64); 12] = [
             ("int4", self.density_by_type.int4),
             ("int8", self.density_by_type.int8),
             ("float8", self.density_by_type.float8),
@@ -121,6 +121,8 @@ impl Config {
             ("uuid", self.density_by_type.uuid),
             ("bool", self.density_by_type.bool),
             ("default_density", self.density_by_type.default_density),
+            ("gin_size_factor", self.density_by_type.gin_size_factor),
+            ("gist_size_factor", self.density_by_type.gist_size_factor),
         ];
         for (name, v) in densities {
             if !(v > 0.0 && v.is_finite()) {
@@ -224,6 +226,12 @@ pub struct Thresholds {
     /// falls back to the legacy heuristic alone (previous behavior).
     #[serde(default = "default_true")]
     pub use_index_bloat: bool,
+    /// GIN/GIST index-need detection (jsonb / hstore / arrays / tsvector →
+    /// GIN, geometry / ranges → GIST). When `false`, detector #3 only
+    /// proposes B-tree indexes (classic scalar SARGable patterns) — the
+    /// pre-GIN/GIST behavior.
+    #[serde(default = "default_true")]
+    pub use_gin_gist_detection: bool,
     /// Minimum number of EXECUTIONS (pg_stat_statements.calls) of a query
     /// for it to be a candidate for a SARGable index.
     /// (The historical name `min_sargable_rows` is kept for compatibility.)
@@ -340,6 +348,15 @@ pub struct DensityByTypeConfig {
     pub bool: f64,
     #[serde(default = "default_density_default")]
     pub default_density: f64,
+    /// Multiplicative factor applied to the size estimate of a **GIN** index
+    /// (GIN is typically ~3× the B-tree size for the same column: per-value
+    /// posting lists + token storage). Must be > 0.
+    #[serde(default = "default_gin_size_factor")]
+    pub gin_size_factor: f64,
+    /// Multiplicative factor applied to the size estimate of a **GIST** index
+    /// (GIST is typically ~2× the B-tree size: R-tree / GiST pages). Must be > 0.
+    #[serde(default = "default_gist_size_factor")]
+    pub gist_size_factor: f64,
 }
 
 impl Default for DensityByTypeConfig {
@@ -355,6 +372,8 @@ impl Default for DensityByTypeConfig {
             uuid: 100.0,
             bool: 300.0,
             default_density: 50.0,
+            gin_size_factor: 3.0,
+            gist_size_factor: 2.0,
         }
     }
 }
@@ -447,6 +466,12 @@ fn default_density_bool() -> f64 {
 fn default_density_default() -> f64 {
     50.0
 }
+fn default_gin_size_factor() -> f64 {
+    3.0
+}
+fn default_gist_size_factor() -> f64 {
+    2.0
+}
 
 // ─────────────────────────────────────────────
 // Unknown key detection (warning, non-blocking)
@@ -479,6 +504,8 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
             "cycle_seconds",
             "unused_minutes",
             "fragmentation_pct",
+            "use_index_bloat",
+            "use_gin_gist_detection",
             "min_sargable_rows",
             "min_confidence",
             "max_proposals_per_cycle",
@@ -511,6 +538,8 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
             "uuid",
             "bool",
             "default_density",
+            "gin_size_factor",
+            "gist_size_factor",
         ],
     ),
 ];
@@ -659,6 +688,8 @@ thresholds:
   cycle_seconds: 60
   unused_minutes: 10080
   fragmentation_pct: 30
+  use_index_bloat: true
+  use_gin_gist_detection: true
   min_sargable_rows: 1
   min_confidence: 0.7
   max_proposals_per_cycle: 20
@@ -688,6 +719,8 @@ density_by_type:
   uuid: 50
   bool: 10
   default_density: 50
+  gin_size_factor: 3
+  gist_size_factor: 2
 "#;
         let value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
         assert!(

@@ -36,6 +36,10 @@ thresholds:
                            # per index). false = legacy heuristic only (blind to
                            # bloat left by VACUUM). Requires: CREATE EXTENSION
                            # pgstattuple + superuser or pg_stat_scan_tables.
+  use_gin_gist_detection: true  # Detect GIN/GIST index needs (jsonb/hstore/
+                                # arrays/tsvector → GIN, geometry/ranges → GIST).
+                                # false = B-tree proposals only (classic scalar
+                                # SARGable patterns).
   min_sargable_rows: 100   # Min. executions (pg_stat_statements.calls) for a
                            # query to be a candidate for a SARGable index (>= 1)
   min_confidence: 0.7      # Minimum Laya confidence to apply (0.0..=1.0)
@@ -69,6 +73,10 @@ density_by_type:
   uuid: 100        # uuid
   bool: 300        # boolean
   default_density: 50  # any other type
+  # Size factors applied to the GIN/GIST index-size estimate (a GIN index is
+  # typically ~3× a B-tree, a GIST ~2× — per-value posting lists / R-tree pages).
+  gin_size_factor: 3.0     # multiplicative factor for GIN size estimate (> 0)
+  gist_size_factor: 2.0    # multiplicative factor for GIST size estimate (> 0)
 
 # Logging
 logging:
@@ -80,7 +88,7 @@ index_logging:
   enabled: true
   # Verbosity levels:
   #   minimal  → timestamp, CRUD type, duration, schema, object name
-  #   standard → + DDL of the modified index
+  #   standard → + DDL of the modified index (+ index method: btree/gin/gist)
   #   verbose  → + detailed reason
   verbosity: "minimal"
   # Log file (if empty → stdout only)

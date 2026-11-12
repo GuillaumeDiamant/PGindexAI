@@ -120,8 +120,9 @@ pub struct Analyzer {
 | `guard_identifier(kind, name)` | **New** — rejects (warning) any catalog identifier not conforming to `is_simple_identifier` before DDL / Laya payload |
 | `analyze_unused()` | **`observation_window_ok` gate** (uptime ≥ `unused_minutes`) → `get_unused_indexes(pool, cap)` → `guard_identifier` on schema/table/index → `Proposal { DropIndex }` (reason includes restart date + size + observation duration) |
 | `analyze_fragmentation()` | `get_fragmented_indexes(pool, cap)` → `fragmentation_pct` threshold → `Proposal { RebuildIndex }` (`REINDEX INDEX CONCURRENTLY`) |
-| `analyze_missing_sargable()` | `get_missing_sargable_indexes(pool, schemas, min_calls, cap)` → exclusion of `pg_*` → **`naming::generate_index_name`** → **density per bucket → estimated size** → `null_frac > 0.10` ⇒ `WHERE … IS NOT NULL` → `Proposal { CreateIndex \| CreateFilteredIndex }` (`CREATE INDEX CONCURRENTLY IF NOT EXISTS`) |
+| `analyze_missing_sargable()` | `get_missing_sargable_indexes(pool, schemas, min_calls, cap)` → exclusion of `pg_*` → **`naming::generate_index_name`** → **density per bucket → estimated size × method factor** → `null_frac > 0.10` ⇒ `WHERE … IS NOT NULL` → `Proposal { CreateIndex \| CreateFilteredIndex }` (`CREATE INDEX CONCURRENTLY IF NOT EXISTS … [USING gin\|gist]`); the column's `index_method` (btree/gin/gist) drives the DDL + the `×N` size factor + the log label; **`use_gin_gist_detection = false`** skips non-B-tree columns (pre-GIN/GIST behavior) |
 | `density_for_bucket(bucket)` | Bucket → target density from `config.density_by_type` (default 50) |
+| `gin_gist_size_factor(method)` | **NEW** — `method` → multiplicative size factor: `gin` → `density_by_type.gin_size_factor` (3.0), `gist` → `.gist_size_factor` (2.0), else `1.0` (btree) |
 
 ### `analyze_cycle()` logic
 
@@ -210,7 +211,7 @@ return applied
 | `UnusedIndexInfo` | `schemaname`, `tablename`, `indexname`, `indexdef`, `idx_scan`, `idx_tup_read`, `idx_tup_fetch`, `size_bytes`, **`installed_at`** (server startup) |
 | `FragmentationInfo` | `schemaname`, `tablename`, `indexname`, `relpages`, **`leaf_density`** (`Option<f64>`, measured 0..1), `fragmentation_pct` |
 | `MissingSargableIndex` | `schemaname`, `tablename`, `query_text`, `call_count`, `mean_exec_time_ms`, `min/max_exec_time_ms`, `sargable_columns` |
-| `SargableColumn` | `column_name`, **`column_type`**, **`is_nullable`**, **`null_frac`**, `filter_expr`, **`density_bucket`** |
+| `SargableColumn` | `column_name`, **`column_type`** (real type via `format_type`), **`is_nullable`**, **`null_frac`**, **`matched_operator`** (`=`,`>`,`IN`,`BETWEEN`,`LIKE`,`IS NULL`,`@>`,`@@`,`&&`,`?`,`?&`,`?|`,`@?`), **`index_method`** (`btree`/`gin`/`gist`), **`density_bucket`** |
 | `TableCardinality` | **`reltuples`**, **`relpages`** |
 
 ### Public functions
@@ -233,24 +234,39 @@ return applied
 | Function | Description |
 |----------|-------------|
 | `parse_query_for_sargable(query)` | **NEW** — Parses with `PostgreSqlDialect` (sqlparser 0.52) → SARGable columns **assigned to their table** (`Vec<(schema, table, column)>`); **JOIN alias resolution** (`a.status` → the table of alias `a`); an unqualified column is accepted only if the query references only ONE table (conservative behavior, no false positive); failure → `None` (debug) |
-| `collect_sargable(expr, …)` | Recursive AST traversal: AND/OR, `=`,`>`,`<`,`>=`,`<=`, `IN` (non-negated), `BETWEEN` (non-negated), `IS [NOT] NULL`, `LIKE`/`ILIKE` prefix; rejects `NOT`, functions on column, col-vs-col |
+| `collect_sargable(expr, …)` | Recursive AST traversal: AND/OR, `=`,`>`,`<`,`>=`,`<=`, `IN` (non-negated), `BETWEEN` (non-negated), `IS [NOT] NULL`, `LIKE`/`ILIKE` prefix — and the **GIN/GIST operators** `@>`, `@@`, `&&`, `?`, `?&`, `?|`, `@?` (the matched operator is recorded per column as `matched_operator`); rejects `NOT`, functions on column, col-vs-col, and `@<` (reverse containment — the indexable side is the right operand) |
+| `resolve_index_method(operator, data_type)` | **NEW** — resolves the index access method from the (matched operator, real column type) pair: scalar operators → `btree`; `@>`/`@@`/`&&`/`?`/`?&`/`?|`/`@?` + geometry/geography/`*range` → `gist`; + jsonb/hstore/`*[]`/tsvector → `gin`; unknown type + GIN/GIST operator → `gin` (best-effort) |
 | `expr_as_column(expr)` | `Identifier` / `CompoundIdentifier` → column name |
 | `expr_is_column_ref(expr)` | True if a column reference (excludes values) |
 | `push_column(columns, name)` | Deduplicated column append |
 | `like_pattern_is_prefix(pattern)` | `SingleQuotedString` without a leading `%`/`\%` → SARGable |
 | `is_column_covered_by_index(indexdef, column)` | Checks the 1st position of the indexdef |
-| `fetch_column_metadata(pool, schema, table, …)` | **NEW (per table)** — `information_schema.columns` (type, nullability) + `pg_stats` (`null_frac::float8`) |
+| `fetch_column_metadata(pool, schema, table, …)` | **NEW (per table)** — real type via `format_type(atttypid, atttypmod)` (from `pg_attribute` — `information_schema.data_type` is too lossy for arrays / user types), nullability + `pg_stats` (`null_frac::float8`) |
 | `map_pg_type_to_bucket(data_type)` | PostgreSQL type → density bucket (`int4`, `int8`, `float8`, `varchar`, `text`, `date`, `timestamptz`, `uuid`, `bool`, `default`) |
 | `truncate_query(query)` | Truncates to 200 characters (UTF-8 safe) + `…` — **local** use (logs) only, never sent to Laya |
 
-### Unit tests (11 + 1 live)
+### Unit tests (24, of which 2 are live)
 
-`eq_and_in`, `between_and_range`, `like_prefix_vs_wildcard`,
-`function_on_column_rejected`, `column_vs_column_rejected`,
-`compound_identifier_schema_table`, `invalid_sql_returns_none`,
-`join_alias_resolution`, `join_ambiguous_unqualified_column_is_dropped`,
-`join_qualified_by_table_name_not_alias`, `truncate_query_multibyte_safe`.
-+ `cardinality_live` (connection test, **clean skip** without local PostgreSQL — CI-safe).
+*B-tree SARGable*: `eq_and_in`, `between_and_range`,
+`like_prefix_vs_wildcard`, `function_on_column_rejected`,
+`column_vs_column_rejected`, `compound_identifier_schema_table`,
+`invalid_sql_returns_none`, `join_alias_resolution`,
+`join_ambiguous_unqualified_column_is_dropped`,
+`join_qualified_by_table_name_not_alias`, `cte_name_is_a_phantom_table_not_attributed`,
+`truncate_query_multibyte_safe`.
+
+*GIN/GIST (new)*: `gin_gist_operators_are_collected`,
+`arrowat_reverse_containment_not_indexable_on_left`,
+`scalar_and_gin_gist_same_column_prefers_gin_gist`, `resolve_index_method`,
+`map_pg_type_to_bucket_handles_format_type_names`.
+
+*Bloat score (new)*: `bloat_score_healthy_indexes_score_near_zero`,
+`bloat_score_worst_case_scores_at_most_one`,
+`bloat_score_all_demo_acceptance_values_pass_threshold`,
+`bloat_score_linear_interpolation`, `bloat_score_nan_and_out_of_range_are_safe`.
+
+*Live* (connection tests, **clean skip** without local PostgreSQL — CI-safe):
+`cardinality_live`, `sargable_system_query_filter_live`.
 
 ---
 
@@ -260,11 +276,12 @@ return applied
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `run_in_transaction()` | `async fn (pool, ddl) -> Result<u64, …>` | **NEW** — `CONCURRENTLY` → **auto-commit** (forbidden inside a PostgreSQL transaction); otherwise **`BEGIN → DDL → COMMIT`** with rollback on error |
+| `run_in_transaction()` | `async fn (pool, ddl, timeout_secs) -> Result<u64, …>` | **NEW** — `CONCURRENTLY` → **auto-commit** (forbidden inside a PostgreSQL transaction); otherwise **`BEGIN → DDL → COMMIT`** with rollback on error; when `timeout_secs > 0` bounds the DDL via `SET [LOCAL] statement_timeout` + `SET LOCAL lock_timeout` (quoted `'{n}s'`, transaction-scoped / reset after) |
 | `is_concurrent_ddl()` | `(ddl) → bool` | Detects `CONCURRENTLY` (case-insensitive) |
-| `execute_create_index()` | `async fn (pool, ddl, writer, confidence?, reason?) -> Result<Option<String>, …>` | Pre-existence (`index_exists`) → DDL → **post-DDL validation: `index_valid`** (indisvalid); if INVALID → `cleanup_invalid_indexes` + logged failure |
-| `execute_drop_index()` | `async fn (pool, ddl, writer, confidence?, size_bytes, reason?) -> Result<(), …>` | `BEGIN → DROP INDEX → COMMIT` → log (success/failure + duration) |
-| `execute_reindex()` | `async fn (pool, ddl, writer, confidence?, size_bytes, fragmentation, reason?) -> Result<(), …>` | `REINDEX CONCURRENTLY` in auto-commit (explicit warning); if build interrupted → **cleanup of the INVALID index** (`pg_drop_index`) — the original index stays intact → otherwise `index_valid` re-checked |
+| `execute_create_index()` | `async fn (pool, ddl, timeout_secs, writer, confidence?, reason?, index_method?) -> Result<DdlOutcome, …>` | Pre-existence (`index_exists`) → DDL → **post-DDL validation: `index_valid`** (indisvalid); if INVALID → `cleanup_invalid_indexes` + logged failure; `index_method` (btree/gin/gist) made explicit in the daemon log **and** the audit entry |
+| `execute_drop_index()` | `async fn (pool, ddl, timeout_secs, writer, confidence?, size_bytes, reason?) -> Result<DdlOutcome, …>` | `BEGIN → DROP INDEX → COMMIT` → log (success/failure + duration) |
+| `execute_reindex()` | `async fn (pool, ddl, timeout_secs, writer, confidence?, size_bytes, fragmentation, reason?) -> Result<DdlOutcome, …>` | `REINDEX CONCURRENTLY` in auto-commit (explicit warning); if build interrupted → **cleanup of the INVALID index** (`pg_drop_index`) — the original index stays intact → otherwise `index_valid` re-checked |
+| `build_create_index_ddl()` | `(schema, index_name, table, column, filtered, index_method) → String` | **NEW** — `CREATE INDEX CONCURRENTLY IF NOT EXISTS <name> ON schema.table [USING gin\|gist] (col) [WHERE col IS NOT NULL]`; `USING` emitted only when `index_method` ≠ `btree`; the index **name is not schema-qualified** (PostgreSQL forbids it) |
 | `extract_index_name()` | `(ddl) → Option<String>` | Parses `CREATE [UNIQUE] INDEX [CONCURRENTLY] [IF NOT EXISTS] name`, `DROP INDEX [IF EXISTS] …`, `REINDEX INDEX [CONCURRENTLY] …` |
 | `extract_schema_from_ddl()` | `(ddl) → String` | Parses `ON schema.table` / `INDEX schema.name`, default `public` |
 
@@ -294,7 +311,7 @@ return applied
 |------|-------------|
 | `CrudOperation` | Enum: `CreateIndex`, `DropIndex`, `Reindex` |
 | `VerbosityLevel` | Enum: `Minimal`, `Standard`, `Verbose` |
-| `IndexOperationLog` | JSON-serializable struct (timestamp, operation, schema, object, duration, status, DDL, confidence, size, fragmentation, reason) |
+| `IndexOperationLog` | JSON-serializable struct (timestamp, operation, schema, object, duration, status, DDL, **index_method**, confidence, size, fragmentation, reason) — `index_method` (`btree`/`gin`/`gist`) is always set on CREATE INDEX entries so the audit trail states which kind of index was built |
 | `IndexLogWriter` | Writer — `log(&self)` **synchronous** (internal short mutex, never held across an `await`; shareable via `Arc`), **loud failures** (a lost audit entry is logged with `error!`), file rotation, **0640** mode |
 
 ### Verbosity level
@@ -302,8 +319,12 @@ return applied
 | Level | Log content |
 |--------|----------------|
 | `minimal` | `timestamp`, `operation`, `schema`, `object`, `duration_ms`, `status` |
-| `standard` | + `ddl_statement`, `confidence`, `reason` |
+| `standard` | + `ddl_statement`, **`index_method`** (CREATE INDEX), `confidence`, `reason` |
 | `verbose` | + `fragmentation_pct`, `index_size_bytes` |
+
+> The **JSON audit file** always carries every set field (via `to_json`,
+> `skip_serializing_if = Option::is_none`) — so `index_method` is present on
+> every CREATE INDEX entry regardless of the stdout verbosity level.
 
 ### File rotation
 
@@ -433,6 +454,10 @@ pub struct Proposal {
     pub reason: String,
     pub confidence: f64,
     pub table: String,
+    pub schema: String,                 // #[serde(default)]
+    pub index_name: Option<String>,     // #[serde(default)]
+    pub column: Option<String>,         // #[serde(default)]
+    pub index_method: Option<String>,   // #[serde(default)] — "btree"|"gin"|"gist" (CREATE INDEX)
 }
 ```
 
@@ -450,12 +475,12 @@ Custom serialization: `DecisionAction` ↔ string (`"IGNORE"`, `"CREATE INDEX"`,
 | `PgConfig` | `host`, `port`, `user`, `database`, `ssl_mode`, **`password`** (optional), **`ssl_root_cert`** (optional, PEM path) |
 | `LayaConfig` | `url`, `timeout_seconds` |
 | `ActionsConfig` | `create_index`, `drop_unused`, `rebuild_fragmented` |
-| `Thresholds` | `cycle_seconds`, `unused_minutes`, `fragmentation_pct`, `min_sargable_rows`, `min_confidence`, **`max_proposals_per_cycle`**, **`ddl_timeout_seconds`** |
+| `Thresholds` | `cycle_seconds`, `unused_minutes`, `fragmentation_pct`, **`use_index_bloat`**, **`use_gin_gist_detection`**, `min_sargable_rows`, `min_confidence`, **`max_proposals_per_cycle`**, **`ddl_timeout_seconds`** |
 | **`AnalysisConfig`** (new) | `schemas: Vec<String>` (empty = all non-system schemas) |
 | **`PgPoolConfig`** (new) | `max_size: u32`, `wait_timeout_ms: u64` |
 | `LoggingConfig` | `level`, `format` |
 | `IndexLoggingConfig` | `enabled`, `verbosity`, `log_file`, `max_file_size_bytes`, `max_files` |
-| **`DensityByTypeConfig`** (new) | `int4`, `int8`, `float8`, `varchar`, `text`, `date`, `timestamptz`, `uuid`, `bool`, `default_density` (all `f64`) |
+| **`DensityByTypeConfig`** (new) | `int4`, `int8`, `float8`, `varchar`, `text`, `date`, `timestamptz`, `uuid`, `bool`, `default_density`, **`gin_size_factor`**, **`gist_size_factor`** (all `f64`) |
 
 All new fields are `#[serde(default)]` — an existing config
 without these sections remains valid.
@@ -474,6 +499,8 @@ without these sections remains valid.
 | `cycle_seconds` | `60` |
 | `unused_minutes` | **`10080` (7 days)** |
 | `fragmentation_pct` | `70` |
+| `use_index_bloat` | `true` |
+| `use_gin_gist_detection` | `true` |
 | `min_sargable_rows` | `100` |
 | `min_confidence` | `0.7` |
 | `max_proposals_per_cycle` | `20` |
@@ -496,6 +523,8 @@ without these sections remains valid.
 | `density_by_type.uuid` | `100.0` |
 | `density_by_type.bool` | `300.0` |
 | `density_by_type.default_density` | `50.0` |
+| `density_by_type.gin_size_factor` | `3.0` |
+| `density_by_type.gist_size_factor` | `2.0` |
 
 ### Validation (`Config::validate`) and unknown keys
 

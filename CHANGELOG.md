@@ -24,6 +24,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   disables only the physical criterion for the current cycle).
 - `sql/demo_schema.sql` now also runs `CREATE EXTENSION IF NOT EXISTS pgstattuple`,
   so detector #2's physical criterion works out of the box in the demo.
+- **GIN/GIST index-need detection (detector #3)**: the SARGable detector now
+  recognizes the containment / key-existence / full-text / overlap / range /
+  spatial operators and resolves the index access method from the
+  **(operator, real column type)** pair via `resolve_index_method`:
+    - **GIN**: `jsonb @> / ? / ?& / ?| / @?`, `hstore @> / ?`, array `@> / &&`,
+      `tsvector @@`
+    - **GIST**: geometry/geography `@@ / &&` (spatial), range types (`int4range`,
+      `tsrange`, …) `@>`
+  The generated DDL emits `USING gin` / `USING gist` (B-tree DDL is unchanged —
+  no `USING` clause). The column's **real type** is read with
+  `format_type(atttypid, atttypmod)` (`information_schema.data_type` is too lossy
+  for arrays / user types — it reports `ARRAY` / `USER-DEFINED`).
+- **`thresholds.use_gin_gist_detection`** config knob (default `true`): set to
+  `false` to restrict detector #3 to B-tree proposals (pre-GIN/GIST behavior).
+- **`density_by_type.gin_size_factor` (default `3.0`) and `.gist_size_factor`
+  (default `2.0`)**: GIN/GIST indexes are typically larger than a B-tree, so the
+  size estimate is multiplied by these factors (validated > 0 and finite).
+- **`index_method` made explicit** in the structured audit log
+  (`IndexOperationLog.index_method`: `btree` / `gin` / `gist`, set at every CREATE
+  site) and in the proposal (`Proposal.index_method`, `#[serde(default)]` for
+  backward compatibility) — the audit trail now states which kind of index was built.
 
 ### Fixed
 
@@ -47,6 +68,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   extended to `information_schema`, plus a safety-net skip of `pg_catalog` /
   `information_schema` / `pg_toast` tables in the proposal loop and a live
   regression test.
+- **`SET statement_timeout` / `SET lock_timeout` were syntax errors** — the DDL
+  path built `SET statement_timeout = {n}s`, `SET LOCAL statement_timeout = {n}s`
+  and `SET LOCAL lock_timeout = {n}s` **without quotes**, which PostgreSQL
+  rejects (`trailing junk after numeric literal`). This broke **every** real
+  index create / drop / reindex with `ddl_timeout_seconds > 0` — all prior runs
+  were dry-run / Laya-unavailable, so it was never hit. Now emitted as `'{n}s'`.
+  The `test_transactional_path_applies_statement_timeout` regression test now
+  genuinely verifies the timeout (it had been passing for the wrong reason — the
+  SET syntax error, not the timeout itself).
+- **`CREATE INDEX` DDL was invalid** — `build_create_index_ddl` emitted a
+  schema-qualified index name (`CREATE INDEX … public.idx ON public.tbl (col)`),
+  but PostgreSQL forbids a schema prefix on the index in `CREATE INDEX`
+  ("No schema name can be included here; the index is always created in the same
+  schema as its parent table"). Every real `CREATE INDEX` failed with
+  `syntax error at or near "."`. The index name is now unqualified (the table
+  name stays schema-qualified, which is what places the index in the intended
+  schema). Surfaced by the new `test_execute_create_index_audit_log_states_method`
+  end-to-end test (the DDL was previously only string-tested, never executed).
+- **`sanitize_reason_field` stripped array brackets** — the allowed-character
+  filter removed `[`/`]`, so an array column type displayed as `text` instead of
+  `text[]` in the proposal `reason`. Brackets are now preserved (matters for GIN
+  detection on arrays).
 
 ### Changed
 
@@ -57,13 +100,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pgstattuple prerequisite and the `use_index_bloat` knob.
 - `README.md` — fragmentation detector section and configuration reference
   updated to match.
-- `README.md` — detector #3 section: documented the **B-tree-only scope** —
-  the generated DDL carries no `USING` clause, so proposals are always B-tree
-  indexes. GIN workloads (`jsonb @>`, `tsvector @@`, arrays) and GIST
-  workloads (geometry, ranges) are out of scope and receive no proposals.
+- `README.md` — detector #3 section: rewritten to document the new **GIN/GIST
+  support** — GIN (jsonb / hstore / array / tsvector) and GIST (geometry /
+  range) operator patterns, `resolve_index_method`, the `USING gin|gist` DDL,
+  the `use_gin_gist_detection` toggle and the honest limitations (operator- not
+  function-driven; unknown type → GIN best-effort; GIN/GIST bloat not covered by
+  detector #2). Replaces the prior "B-tree-only scope" note.
 - `docs/architecture/01-system-overview.md` — behavioral-guarantees table
-  now states the B-tree-only scope for both detector #2 (technical:
-  `pgstatindex()` is B-tree-only) and detector #3 (by design).
+  updated: detector #2 remains B-tree-only (technical — `pgstatindex()` is
+  B-tree-only) while detector #3 now covers B-tree + GIN + GIST.
+- `docs/architecture/03-module-reference.md`, `04-protocols.md`,
+  `05-configuration.md` — signatures (the `build_create_index_ddl` method
+  parameter, `resolve_index_method`, the `index_method` fields), the SARGable
+  patterns, and the new config keys (`use_gin_gist_detection`,
+  `gin_size_factor`, `gist_size_factor`).
+- `sql/demo_workload.sql` — added a `SET pg_stat_statements.track = 'all'` block
+  (required: with the default `track = top`, the workload's `EXECUTE … USING`
+  queries inside PL/pgSQL DO blocks are not recorded per-query, so detector #3
+  would see nothing — requires superuser, which the demo runs as) and a
+  **Phase 8 GIN/GIST workload** (events.payload `@>` ×2000, events.tags `&&`
+  ×1500, bookings.period `@>` ×1500) alongside the existing Phase 7 B-tree
+  SARGable workload.
+- `sql/demo_schema.sql` — added `events` (jsonb `payload` + `text[]` `tags`, no
+  index) and `bookings` (int4range `period`, no index) tables as GIN/GIST
+  candidates.
+- `sql/README.md` — added the GIN/GIST trigger recipe (Phase 7 + 8 workload), the
+  verified `track = 'all'` note, and the verified expected output (GIN for
+  events.payload + events.tags, GIST for bookings.period, B-tree for the scalar
+  columns).
 
 ## [0.1.2] - 2026-11-04
 

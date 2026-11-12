@@ -101,6 +101,11 @@ pub struct Proposal {
     /// Indexed column (filled in for CREATE INDEX).
     #[serde(default)]
     pub column: Option<String>,
+    /// Index access method for CREATE INDEX: "btree" | "gin" | "gist".
+    /// Additive field — `#[serde(default)]` keeps backward compatibility with
+    /// Laya payloads / older proposals that predate GIN/GIST detection.
+    #[serde(default)]
+    pub index_method: Option<String>,
 }
 
 fn serialize_action<S>(action: &DecisionAction, serializer: S) -> Result<S::Ok, S::Error>
