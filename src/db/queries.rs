@@ -15,8 +15,6 @@ pub struct UnusedIndexInfo {
     pub indexname: String,
     pub indexdef: String,
     pub idx_scan: i64,
-    pub idx_tup_read: i64,
-    pub idx_tup_fetch: i64,
     pub size_bytes: i64,
     /// Start of the observation window (server restart)
     pub installed_at: chrono::DateTime<chrono::Utc>,
@@ -62,9 +60,15 @@ pub struct SargableColumn {
     pub null_frac: f64,
     /// Density bucket (e.g. "int4", "varchar", "timestamptz", "default")
     pub density_bucket: String,
-    /// The predicate operator that matched this column: "=" / ">" / "IN" /
-    /// "BETWEEN" / "LIKE" / "IS NULL" (classic B-tree SARGable), or one of
-    /// the GIN/GIST-family operators: "@>", "@@", "&&", "?", "?&", "?|", "@?".
+    /// The predicate operator that matched this column. Comparison
+    /// operators (`=`, `>`, `<`, `>=`, `<=`) are bucketed as `"btree"`;
+    /// the rest keep a distinct token: `"IN"`, `"BETWEEN"`, `"LIKE"`,
+    /// `"IS NULL"`, `"IS NOT NULL"` (classic B-tree SARGable), or one of
+    /// the GIN/GIST-family tokens (see `gin_gist_op_token`): `"@"`,
+    /// `"@@"`, `"&&"`, `"?"`, `"?&"`, `"?|"` or `"@?"`.
+    /// The NULL predicates keep their polarity (`"IS NULL"` ≠
+    /// `"IS NOT NULL"`): the planner's choice and the ideal index variant
+    /// depend on it — see `null_predicate_plan`.
     pub matched_operator: String,
     /// Resolved index access method: "btree" | "gin" | "gist".
     /// Computed from (matched_operator, column_type) after type enrichment;
@@ -135,8 +139,6 @@ pub async fn get_unused_indexes(
                 s.indexrelname AS indexname,
                 pg_get_indexdef(s.indexrelid) AS indexdef,
                 COALESCE(s.idx_scan, 0) AS idx_scan,
-                COALESCE(s.idx_tup_read, 0) AS idx_tup_read,
-                COALESCE(s.idx_tup_fetch, 0) AS idx_tup_fetch,
                 pg_relation_size(s.indexrelid) AS size_bytes,
                 pg_postmaster_start_time() AS installed_at
             FROM pg_stat_user_indexes s
@@ -161,8 +163,6 @@ pub async fn get_unused_indexes(
             indexname: row.get("indexname"),
             indexdef: row.get("indexdef"),
             idx_scan: row.get("idx_scan"),
-            idx_tup_read: row.get("idx_tup_read"),
-            idx_tup_fetch: row.get("idx_tup_fetch"),
             size_bytes: row.get("size_bytes"),
             installed_at: row.get("installed_at"),
         });
@@ -311,7 +311,6 @@ pub async fn get_fragmented_indexes(
                     s.indexrelname AS indexname,
                     s.indexrelid AS index_oid,
                     pg_relation_size(s.indexrelid) / 8192 AS relpages,
-                    COALESCE(s.idx_tup_read, 0) AS idx_tup_read,
                     COALESCE(s.idx_scan, 0) AS idx_scan
                 FROM pg_stat_user_indexes s
                 JOIN pg_index pi ON s.indexrelid = pi.indexrelid
@@ -988,10 +987,18 @@ fn collect_sargable(expr: &sqlparser::ast::Expr, out: &mut Vec<(Option<String>, 
             }
         }
 
-        // col IS [NOT] NULL
-        sqlparser::ast::Expr::IsNotNull(expr) | sqlparser::ast::Expr::IsNull(expr) => {
+        // col IS NULL  →  "IS NULL"
+        sqlparser::ast::Expr::IsNull(expr) => {
             if let Some(qualified) = expr_as_qualified_column(expr) {
                 push_qualified(out, &qualified, "IS NULL");
+            }
+        }
+        // col IS NOT NULL  →  "IS NOT NULL" (distinct label: the planner and
+        // the index variant it deserves depend on the polarity — see
+        // `null_predicate_plan`)
+        sqlparser::ast::Expr::IsNotNull(expr) => {
+            if let Some(qualified) = expr_as_qualified_column(expr) {
+                push_qualified(out, &qualified, "IS NOT NULL");
             }
         }
 
@@ -1082,6 +1089,44 @@ fn gin_gist_op_token(op: &sqlparser::ast::BinaryOperator) -> &'static str {
         B::AtQuestion => "@?",
         _ => "btree",
     }
+}
+
+/// Selectivity gate for NULL predicates (`IS NULL` / `IS NOT NULL`).
+///
+/// PostgreSQL's planner picks between an index scan and a sequential scan
+/// for these predicates almost purely on SELECTIVITY (verified on PG 16:
+/// at 33 % NULL, `IS NULL` (selects 33 %) uses the B-tree while
+/// `IS NOT NULL` (selects 67 %) seq-scans; at 99 % NULL the polarity
+/// flips). When a predicate is expected to select **at least half** the
+/// table, an index on that column will almost never be used — creating it
+/// leads to the "ping-pong": index created → never scanned → detected as
+/// unused → DROPped → the same query is "SARGable without coverage" again
+/// → re-proposed.
+///
+/// Returns:
+/// - `None` — do NOT propose: the predicate is not a NULL predicate, or it
+///   is expected to select ≥ `NULL_PREDICATE_MAX_SELECTIVITY` of the table;
+/// - `Some(false)` — `IS NULL`: propose the **standard** B-tree. The
+///   `WHERE col IS NOT NULL` partial variant structurally CANNOT serve a
+///   `col IS NULL` query (the query's WHERE does not imply the index
+///   predicate), so it must not even be offered;
+/// - `Some(true)` — `IS NOT NULL`: propose the **filtered** variant
+///   (`WHERE col IS NOT NULL`) — the ideal partial index, small and exact.
+///
+/// `null_frac` is the column's measured NULL fraction (0..1); the expected
+/// selectivity is `null_frac` for `IS NULL` and `1 - null_frac` for
+/// `IS NOT NULL`.
+pub fn null_predicate_plan(matched_operator: &str, null_frac: f64) -> Option<bool> {
+    const NULL_PREDICATE_MAX_SELECTIVITY: f64 = 0.5;
+    let selectivity = match matched_operator {
+        "IS NULL" => null_frac,
+        "IS NOT NULL" => 1.0 - null_frac,
+        _ => return None,
+    };
+    if !selectivity.is_finite() || selectivity >= NULL_PREDICATE_MAX_SELECTIVITY {
+        return None;
+    }
+    Some(matched_operator == "IS NOT NULL")
 }
 
 /// Resolve the index access method from the matched operator and the
@@ -1827,5 +1872,59 @@ mod tests {
         assert_eq!(legacy_frag_score(0.0, 0.0, 1, 10_000), 0.0);
         // Never exceeds 1.0
         assert!(legacy_frag_score(1.0, 1.0, 0, 10_000) <= 1.0);
+    }
+
+    // ── NULL predicate polarity (IS NULL vs IS NOT NULL) ───────────────
+
+    #[test]
+    fn test_parser_keeps_null_polarity() {
+        // Regression: both polarities used to be labeled "IS NULL",
+        // losing the information the planner and the variant choice need.
+        let op = operator_of("SELECT * FROM public.t WHERE a IS NULL", "a");
+        assert_eq!(op.as_deref(), Some("IS NULL"));
+        let op = operator_of("SELECT * FROM public.t WHERE a IS NOT NULL", "a");
+        assert_eq!(op.as_deref(), Some("IS NOT NULL"));
+    }
+
+    // ── null_predicate_plan (selectivity gate + variant steering) ──────
+
+    #[test]
+    fn test_null_plan_is_null_polarity() {
+        // IS NULL selects `null_frac` of the table.
+        // Non-selective (< 50 %) → propose the STANDARD B-tree (the
+        // `WHERE col IS NOT NULL` variant cannot serve it).
+        assert_eq!(null_predicate_plan("IS NULL", 0.05), Some(false));
+        assert_eq!(null_predicate_plan("IS NULL", 0.49), Some(false));
+        // Boundary: exactly 50 % → BLOCKED (planner will seq-scan).
+        assert_eq!(null_predicate_plan("IS NULL", 0.50), None);
+        // Non-selective (≥ 50 %) → BLOCKED (the ping-pong case: mostly-
+        // NULL column queried `IS NULL` = the majority of rows).
+        assert_eq!(null_predicate_plan("IS NULL", 0.90), None);
+        assert_eq!(null_predicate_plan("IS NULL", 1.0), None);
+    }
+
+    #[test]
+    fn test_null_plan_is_not_null_polarity() {
+        // IS NOT NULL selects `1 - null_frac` of the table.
+        // Non-selective (< 50 %) → propose the FILTERED variant
+        // (`WHERE col IS NOT NULL` — the ideal partial index).
+        assert_eq!(null_predicate_plan("IS NOT NULL", 0.99), Some(true));
+        assert_eq!(null_predicate_plan("IS NOT NULL", 0.51), Some(true));
+        // Boundary: exactly 50 % → BLOCKED.
+        assert_eq!(null_predicate_plan("IS NOT NULL", 0.50), None);
+        // Non-selective (≥ 50 %) → BLOCKED (mostly-NOT-NULL column:
+        // `IS NOT NULL` = the majority of rows).
+        assert_eq!(null_predicate_plan("IS NOT NULL", 0.10), None);
+        assert_eq!(null_predicate_plan("IS NOT NULL", 0.0), None);
+    }
+
+    #[test]
+    fn test_null_plan_ignores_other_operators_and_bad_stats() {
+        // Not a NULL predicate → not this function's business (None).
+        assert_eq!(null_predicate_plan("=", 0.05), None);
+        assert_eq!(null_predicate_plan("IN", 0.99), None);
+        // Broken statistics (NaN) → block rather than guess.
+        assert_eq!(null_predicate_plan("IS NULL", f64::NAN), None);
+        assert_eq!(null_predicate_plan("IS NOT NULL", f64::NAN), None);
     }
 }

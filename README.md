@@ -157,7 +157,7 @@ type resolve the index method (`resolve_index_method`):
   B-tree (scalar equality / range — any scalar type)
     - col = v, col > v, col < v, col >= v, col <= v   (value is not a column)
     - col IN (...) / col BETWEEN a AND b              (non-negated)
-    - col IS NULL / col IS NOT NULL
+    - col IS NULL / col IS NOT NULL                   (selectivity-gated, see below)
     - col LIKE 'pref…%' / ILIKE                      (prefix pattern)
     - AND / OR / nested parentheses (recursive traversal)
 
@@ -193,12 +193,25 @@ the estimate is multiplied by a configurable size factor
 **Proposed action:** `CREATE INDEX [CONCURRENTLY] idx_table_column ON
 table [USING gin|gist] (column)` — `USING gin` / `USING gist` is emitted
 only for GIN/GIST columns (B-tree DDL is unchanged: no `USING`).
-If `null_frac > 0.10` → filtered index: `WHERE column IS NOT NULL`.
+If `null_frac > 0.10` → filtered index: `WHERE column IS NOT NULL`
+(non-NULL predicates only).
 Validated index name: ≤ 63 bytes (truncation + short hash if needed).
 Toggle: `thresholds.use_gin_gist_detection` (default `true`) — set to `false`
 to restrict detector #3 to B-tree proposals (pre-GIN/GIST behavior).
 The chosen method is explicit in every CREATE audit/daemon log entry
 (`index_method`: `btree` / `gin` / `gist`).
+
+**NULL-predicate selectivity gate:** for `col IS NULL` / `col IS NOT NULL`,
+PostgreSQL's planner picks index-scan vs sequential-scan almost purely on
+**selectivity** (verified on PG 16: the B-tree is used only while the
+predicate selects less than half the table). An index proposed for a NULL
+predicate expected to select ≥ 50 % of the table would be created, never
+scanned, dropped as unused, and the same query re-proposed — a
+"ping-pong". PGindexAI therefore blocks such proposals
+(`null_predicate_plan`), and for the rest steers the variant by polarity:
+`IS NULL` → standard B-tree (a `WHERE col IS NOT NULL` partial index
+structurally cannot serve it); `IS NOT NULL` → filtered
+`WHERE col IS NOT NULL` (the ideal partial index).
 
 > **Known limitations (honest):**
 >

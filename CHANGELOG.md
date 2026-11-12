@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **NULL predicates are now selectivity-gated** (`null_predicate_plan`): a
+  `IS NULL` / `IS NOT NULL` predicate expected to select ≥ 50 % of the table
+  no longer yields an index proposal. PostgreSQL's planner picks
+  index-scan vs sequential-scan almost purely on selectivity for these
+  predicates (verified on PG 16), so an index created for a majority-selecting
+  NULL predicate would be created, never scanned, dropped as "unused", and the
+  same query re-proposed — the "ping-pong".
+- **NULL-predicate polarity now steers the index variant.** The parser labeled
+  both `IS NULL` and `IS NOT NULL` as `"IS NULL"`, so the
+  `null_frac > 0.10` heuristic could propose a `WHERE col IS NOT NULL`
+  partial index for an `IS NULL` workload — an index the query **cannot use**
+  (the query's WHERE does not imply the index predicate). The polarities are
+  now distinct (`"IS NULL"` / `"IS NOT NULL"`); `IS NULL` always proposes the
+  standard B-tree, `IS NOT NULL` the filtered variant, and Laya is no longer
+  offered the filtered option for `IS NULL` proposals (a stray "filtered"
+  answer is downgraded to a standard CREATE as a safety net).
+- **Removed never-read statistics from the unused-index detector.**
+  `idx_tup_read` / `idx_tup_fetch` were selected from `pg_stat_user_indexes`
+  into `UnusedIndexInfo` but never consumed (dead-tuple counters are a
+  VACUUM-side metric, not an index-usage signal). The `idx_tup_read = 0`
+  filter is kept — it is part of the "unused" definition.
+
 ### Fixed
 
 - **Observation window could be silently disabled by a config typo**
@@ -47,6 +71,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Documented the new `thresholds.unused_minutes` upper bound (max `525600`).
 - Clarified the accepted `logging.format` values across the README, the config
   template, and the configuration reference.
+- **Clarified the `index_log` module semantics**: the verbosity levels
+  (minimal / standard / verbose) apply to the **console only**; the `log_file`
+  audit trail always receives the complete JSON entry, whatever the console
+  level — by design, the audit record must not depend on the console
+  verbosity. Only `index_logging.enabled` (off) suppresses the file, and
+  `max_size` / `max_files` bound it.
+- **Documented the NULL-predicate selectivity gate and variant steering**
+  (README, module reference, protocols) and the new `null_predicate_plan`
+  function.
+- **Corrected the documented `matched_operator` value set** (comparison
+  operators are bucketed as `btree`; the GIN/GIST token set follows
+  `gin_gist_op_token`) and the `UnusedIndexInfo` field list (dead tuple
+  counters removed).
 
 ## [0.2.0] - 2026-11-12
 

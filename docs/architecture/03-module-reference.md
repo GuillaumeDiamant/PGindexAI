@@ -208,10 +208,10 @@ return applied
 
 | Type | Key fields |
 |------|-------------|
-| `UnusedIndexInfo` | `schemaname`, `tablename`, `indexname`, `indexdef`, `idx_scan`, `idx_tup_read`, `idx_tup_fetch`, `size_bytes`, **`installed_at`** (server startup) |
+| `UnusedIndexInfo` | `schemaname`, `tablename`, `indexname`, `indexdef`, `idx_scan`, `size_bytes`, **`installed_at`** (server startup) |
 | `FragmentationInfo` | `schemaname`, `tablename`, `indexname`, `relpages`, **`leaf_density`** (`Option<f64>`, measured 0..1), `fragmentation_pct` |
 | `MissingSargableIndex` | `schemaname`, `tablename`, `query_text`, `call_count`, `mean_exec_time_ms`, `min/max_exec_time_ms`, `sargable_columns` |
-| `SargableColumn` | `column_name`, **`column_type`** (real type via `format_type`), **`is_nullable`**, **`null_frac`**, **`matched_operator`** (`=`,`>`,`IN`,`BETWEEN`,`LIKE`,`IS NULL`,`@>`,`@@`,`&&`,`?`,`?&`,`?|`,`@?`), **`index_method`** (`btree`/`gin`/`gist`), **`density_bucket`** |
+| `SargableColumn` | `column_name`, **`column_type`** (real type via `format_type`), **`is_nullable`**, **`null_frac`**, **`matched_operator`** (comparisons bucketed as `btree`; else `IN`,`BETWEEN`,`LIKE`,`IS NULL`,`IS NOT NULL`; GIN/GIST: `@>`,`@@`,`&&`,`?`,`?&`,`?|`,`@?`), **`index_method`** (`btree`/`gin`/`gist`), **`density_bucket`** |
 | `TableCardinality` | **`reltuples`**, **`relpages`** |
 
 ### Public functions
@@ -236,10 +236,11 @@ return applied
 | `parse_query_for_sargable(query)` | **NEW** — Parses with `PostgreSqlDialect` (sqlparser 0.52) → SARGable columns **assigned to their table** (`Vec<(schema, table, column)>`); **JOIN alias resolution** (`a.status` → the table of alias `a`); an unqualified column is accepted only if the query references only ONE table (conservative behavior, no false positive); failure → `None` (debug) |
 | `collect_sargable(expr, …)` | Recursive AST traversal: AND/OR, `=`,`>`,`<`,`>=`,`<=`, `IN` (non-negated), `BETWEEN` (non-negated), `IS [NOT] NULL`, `LIKE`/`ILIKE` prefix — and the **GIN/GIST operators** `@>`, `@@`, `&&`, `?`, `?&`, `?|`, `@?` (the matched operator is recorded per column as `matched_operator`); rejects `NOT`, functions on column, col-vs-col, and `@<` (reverse containment — the indexable side is the right operand) |
 | `resolve_index_method(operator, data_type)` | **NEW** — resolves the index access method from the (matched operator, real column type) pair: scalar operators → `btree`; `@>`/`@@`/`&&`/`?`/`?&`/`?|`/`@?` + geometry/geography/`*range` → `gist`; + jsonb/hstore/`*[]`/tsvector → `gin`; unknown type + GIN/GIST operator → `gin` (best-effort) |
+| `null_predicate_plan(operator, null_frac)` | **NEW** — selectivity gate for `IS NULL` / `IS NOT NULL`: expected selectivity = `null_frac` (IS NULL) or `1 − null_frac` (IS NOT NULL); ≥ 0.5 → `None` (do NOT propose — the planner will seq-scan, preventing the create→unused→drop→re-propose "ping-pong"); else `Some(false)` for `IS NULL` (standard B-tree) / `Some(true)` for `IS NOT NULL` (filtered `WHERE col IS NOT NULL`) |
 | `expr_as_column(expr)` | `Identifier` / `CompoundIdentifier` → column name |
 | `expr_is_column_ref(expr)` | True if a column reference (excludes values) |
 | `push_column(columns, name)` | Deduplicated column append |
-| `like_pattern_is_prefix(pattern)` | `SingleQuotedString` without a leading `%`/`\%` → SARGable |
+| `like_pattern_is_prefix(pattern)` | literal `SingleQuotedString` that is a plain value or a prefix + single trailing `%` → SARGable; any leading/mid `%` or a `_` wildcard defeats a B-tree (see `like_prefix_is_sargable`) |
 | `is_column_covered_by_index(indexdef, column)` | Checks the 1st position of the indexdef |
 | `fetch_column_metadata(pool, schema, table, …)` | **NEW (per table)** — real type via `format_type(atttypid, atttypmod)` (from `pg_attribute` — `information_schema.data_type` is too lossy for arrays / user types), nullability + `pg_stats` (`null_frac::float8`) |
 | `map_pg_type_to_bucket(data_type)` | PostgreSQL type → density bucket (`int4`, `int8`, `float8`, `varchar`, `text`, `date`, `timestamptz`, `uuid`, `bool`, `default`) |

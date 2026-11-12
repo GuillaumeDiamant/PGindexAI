@@ -1,10 +1,16 @@
 //! Structured logging of index operations (DROP/CREATE/REINDEX).
 //!
-//! Three verbosity levels:
+//! Verbosity levels — **console output only**:
 //! - **minimal**: timestamp, CRUD type, duration, schema, object name
 //! - **standard**: + DDL/DML of the modified index (+ index access method
 //!   for CREATE: btree / gin / gist)
 //! - **verbose**: + technical metadata (confidence, size, fragmentation, reason)
+//!
+//! The `log_file` is a SEPARATE audit trail and is NOT affected by verbosity:
+//! it **always** receives the complete JSON entry (every field that was
+//! collected), whatever the console level — by design, the audit record must
+//! not depend on the console log level. Only `index_logging.enabled` (off)
+//! suppresses the file entirely, and `max_size` / `max_files` bound it.
 //!
 //! Rotation: if `max_size > 0`, the current file is renamed `.1`, `.1` → `.2`, …
 //! once `max_size` bytes is exceeded; beyond `max_files`, the oldest is deleted.

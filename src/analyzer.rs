@@ -163,6 +163,7 @@ impl Analyzer {
                 index_name: Some(idx.indexname),
                 column: None,
                 index_method: None, // DROP INDEX: not applicable
+                null_predicate: None,
             });
         }
 
@@ -229,6 +230,7 @@ impl Analyzer {
                     index_name: Some(idx.indexname),
                     column: None,
                     index_method: None, // REINDEX: not applicable
+                    null_predicate: None,
                 });
             }
         }
@@ -298,6 +300,45 @@ impl Analyzer {
                     continue;
                 }
 
+                // NULL predicates (IS NULL / IS NOT NULL): the planner's
+                // choice is selectivity-driven (verified on PG 16 — an index
+                // scan wins only while the predicate selects less than ~half
+                // the table). `null_predicate_plan` therefore:
+                //  - BLOCKS predicates expected to select ≥ 50 % of the
+                //    table: the index would be created, never scanned,
+                //    DROPped as unused, and the same query re-proposed —
+                //    the "ping-pong";
+                //  - STEERS the variant by polarity: a
+                //    `WHERE col IS NOT NULL` partial index CANNOT serve an
+                //    `IS NULL` workload (and vice versa), so the default
+                //    `null_frac > 0.1` heuristic must not decide here.
+                let null_predicate: Option<String> =
+                    matches!(col.matched_operator.as_str(), "IS NULL" | "IS NOT NULL")
+                        .then(|| col.matched_operator.clone());
+                let filtered_override: Option<bool> = if let Some(pred) = &null_predicate {
+                    match queries::null_predicate_plan(pred, col.null_frac) {
+                        Some(f) => Some(f),
+                        None => {
+                            let selectivity = if pred.as_str() == "IS NULL" {
+                                col.null_frac
+                            } else {
+                                1.0 - col.null_frac
+                            };
+                            info!(
+                                "Skipping {}.{} ({}) — `{pred}` selects ~{:.0}% of the table; \
+                                 an index would not be used (planner will seq-scan)",
+                                miss.schemaname,
+                                miss.tablename,
+                                col.column_name,
+                                (selectivity.clamp(0.0, 1.0) * 100.0)
+                            );
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
+
                 // Explicit naming convention + length validation
                 let idx_name = match naming::generate_index_name(
                     &miss.schemaname,
@@ -337,12 +378,13 @@ impl Analyzer {
                     String::new()
                 };
                 let reason = format!(
-                    "SARGable query on {}.{}: {} (type: {}, {} calls, {:.1}ms avg, null_frac: {:.2}). \
+                    "SARGable query on {}.{}: {} {} (type: {}, {} calls, {:.1}ms avg, null_frac: {:.2}). \
                      No covering index. Proposed {method_label} index{factor_note}. \
                      Target density for {}: {:.0} tuples/page, estimated index size: {} bytes.",
                     miss.schemaname,
                     miss.tablename,
                     col.column_name,
+                    col.matched_operator,
                     sanitize_reason_field(&col.column_type),
                     miss.call_count,
                     miss.mean_exec_time_ms,
@@ -354,8 +396,11 @@ impl Analyzer {
 
                 // Filtered index if the column is nullable by > 10%
                 // (default proposed variant — LAYA is free to choose
-                // the other variant at apply time, see apply_proposals)
-                let filtered = col.is_nullable && col.null_frac > 0.1;
+                // the other variant at apply time, see apply_proposals).
+                // NULL predicates OVERRIDE the default: the variant that can
+                // actually serve the observed polarity (see
+                // `queries::null_predicate_plan`).
+                let filtered = filtered_override.unwrap_or(col.is_nullable && col.null_frac > 0.1);
 
                 // Online DDL: CREATE INDEX CONCURRENTLY (does not block writes).
                 // The access method (btree/gin/gist) is resolved from
@@ -386,6 +431,7 @@ impl Analyzer {
                     index_name: Some(idx_name),
                     column: Some(col.column_name.clone()),
                     index_method: Some(col.index_method.clone()),
+                    null_predicate,
                 });
             }
         }
@@ -479,13 +525,20 @@ impl Analyzer {
                         "1".to_string(),
                         format!("Create standard index — {}", proposal.reason),
                     );
-                    m.insert(
-                        "2".to_string(),
-                        format!(
-                            "Create filtered index (WHERE IS NOT NULL) — {}",
-                            proposal.reason
-                        ),
-                    );
+                    // The `WHERE col IS NOT NULL` partial variant can only
+                    // serve `IS NOT NULL` workloads — a query `col IS NULL`
+                    // can never use it. For `IS NULL` proposals it is
+                    // therefore NOT offered (offering a structurally
+                    // useless option would only invite a wrong decision).
+                    if proposal.null_predicate.as_deref() != Some("IS NULL") {
+                        m.insert(
+                            "2".to_string(),
+                            format!(
+                                "Create filtered index (WHERE IS NOT NULL) — {}",
+                                proposal.reason
+                            ),
+                        );
+                    }
                     m
                 }
                 DecisionAction::Ignore => {
@@ -534,7 +587,20 @@ impl Analyzer {
                         DecisionAction::CreateIndex | DecisionAction::CreateFilteredIndex => {
                             match choice.as_str() {
                                 "1" => Some(DecisionAction::CreateIndex),
-                                "2" => Some(DecisionAction::CreateFilteredIndex),
+                                "2" => {
+                                    // Safety net: "2" (filtered) is never
+                                    // OFFERED for IS NULL proposals (see the
+                                    // criteria above) — if Laya returns it
+                                    // anyway, downgrade to the standard
+                                    // variant instead of executing a
+                                    // `WHERE col IS NOT NULL` index that
+                                    // cannot serve the IS NULL workload.
+                                    if proposal.null_predicate.as_deref() == Some("IS NULL") {
+                                        Some(DecisionAction::CreateIndex)
+                                    } else {
+                                        Some(DecisionAction::CreateFilteredIndex)
+                                    }
+                                }
                                 _ => Some(DecisionAction::Ignore),
                             }
                         }
