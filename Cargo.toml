@@ -1,6 +1,6 @@
 [package]
 name = "pgindexai"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Real-time PostgreSQL index management driven by Laya decision engine"
 license = "MIT"
