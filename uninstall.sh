@@ -156,6 +156,23 @@ stop_service() {
         warn "Process $SERVICE_NAME running — stopping..."
         run sudo pkill -x "$SERVICE_NAME" || true
     fi
+
+    # Laya decision engine (served by install.sh as 'laya') — the Laya
+    # BINARY AND MODELS are NOT removed: they are external components and
+    # may be used by other tools. Only the service is cleaned up.
+    local laya_unit="/etc/systemd/system/laya.service"
+    if [[ -f "$laya_unit" ]]; then
+        run sudo systemctl stop laya 2>/dev/null || true
+        run sudo systemctl disable laya 2>/dev/null || true
+        run sudo rm -f "$laya_unit"
+        run sudo systemctl daemon-reload
+        run sudo systemctl reset-failed laya 2>/dev/null || true
+        info "Laya service stopped, disabled, unit removed"
+    fi
+    if command -v pgrep &>/dev/null && pgrep -x laya >/dev/null 2>&1; then
+        warn "Laya process running — stopping..."
+        run sudo pkill -x laya || true
+    fi
 }
 
 # ─────────────────────────────────────────────
@@ -291,6 +308,7 @@ verify() {
     echo "============================================"
     echo ""
     echo "  Service    : $SERVICE_NAME — stopped, unit removed"
+    echo "  Laya       : unit removed (binary + models PRESERVED — external component)"
     echo "  Binary    : $BIN_PATH — removed"
     echo "  Files   : config, data, logs removed"
     if $PURGE; then

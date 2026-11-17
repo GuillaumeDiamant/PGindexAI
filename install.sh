@@ -66,6 +66,8 @@ CONFIG_DIR="${TARGET_HOME}/.config/PGindexAI"
 CONFIG_FILE="$CONFIG_DIR/PGindexAI.yaml"
 BIN_PATH="/usr/local/bin/pgindexai"
 SERVICE_NAME="pgindexai"
+LAYA_SERVICE_NAME="laya"   # Laya decision engine (optional — required to apply DDL)
+LAYA_PORT=8080
 PG_IDENT_MAP="pgindexai_map"  # pg_ident.conf map name (daemon OS user → pgindexai)
 PG_CONF=""
 PG_HBA=""
@@ -733,6 +735,141 @@ SERVICE
 }
 
 # ─────────────────────────────────────────────
+# Step 4b: Laya decision engine (optional — required to apply DDL)
+# ─────────────────────────────────────────────
+# Laya is an EXTERNAL binary (not built by this script). When it is found
+# on the machine (new location first, legacy 'laya-sql' layout after),
+# install.sh services it as '$LAYA_SERVICE_NAME' (systemd, hardened).
+# When it is missing, the install CONTINUES: the daemon runs in
+# observation mode (proposals generated, no DDL applied) until Laya is
+# reachable — the "no-fallback" policy guarantees the daemon never
+# decides on its own.
+setup_laya_service() {
+    step "Laya decision engine (optional — required to apply DDL)..."
+
+    # ── Locate the binary ────────────────────────────────────────────
+    local laya_bin="" cand
+    for cand in \
+        "${TARGET_HOME}/.local/share/pgindexai/laya" \
+        "${TARGET_HOME}/.local/share/laya-sql/laya"
+    do
+        [[ -x "$cand" ]] && { laya_bin="$cand"; break; }
+    done
+
+    # ── Locate the model (root dir containing rl_agent_config.json) ──
+    local laya_model=""
+    for cand in \
+        "${TARGET_HOME}/.local/share/pgindexai/models/typed-decisions/typed-decisions" \
+        "${TARGET_HOME}/.local/share/pgindexai/models/typed-decisions" \
+        "${TARGET_HOME}/.local/share/laya-sql/models/typed-decisions/typed-decisions" \
+        "${TARGET_HOME}/.local/share/laya-sql/models/typed-decisions"
+    do
+        [[ -f "$cand/rl_agent_config.json" ]] && { laya_model="$cand"; break; }
+    done
+
+    if [[ -z "$laya_bin" || -z "$laya_model" ]]; then
+        warn "Laya not found (binary: ${laya_bin:-missing} — model: ${laya_model:-missing})."
+        warn "The daemon will run in OBSERVATION MODE (no DDL) until Laya is"
+        warn "reachable — 'no fallback' policy: the daemon never decides alone."
+        warn "Manual start: laya --model <DIR> --cpu --server --port $LAYA_PORT"
+        return 0
+    fi
+
+    info "Laya found — binary: $laya_bin"
+    info "             model : $laya_model"
+
+    local service_file="/etc/systemd/system/${LAYA_SERVICE_NAME}.service"
+    if [[ -f "$service_file" ]]; then
+        if ! ask "Existing Laya service → $service_file. Replace it? [Y/n]" Y; then
+            return 0
+        fi
+    fi
+
+    if $DRY_RUN; then
+        echo -e "${CYAN}[dry-run]${NC} write $service_file (User=$TARGET_USER, MemoryMax=4G, CPUQuota=100%)"
+        echo -e "${CYAN}[dry-run]${NC} sudo systemctl enable --now $LAYA_SERVICE_NAME"
+        return 0
+    fi
+
+    # Orphan instance (manual start, nohup...): if it holds the port,
+    # the systemd unit would crash-loop. Stop it first.
+    if command -v pgrep &>/dev/null && pgrep -x "${LAYA_SERVICE_NAME}" >/dev/null 2>&1; then
+        warn "A Laya process is already running (manual start) — stopping it..."
+        run sudo pkill -x "${LAYA_SERVICE_NAME}" || true
+        sleep 1
+    fi
+
+    local tmp
+    tmp="$(mktemp)"
+    cat > "$tmp" <<SERVICE
+[Unit]
+Description=PGindexAI Laya decision engine (HTTP server, /v1/systemone)
+Documentation=https://github.com/GuillaumeDiamant/PGindexAI
+After=network.target
+
+[Service]
+Type=simple
+User=$TARGET_USER
+Group=$TARGET_USER
+ExecStart=$laya_bin --model $laya_model --cpu --server --port $LAYA_PORT
+Restart=always
+RestartSec=5
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=HOME=$TARGET_HOME
+
+# Resources — CPU inference server (~850 MB of weights + runtime)
+MemoryMax=4G
+CPUQuota=100%
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=$laya_model
+PrivateTmp=true
+PrivateDevices=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+
+# Journal
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=$LAYA_SERVICE_NAME
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+    run sudo install -m 644 "$tmp" "$service_file"
+    run rm -f "$tmp"
+    run sudo systemctl daemon-reload
+    run sudo systemctl enable "$LAYA_SERVICE_NAME"
+    run sudo systemctl restart "$LAYA_SERVICE_NAME"
+
+    # Activity polling (30 s) — the model is loaded at startup
+    for _ in {1..15}; do
+        if laya_health_up; then
+            info "Laya service is active (http://127.0.0.1:${LAYA_PORT}/health OK)"
+            return 0
+        fi
+        sleep 2
+    done
+    error "Laya is not answering after 30 s — check: sudo journalctl -u $LAYA_SERVICE_NAME -n 30"
+    return 1
+}
+
+# laya_health_up — probe the Laya HTTP endpoint (curl when available,
+# /dev/tcp fallback otherwise).
+laya_health_up() {
+    if command -v curl &>/dev/null; then
+        curl -sf -m 2 "http://127.0.0.1:${LAYA_PORT}/health" >/dev/null 2>&1
+    else
+        (exec 3<>"/dev/tcp/127.0.0.1/${LAYA_PORT}") 2>/dev/null
+    fi
+}
+
+# ─────────────────────────────────────────────
 # Step 5: Startup
 # ─────────────────────────────────────────────
 start_daemon() {
@@ -792,6 +929,7 @@ verify() {
     echo "  Auth       : peer — pg_ident map '$PG_IDENT_MAP: $TARGET_USER → pgindexai' (no password)"
     echo "  Logs       : /var/log/pgindexai/"
     echo "  Service    : systemctl status $SERVICE_NAME"
+    echo "  Laya       : systemctl status $LAYA_SERVICE_NAME  (decision engine — required to apply DDL)"
     echo "  Daemon     : journalctl -u $SERVICE_NAME -f"
     echo ""
     echo "  Useful commands:"
@@ -830,6 +968,11 @@ main() {
     setup_config
     echo ""
     setup_systemd
+    echo ""
+    # Optional component: a missing Laya must NEVER abort the install —
+    # the daemon simply stays in observation mode (no DDL) until Laya is
+    # reachable. A Laya health failure only downgrades the final status.
+    setup_laya_service || true
     echo ""
     local daemon_ok=true
     start_daemon || daemon_ok=false

@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`laya.service` systemd unit for the Laya decision engine**
+  (`config/laya.service` reference template): `install.sh` now detects the
+  Laya binary and model (new `~/.local/share/pgindexai/` layout first, legacy
+  `~/.local/share/laya-sql/` layout after) and deploys a hardened unit
+  (`Restart=always`, `MemoryMax=4G`, `CPUQuota=100%`, `NoNewPrivileges`,
+  `ProtectSystem=strict`, …), stops any orphan manual instance holding port
+  8080, and polls `http://127.0.0.1:8080/health` for up to 30 s before
+  declaring the service active. Laya is an **optional** external component:
+  when it is missing, the install **never aborts** — the daemon runs in
+  observation mode (proposals generated, no DDL applied) until Laya is
+  reachable, per the "no fallback" policy.
+- `uninstall.sh` now stops, disables and removes the `laya.service` unit
+  (and kills orphan `laya` processes) — while **preserving** the Laya binary
+  and models, which are external components possibly used by other tools.
+
 ### Changed
 
 - **Peer authentication replaces the password (local setup)**: `install.sh`

@@ -332,6 +332,8 @@ curl -fsSL https://raw.githubusercontent.com/GuillaumeDiamant/PGindexAI/main/ins
 ```bash
 # By default: service + binary + config + data + logs
 # (KEEPS the pgindexai_demo database, the pgindexai role and the pg_hba line)
+# The Laya 'laya.service' unit is removed too — but the Laya binary and
+# models are PRESERVED (external component, possibly used by other tools)
 sudo ./uninstall.sh
 
 # Full simulation (no modification)
@@ -358,6 +360,7 @@ The script does the following automatically:
 | 5. Installation | Binary → `/usr/local/bin/pgindexai` |
 | 6. Configuration | Generates `~/.config/PGindexAI/PGindexAI.yaml` as **0600** with `password: null` (no secret) |
 | 7. systemd service | Deploys the **hardened** unit (MemoryMax, NoNewPrivileges, …) and enables it |
+| 7b. Laya service (optional) | If the Laya binary + model are found on the machine, deploys the hardened `laya.service` unit and verifies `http://127.0.0.1:8080/health`; **never aborts the install** if missing (observation mode) |
 | 8. Demo | Loads the demo schema and workload, transfers ownership to `pgindexai` |
 
 ### 1. PostgreSQL (manual)
@@ -396,6 +399,15 @@ mkdir -p ~/.local/share/pgindexai/models
 laya --model ~/.local/share/pgindexai/models/typed-decisions/ \
      --cpu --server --port 8080
 ```
+
+> **Automatic service (recommended)**: `install.sh` detects the Laya binary
+> and model (new `~/.local/share/pgindexai/` layout first, legacy
+> `~/.local/share/laya-sql/` layout after) and deploys a hardened
+> `laya.service` unit (see `config/laya.service` for the reference template).
+> Laya is an **optional** component: if it is not found, the install
+> completes normally and the daemon runs in **observation mode** (proposals
+> only, no DDL) until Laya becomes reachable — the "no fallback" policy
+> guarantees the daemon never decides on its own.
 
 ### 3. PGindexAI
 

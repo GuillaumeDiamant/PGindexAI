@@ -1,0 +1,40 @@
+# Laya systemd template — installed by install.sh ($USER / $HOME / $LAYA_BIN /
+# $LAYA_MODEL values are resolved at install time). This file is a readable
+# reference; the unit actually deployed is /etc/systemd/system/laya.service.
+[Unit]
+Description=PGindexAI Laya decision engine (HTTP server, /v1/systemone)
+Documentation=https://github.com/GuillaumeDiamant/PGindexAI
+After=network.target
+
+[Service]
+Type=simple
+User=$USER
+Group=$USER
+ExecStart=$LAYA_BIN --model $LAYA_MODEL --cpu --server --port 8080
+Restart=always
+RestartSec=5
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=HOME=$HOME
+
+# Resources — CPU inference server (~850 MB of weights + runtime)
+MemoryMax=4G
+CPUQuota=100%
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=$LAYA_MODEL
+PrivateTmp=true
+PrivateDevices=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+
+# Journal
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=laya
+
+[Install]
+WantedBy=multi-user.target
