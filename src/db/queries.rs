@@ -511,11 +511,23 @@ fn is_column_covered_by_index(indexdef: &str, column_name: &str) -> bool {
 ///   - `[\s\S]` spans newlines (a plain `.` does not).
 const SARGABLE_SYSTEM_QUERY_FILTER: &str = r"^(SELECT|WITH)[\s\S]*\y(pg_|information_schema\.)";
 
+/// Placeholder query text: some tools log statements they cannot read (no
+/// privilege) under the literal text `<insufficient privilege>`, and
+/// `pg_stat_statements` records that placeholder verbatim. These rows are
+/// noise, not workload queries — observed: 440 rows / 788 k calls on a
+/// single cluster, occupying every slot of the candidate budget (LIMIT) and
+/// starving all real queries. Excluded here so the budget is only spent on
+/// actual statements.
+const SARGABLE_PLACEHOLDER_INSUFFICIENT_PRIVILEGE: &str = "<insufficient privilege>";
+
 /// Detect SARGable queries with no index covering the filtered column.
 ///
 /// - `min_calls`: minimum number of executions (pg_stat_statements.calls) —
 ///   applied in the SQL query (no more hardcoded `calls > 10` threshold).
 /// - `max_queries`: budget of candidate queries examined (SQL LIMIT).
+/// - Exclusions: DDL/DML statements, system-catalog queries, and the
+///   `<insufficient privilege>` placeholder (tool noise that would otherwise
+///   monopolize the candidate budget).
 ///
 /// Result grouped by (schema, table): a JOIN query can produce columns
 /// attributed to DIFFERENT tables (alias resolution).
@@ -542,6 +554,7 @@ pub async fn get_missing_sargable_indexes(
             WHERE s.calls >= $3
               AND s.query !~* $1
               AND s.query !~* $2
+              AND s.query <> $5
             ORDER BY (s.calls * GREATEST(s.mean_exec_time, 0.1)) DESC
             LIMIT $4
             "#,
@@ -550,6 +563,7 @@ pub async fn get_missing_sargable_indexes(
                 &SARGABLE_SYSTEM_QUERY_FILTER.to_string(),
                 &min_calls,
                 &max_queries,
+                &SARGABLE_PLACEHOLDER_INSUFFICIENT_PRIVILEGE.to_string(),
             ],
         )
         .await?;
@@ -1704,6 +1718,47 @@ mod tests {
         ));
         // Word boundary: a user table with a `pg`-like name must survive
         assert!(!excluded("SELECT * FROM my_spg_table WHERE x = 1"));
+    }
+
+    #[test]
+    fn test_sargable_insufficient_privilege_exclusion_live() {
+        // Regression: `<insufficient privilege>` is a placeholder text that
+        // some tools log VERBATIM in pg_stat_statements (observed: 440 rows,
+        // 788 k calls on a single cluster — they monopolized the candidate
+        // budget and starved every real query). It must be excluded, while
+        // real user queries must survive.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let pool = rt.block_on(async {
+            let mut c = deadpool_postgres::Config::new();
+            c.host = Some("/var/run/postgresql".to_string());
+            c.port = Some(5432);
+            c.user = Some("postgres".to_string());
+            c.dbname = Some("pgindexai_demo".to_string());
+            c.create_pool(
+                Some(deadpool_postgres::Runtime::Tokio1),
+                tokio_postgres::NoTls,
+            )
+            .ok()
+        });
+        let Some(pool) = pool else {
+            eprintln!("SKIP test_sargable_insufficient_privilege_exclusion_live: no local PostgreSQL");
+            return;
+        };
+        let excluded = |query: &str| {
+            rt.block_on(async {
+                let client = pool.get().await.unwrap();
+                client
+                    .query_one("SELECT $1 = $2", &[&query, &SARGABLE_PLACEHOLDER_INSUFFICIENT_PRIVILEGE])
+                    .await
+                    .unwrap()
+                    .get::<_, bool>(0)
+            })
+        };
+        // Placeholder → MUST be excluded from the candidate pool
+        assert!(excluded("<insufficient privilege>"));
+        // Real user queries → must NOT be excluded
+        assert!(!excluded("SELECT id, customer_id FROM orders WHERE shipping_method = $1"));
+        assert!(!excluded("SELECT c.name FROM customers c JOIN orders o ON o.customer_id = c.id WHERE o.status = $1"));
     }
 
     #[test]

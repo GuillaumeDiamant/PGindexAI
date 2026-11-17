@@ -47,6 +47,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `uninstall.sh --purge` now also removes the `pgindexai_map` line (and its
   comment) from `pg_ident.conf`.
 
+### Fixed
+
+- **`<insufficient privilege>` placeholder no longer starves the SARGable
+  candidate budget** (`src/db/queries.rs::get_missing_sargable_indexes`):
+  some client tools log statements they cannot read under the literal text
+  `<insufficient privilege>`, and `pg_stat_statements` records that
+  placeholder verbatim (observed on a single cluster: **440 rows, ~788 k
+  calls**, all from the `postgres` role). Because the candidate pool is the
+  top-N rows ranked by `calls × GREATEST(mean_exec_time, 0.1)` with
+  `min_sargable_rows` as the only floor, these high-score noise rows occupied
+  every slot of the `max_proposals_per_cycle` budget and **starved every real
+  query** — a genuinely slow, unindexed predicate could never be proposed.
+  The placeholder is now excluded from the pool with an exact-match filter
+  (`AND s.query <> '<insufficient privilege>'`), so the budget is spent only
+  on actual workload statements. Exact match (not `LIKE`) because the
+  evidence shows a single uniform text; a real user query can never be
+  mis-excluded. Covered by the live regression test
+  `test_sargable_insufficient_privilege_exclusion_live`.
+
 ## [0.2.1] - 2026-11-13
 
 ### Changed
