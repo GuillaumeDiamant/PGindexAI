@@ -19,8 +19,8 @@ PGindexAI continuously monitors your PostgreSQL databases, detects unused and fr
 
 **Security hardening (audit)**:
 
-11. **Validated TLS** (rustls) on the PostgreSQL connection — chain + hostname **always** validated, optional `ssl_root_cert` (PEM), dedicated non-superuser role (`pgindexai`)
-12. **Hardened installer** `install.sh` (no `eval`, targeted pg_hba, `shared_preload_libraries` merge, 0600 config, hardened systemd unit) + **`--dry-run`** mode + idempotent **`uninstall.sh`** (`--purge`, `--clean-legacy`)
+11. **Validated TLS** (rustls) on the PostgreSQL connection — chain + hostname **always** validated, optional `ssl_root_cert` (PEM), dedicated non-superuser role (`pgindexai`) with **peer** authentication (no password)
+12. **Hardened installer** `install.sh` (no `eval`, targeted pg_hba (peer), `shared_preload_libraries` merge, 0600 config with no secret by default, hardened systemd unit) + **`--dry-run`** mode + idempotent **`uninstall.sh`** (`--purge`, `--clean-legacy`)
 13. **Proposal cap** per cycle (`max_proposals_per_cycle`), audit log rotation (0640, loud failures), config validation with unknown-key warnings, **CI** (fmt / clippy `-D warnings` / test / shellcheck)
 
 ---
@@ -239,7 +239,7 @@ postgresql:
   port: 5432
   user: "pgindexai"              # Dedicated non-superuser role (see 06)
   database: "pgindexai_demo"
-  password: ""                  # Required if pg_hba enforces scram-sha-256 / md5
+  password: null                # peer auth (local socket) — set a value only for remote TCP with scram-sha-256 / md5
   ssl_mode: "disable"           # disable | require | verify-ca | verify-full
   # ssl_root_cert: ""           # PEM of a self-signed CA (verify-ca / verify-full)
 
@@ -353,10 +353,10 @@ The script does the following automatically:
 |-------|--------|
 | 1. Prerequisites | Checks PostgreSQL, Rust, sudo access |
 | 2. PostgreSQL | Detection via `SHOW config_file/hba_file/ssl`; **merges** `pg_stat_statements` into `shared_preload_libraries` (never overwrites); restarts if needed |
-| 3. Dedicated role | Creates `pgindexai` (non-superuser, `scram-sha-256`) + password `openssl rand -hex 16` (never displayed); **prepends** the targeted line `local all pgindexai scram-sha-256` in `pg_hba.conf` |
+| 3. Dedicated role | Creates `pgindexai` (non-superuser, **no password**); **adds** the `pg_ident` map `pgindexai_map: <your user> → pgindexai` and **prepends** the targeted line `local all pgindexai peer map=pgindexai_map` in `pg_hba.conf` |
 | 4. Compilation | `cargo build --release` |
 | 5. Installation | Binary → `/usr/local/bin/pgindexai` |
-| 6. Configuration | Generates `~/.config/PGindexAI/PGindexAI.yaml` as **0600** with the password |
+| 6. Configuration | Generates `~/.config/PGindexAI/PGindexAI.yaml` as **0600** with `password: null` (no secret) |
 | 7. systemd service | Deploys the **hardened** unit (MemoryMax, NoNewPrivileges, …) and enables it |
 | 8. Demo | Loads the demo schema and workload, transfers ownership to `pgindexai` |
 
@@ -375,9 +375,14 @@ sudo systemctl restart postgresql
 # Create the extension
 sudo -u postgres psql -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements;"
 
-# Dedicated role (recommended — the daemon should not run as the superuser)
-sudo -u postgres psql -c "CREATE ROLE pgindexai LOGIN PASSWORD '<strong-password>';"
-# pg_hba.conf — TARGETED line (prepend): local  all  pgindexai  scram-sha-256
+# Dedicated role (recommended — the daemon should not run as the superuser),
+# without a password: peer auth via a pg_ident map
+sudo -u postgres psql -c "CREATE ROLE pgindexai LOGIN;"
+# pg_ident.conf — map the daemon OS user to the PG role:
+#   pgindexai_map  <your-user>  pgindexai
+# pg_hba.conf — TARGETED line (prepend): local  all  pgindexai  peer  map=pgindexai_map
+# (Remote TCP instead: CREATE ROLE pgindexai LOGIN PASSWORD '<strong-password>';
+#  a scram-sha-256 pg_hba line; and set the password in the config)
 ```
 
 ### 2. Laya server
@@ -614,7 +619,7 @@ pgindexai/
 - **Deep health check** of Laya (real test payload, validated response) before each batch
 - **Online DDL** (`CONCURRENTLY`) with post-DDL validation + cleanup of INVALID indexes
 - **Validated TLS** (rustls) on PostgreSQL — chain + hostname always validated, optional `ssl_root_cert` CA, dedicated non-superuser role
-- **Hardened installer** (`install.sh`: no `eval`, targeted pg_hba, 0600 config) + side-effect-free **`--dry-run`** + idempotent **`uninstall.sh`** (`--purge` for database/role/pg_hba, `--clean-legacy`)
+- **Hardened installer** (`install.sh`: no `eval`, targeted pg_hba (peer), 0600 config with no secret) + side-effect-free **`--dry-run`** + idempotent **`uninstall.sh`** (`--purge` for database/role/pg_hba/pg_ident, `--clean-legacy`)
 - **SARGable detection via a real SQL parser** (AST, sqlparser-rs) — no more regex false positives
 - **Per-column-type target density** — size estimation for created indexes
 - **Naming convention** `idx_<table>_<col>` validated (63 bytes, short hash)

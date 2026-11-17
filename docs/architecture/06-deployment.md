@@ -17,14 +17,15 @@
 
 `install.sh` (shellcheck-clean, no `eval`, prompts via `/dev/tty`):
 - detects the PostgreSQL cluster via `SHOW config_file/hba_file/ssl`;
-- creates the **dedicated non-superuser role `pgindexai`** (password
-  `openssl rand -hex 16`, never displayed);
-- **prepends** the targeted line `local all pgindexai scram-sha-256` in
-  `pg_hba.conf` (never touches the other lines);
+- creates the **dedicated non-superuser role `pgindexai`** **without a password**;
+- adds a **`pg_ident` map** (`pgindexai_map: <daemon OS user> → pgindexai`) in
+  `pg_ident.conf` and **prepends** the targeted line
+  `local all pgindexai peer map=pgindexai_map` in `pg_hba.conf`
+  (never touches the other lines);
 - **merges** `pg_stat_statements` into `shared_preload_libraries` (never
   overrides it) then restarts PostgreSQL if needed;
 - installs the binary to `/usr/local/bin/pgindexai`;
-- generates `~/.config/PGindexAI/PGindexAI.yaml` with **0600** permissions and the password;
+- generates `~/.config/PGindexAI/PGindexAI.yaml` with **0600** permissions and `password: null` (no secret by default);
 - moves ownership of the demo objects to `pgindexai` (if the database exists);
 - deploys the **hardened** systemd unit and enables the service.
 
@@ -314,8 +315,10 @@ Each DDL action type is controlled by a flag in the config:
    is no "accept all" mode; add `ssl_root_cert` (PEM)
    if your CA is self-signed. Unix socket ⇒ `ssl_mode: disable`.
 5. **Dedicated role**: the daemon connects as `pgindexai` (non-superuser,
-   `scram-sha-256`) — do not run it as the superuser `postgres`
-6. **Config**: file at **0600** (contains the password); unknown
+   **peer** auth locally via the `pg_ident` map; no password) — do not run it
+   as the superuser `postgres`
+6. **Config**: file at **0600** (`password: null` by default — a secret only
+   exists in remote TCP deployments); unknown
    keys trigger an explicit warning at load time
 7. **Logs**: set `index_logging.log_file` for audit (built-in
    rotation, mode 0640, loud failures)

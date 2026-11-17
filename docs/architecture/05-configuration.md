@@ -15,7 +15,8 @@
 | CLI | `pgindexai --config /path/to/config.yaml daemon` |
 | Fallback | `./PGindexAI.yaml` (if `config_dir()` is `None`) |
 
-**Recommended permissions: `0600`** — the file may contain a password.
+**Recommended permissions: `0600`** — the file may contain a password
+(only for remote TCP deployments — the local peer setup carries no secret).
 
 ## 2. Full configuration
 
@@ -28,7 +29,8 @@ postgresql:
   port: 5432                       # PostgreSQL port
   user: "pgindexai"                 # Dedicated non-superuser role (see 06)
   database: "pgindexai_demo"            # Target database
-  password: ""                     # Required if pg_hba requires scram-sha-256 / md5
+  password: null                   # peer auth (local socket, pg_ident map) —
+                                   # set a value only for remote TCP with scram-sha-256 / md5
   ssl_mode: "disable"              # disable | require | verify-ca | verify-full
   # ssl_root_cert: ""              # PEM path of a self-signed CA (snakeoil,
                                    # internal) for verify-ca / verify-full.
@@ -124,7 +126,7 @@ index_logging:
 | `postgresql.port` | — (required) | valid port |
 | `postgresql.user` | — (required) | non-empty |
 | `postgresql.database` | — (required) | non-empty |
-| `postgresql.password` | `null` | required if scram/md5 auth |
+| `postgresql.password` | `null` | peer auth (local socket); required only for remote TCP with scram/md5 |
 | `postgresql.ssl_mode` | `disable` | `disable` \| `require` \| `verify-ca` \| `verify-full` |
 | `postgresql.ssl_root_cert` | `null` | readable PEM path |
 | `laya.url` | — (required) | non-empty |

@@ -13,11 +13,12 @@
 #   ./install.sh [--dry-run]
 #
 # Guarantees:
-#   - Dedicated NON-superuser PostgreSQL role (pgindexai, scram-sha-256 auth)
-#   - pg_hba: TARGETED line (local all pgindexai scram-sha-256), never
-#     a 'local all all trust'
+#   - Dedicated NON-superuser PostgreSQL role (pgindexai) with PEER auth —
+#     no password: a pg_ident map (daemon OS user → pgindexai)
+#   - pg_hba: TARGETED line (local all pgindexai peer map=pgindexai_map),
+#     never a 'local all all trust'
 #   - shared_preload_libraries is MERGED, never overwritten
-#   - 0600 config, generated password (openssl rand), never echoed in the log
+#   - 0600 config with no secret by default (password only for remote TCP)
 #   - No eval, no command interpreted as a string
 #   - Hardened systemd unit (MemoryMax, CPUQuota, NoNewPrivileges, …)
 # ============================================================================
@@ -65,9 +66,10 @@ CONFIG_DIR="${TARGET_HOME}/.config/PGindexAI"
 CONFIG_FILE="$CONFIG_DIR/PGindexAI.yaml"
 BIN_PATH="/usr/local/bin/pgindexai"
 SERVICE_NAME="pgindexai"
-PGINDEXAI_PW=""          # password of the pgindexai role (never displayed)
+PG_IDENT_MAP="pgindexai_map"  # pg_ident.conf map name (daemon OS user → pgindexai)
 PG_CONF=""
 PG_HBA=""
+PG_IDENT=""
 PG_SSL="off"
 
 # ─────────────────────────────────────────────
@@ -270,46 +272,45 @@ END
 }
 
 setup_role() {
-    step "Configuring the dedicated 'pgindexai' role (non-superuser)..."
+    step "Configuring the dedicated 'pgindexai' role (non-superuser, peer auth)..."
 
     local role_exists
     role_exists="$(pg_show "SELECT 1 FROM pg_roles WHERE rolname = 'pgindexai'")"
 
     if [[ -n "$role_exists" ]]; then
         info "Role 'pgindexai' already exists"
-        # If an existing config contains the password, re-apply it
-        # (guaranteeing role ↔ config consistency)
-        if [[ -f "$CONFIG_FILE" ]]; then
-            local existing_pw pw_sql q
-            existing_pw="$(sed -n 's/^[[:space:]]*password:[[:space:]]*//p' "$CONFIG_FILE" | head -1 || true)"
-            # Strip ONE pair of outer YAML quotes if present —
-            # INNER quotes are part of the password (we do not
-            # remove them: the old `tr -d` was corrupting them).
-            q="'"
-            if [[ ${#existing_pw} -ge 2 && "${existing_pw:0:1}" == "$q" && "${existing_pw: -1}" == "$q" ]]; then
-                existing_pw="${existing_pw:1:${#existing_pw}-2}"
-            fi
-            if [[ ${#existing_pw} -ge 2 && "${existing_pw:0:1}" == '"' && "${existing_pw: -1}" == '"' ]]; then
-                existing_pw="${existing_pw:1:${#existing_pw}-2}"
-            fi
-            if [[ -n "$existing_pw" ]]; then
-                PGINDEXAI_PW="$existing_pw"
-                pw_sql="${existing_pw//$q/$q$q}"   # SQL escaping: ' → ''
-                psql_stdin "ALTER ROLE pgindexai PASSWORD '$pw_sql'"
-                info "Existing password kept (re-applied to the role)"
-            fi
-        fi
     else
-        PGINDEXAI_PW="$(openssl rand -hex 16)"
-        psql_stdin "CREATE ROLE pgindexai LOGIN PASSWORD '${PGINDEXAI_PW}'"
-        info "Role 'pgindexai' created (generated password — kept in the 0600 config)"
+        # NO PASSWORD: local authentication goes through peer + pg_ident map
+        # (ensure_pg_ident / ensure_hba run BEFORE this step in setup_postgresql).
+        # A password can still be set manually for remote TCP (scram-sha-256).
+        psql_stdin "CREATE ROLE pgindexai LOGIN"
+        info "Role 'pgindexai' created (no password — peer auth)"
     fi
 
-    if [[ -z "$PGINDEXAI_PW" ]]; then
-        # Existing role without a known password: generate one and enforce it
-        PGINDEXAI_PW="$(openssl rand -hex 16)"
-        psql_stdin "ALTER ROLE pgindexai PASSWORD '${PGINDEXAI_PW}'"
-        warn "Password regenerated for 'pgindexai' (none found in the existing config)"
+    # Migration from the old password (scram-sha-256) setup: the role still
+    # holds a password. Clear it — but only AFTER the peer hba line + ident map
+    # are in place AND a REAL peer connection as TARGET_USER is verified.
+    # (Clearing it first would remove the only working auth method.)
+    local has_pw
+    has_pw="$(pg_show "SELECT 1 FROM pg_authid WHERE rolname = 'pgindexai' AND rolpassword IS NOT NULL")"
+    if [[ -n "$has_pw" ]]; then
+        if $DRY_RUN; then
+            echo -e "  ${CYAN}(dry-run)${NC} verify peer auth as '$TARGET_USER' + ALTER ROLE pgindexai PASSWORD NULL"
+        else
+            local peer_check
+            peer_check="$(sudo -u "$TARGET_USER" psql -U pgindexai -d pgindexai_demo -tAc "SELECT 1" 2>&1 || true)"
+            if [[ "$peer_check" == "1" ]]; then
+                psql_stdin "ALTER ROLE pgindexai PASSWORD NULL"
+                info "Password removed from 'pgindexai' (peer auth verified for '$TARGET_USER')"
+            else
+                error "Peer connection as '$TARGET_USER' → 'pgindexai' FAILED — the role password is KEPT."
+                error "Check pg_ident.conf (map '$PG_IDENT_MAP') and the pg_hba peer line, then re-run."
+                if [[ -n "$peer_check" ]]; then
+                    error "Detail: $(head -c 200 <<<"$peer_check" | tr '\n' ' ')"
+                fi
+                return 1
+            fi
+        fi
     fi
 
     run sudo -u "$POSTGRES_USER" psql -qc "GRANT CONNECT ON DATABASE pgindexai_demo TO pgindexai"
@@ -326,11 +327,12 @@ setup_role() {
 }
 
 ensure_hba() {
-    step "pg_hba.conf: targeted line for pgindexai (scram-sha-256)..."
+    step "pg_hba.conf: targeted line for pgindexai (peer)..."
     local hba="${PG_HBA:-/etc/postgresql/16/main/pg_hba.conf}"
     # pg_hba.conf: TYPE  DATABASE  USER  METHOD — the daemon connects to the
     # database pgindexai_demo (not a database « pgindexai ») → DATABASE = « all ».
-    local line="local   all   pgindexai   scram-sha-256"
+    # peer + map: ONLY the mapped OS user (TARGET_USER) can log in as pgindexai.
+    local line="local   all   pgindexai   peer   map=${PG_IDENT_MAP}"
 
     if [[ ! -f "$hba" ]]; then
         warn "pg_hba not found at '$hba' — manual addition required: $line"
@@ -339,16 +341,24 @@ ensure_hba() {
 
     local hba_modified=false
 
-    if sudo grep -Eq "^[[:space:]]*local[[:space:]]+(all|pgindexai_demo)[[:space:]]+pgindexai[[:space:]]+" "$hba"; then
-        info "Line for pgindexai already present"
+    if sudo grep -Eq "^[[:space:]]*local[[:space:]]+all[[:space:]]+pgindexai[[:space:]]+peer[[:space:]]+map=${PG_IDENT_MAP}[[:space:]]*\$" "$hba"; then
+        info "Peer line for pgindexai already present"
+    elif sudo grep -Eq "^[[:space:]]*local[[:space:]]+(all|pgindexai_demo)[[:space:]]+pgindexai[[:space:]]+(scram-sha-256|md5)[[:space:]]*\$" "$hba"; then
+        # Migration from the old scram-sha-256 / md5 line → peer + map.
+        warn "Existing password-auth line (scram/md5) detected — replacing with peer..."
+        # NB: '#' delimiter — the ERE alternation '|' must not collide with
+        # the sed delimiter (a '|' delimiter breaks the s command).
+        run sudo sed -i -E "s#^([[:space:]]*)local[[:space:]]+(all|pgindexai_demo)[[:space:]]+pgindexai[[:space:]]+(scram-sha-256|md5)[[:space:]]*\$#\1${line}#" "$hba"
+        hba_modified=true
+        info "Line replaced: $line"
     elif sudo grep -Eq "^[[:space:]]*local[[:space:]]+pgindexai[[:space:]]+pgindexai[[:space:]]+" "$hba"; then
         # Defective variant: « local pgindexai pgindexai » puts pgindexai in
         # the DATABASE column → the daemon (database pgindexai_demo) never matches
         # → « no pg_hba.conf entry for host [local] ».
-        warn "Malformed line (DATABASE=pgindexai) detected — correcting to « local all pgindexai »..."
-        run sudo sed -i -E "s|^([[:space:]]*)local[[:space:]]+pgindexai[[:space:]]+pgindexai([[:space:]]+.*)\$|\1local   all   pgindexai\2|" "$hba"
+        warn "Malformed line (DATABASE=pgindexai) detected — correcting to peer form..."
+        run sudo sed -i -E "s|^([[:space:]]*)local[[:space:]]+pgindexai[[:space:]]+pgindexai([[:space:]]+.*)\$|\1${line}|" "$hba"
         hba_modified=true
-        info "Line corrected: local all pgindexai scram-sha-256"
+        info "Line corrected: $line"
     else
         # pg_hba is « first match wins »: the dedicated line is inserted AT THE TOP
         # so it takes precedence over any broad line ('local all all ...').
@@ -381,6 +391,42 @@ EOF
         warn "Warning: 'local all all trust' is present in pg_hba.conf."
         warn "The line dedicated to pgindexai precedes it (so it is applied), but remove the"
         warn "trust line to harden the cluster (all the other roles are affected)."
+    fi
+}
+
+ensure_pg_ident() {
+    step "pg_ident.conf: peer map for pgindexai (${PG_IDENT_MAP}: ${TARGET_USER} → pgindexai)..."
+    local ident="${PG_IDENT:-/etc/postgresql/16/main/pg_ident.conf}"
+    # pg_ident.conf: MAPNAME   SYSTEM-USERNAME   PG-USERNAME
+    local line="$PG_IDENT_MAP   $TARGET_USER   pgindexai"
+
+    if [[ ! -f "$ident" ]]; then
+        warn "pg_ident.conf not found at '$ident' — manual addition required: $line"
+        return 1
+    fi
+
+    local modified=false
+
+    if sudo grep -Eq "^[[:space:]]*${PG_IDENT_MAP}[[:space:]]+${TARGET_USER}[[:space:]]+pgindexai[[:space:]]*\$" "$ident"; then
+        info "Ident map already present"
+    elif sudo grep -Eq "^[[:space:]]*${PG_IDENT_MAP}[[:space:]]" "$ident"; then
+        # Map name already declared with different content → replace its line.
+        warn "Existing map '${PG_IDENT_MAP}' does not map '${TARGET_USER} → pgindexai' — replacing..."
+        run sudo sed -i -E "s|^([[:space:]]*)${PG_IDENT_MAP}[[:space:]]+.*|\1${line}|" "$ident"
+        modified=true
+        info "Map line replaced: $line"
+    else
+        # pg_ident.conf has NO first-match-wins semantics: map names are
+        # unique, so appending is safe (unlike pg_hba.conf).
+        run sudo bash -c "printf '\n# Added by pgindexai install.sh (peer auth)\n%s\n' \"$line\" >> \"$ident\""
+        modified=true
+        info "Ident map added: $line"
+    fi
+
+    # pg_ident.conf is applied on reload (same mechanism as pg_hba.conf).
+    if $modified; then
+        run sudo systemctl reload postgresql
+        info "PostgreSQL reloaded (pg_ident.conf applied)"
     fi
 }
 
@@ -448,8 +494,12 @@ ensure_pg_stat_statements() {
 
 setup_postgresql() {
     ensure_demo_db
-    setup_role
+    # Order matters (scram → peer migration): 1. pg_ident map + 2. pg_hba
+    # peer line (+ reload) FIRST, then 3. setup_role — it clears the role
+    # password only AFTER a real peer connection as TARGET_USER is verified.
+    ensure_pg_ident
     ensure_hba
+    setup_role
     ensure_pg_stat_statements || true
 }
 
@@ -498,13 +548,16 @@ setup_config() {
     if [[ -f "$CONFIG_FILE" ]]; then
         if ask "Existing configuration → $CONFIG_FILE. Keep it? [Y/n]" Y; then
             info "Configuration kept"
-            # Ensure 0600, the target ownership and a consistent password
+            # Ensure 0600, the target ownership — and migrate away from the
+            # old password-based setup (peer auth replaces it; the key stays,
+            # set to null, so remote TCP with scram remains possible).
             run chmod 600 "$CONFIG_FILE"
             if [[ "$(id -u)" -eq 0 ]]; then
                 run chown "$TARGET_USER" "$CONFIG_FILE"
             fi
-            if ! grep -q "password:" "$CONFIG_FILE"; then
-                warn "No 'password:' in the existing config — required if pg_hba requires scram."
+            if grep -Eq "^[[:space:]]*password:" "$CONFIG_FILE"; then
+                run sed -i -E "s|^([[:space:]]*)password:.*|\1password: null   # peer auth (local socket) — set a value only for remote TCP with scram|" "$CONFIG_FILE"
+                info "Configuration migrated: 'password' → null (peer auth)"
             fi
             return
         fi
@@ -527,22 +580,20 @@ setup_config() {
 
     run mkdir -p "$CONFIG_DIR"
 
-    # The password is injected directly (no display)
     if $DRY_RUN; then
-        echo -e "${CYAN}[dry-run]${NC} write $CONFIG_FILE (password: <generated>, ssl_mode: $ssl_mode)"
-        PGINDEXAI_PW="${PGINDEXAI_PW:-<generated>}"
+        echo -e "${CYAN}[dry-run]${NC} write $CONFIG_FILE (password: null — peer auth, ssl_mode: $ssl_mode)"
     else
         cat > "$CONFIG_FILE" <<EOF
 # Configuration of the PGindexAI daemon
 # Generated by install.sh at $(date '+%F %T')
-# Permissions: 0600 (contains a password)
+# Permissions: 0600 (no secret by default: peer auth on the local socket)
 
 postgresql:
   host: "/var/run/postgresql"   # Local Unix socket (TLS not applicable on socket → disable)
   port: 5432
   user: "pgindexai"
   database: "pgindexai_demo"
-  password: "${PGINDEXAI_PW}"
+  password: null               # peer auth (pg_ident map) — set a value only for remote TCP with scram
   ssl_mode: "${ssl_mode}"
   # ssl_root_cert: "/etc/ssl/certs/your-ca.pem"   # Self-signed CA (TCP only: verify-ca/verify-full)
 laya:
@@ -737,7 +788,8 @@ verify() {
     echo "============================================"
     echo ""
     echo "  Binary     : $BIN_PATH"
-    echo "  Config     : $CONFIG_FILE  (0600)"
+    echo "  Config     : $CONFIG_FILE  (0600, password: null)"
+    echo "  Auth       : peer — pg_ident map '$PG_IDENT_MAP: $TARGET_USER → pgindexai' (no password)"
     echo "  Logs       : /var/log/pgindexai/"
     echo "  Service    : systemctl status $SERVICE_NAME"
     echo "  Daemon     : journalctl -u $SERVICE_NAME -f"

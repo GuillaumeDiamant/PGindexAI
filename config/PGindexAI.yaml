@@ -7,7 +7,8 @@ postgresql:
   port: 5432
   user: "pgindexai"             # Dedicated non-superuser role (see install.sh)
   database: "pgindexai_demo"
-  password: ""                 # Required if pg_hba.conf requires scram-sha-256 / md5
+  password: null               # peer auth on the local socket (pg_ident map, see install.sh)
+                               # set a value only for remote TCP with scram-sha-256 / md5
   ssl_mode: "disable"          # disable | require | verify-ca | verify-full
                                # (TLS not applicable on Unix socket → disable)
   # ssl_root_cert: ""          # PEM path of a self-signed CA (snakeoil, internal)

@@ -526,9 +526,10 @@ index_logging:
 
 ### `password authentication failed for user "pgindexai"`
 The shipped config uses the dedicated `pgindexai` role, which authenticates
-with `scram-sha-256` (a password is required). For a quick local test, use the
-`postgres` role (peer auth, no password) via the test config — or set a
-password for `pgindexai` and put it in `postgresql.password`.
+locally via **peer** (pg_ident map — no password). For a quick local test,
+use the `postgres` role (peer auth, no password) via the test config — or,
+when the role is behind scram-sha-256 (remote TCP), set a password for
+`pgindexai` and put it in `postgresql.password`.
 
 ### No `DROP INDEX` proposals (detector #1 silent)
 Detector #1 has an **observation-window gate**: it only runs when the server

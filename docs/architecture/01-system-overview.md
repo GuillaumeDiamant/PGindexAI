@@ -15,9 +15,10 @@
 >
 > **Security hardening (audit)**:
 > 11. **Validated TLS** (rustls) on the PostgreSQL connection + **dedicated
->     non-superuser PG role** (`pgindexai`)
-> 12. **Hardened** installer (`install.sh`: no `eval`, targeted pg_hba, config
->     0600, `shared_preload_libraries` merge) + `--dry-run` mode +
+>     non-superuser PG role** (`pgindexai`) with **peer** authentication
+>     (no password, `pg_ident` map)
+> 12. **Hardened** installer (`install.sh`: no `eval`, targeted pg_hba (peer), config
+>     0600 with no secret by default, `shared_preload_libraries` merge) + `--dry-run` mode +
 >     idempotent `uninstall.sh` (`--purge`, `--clean-legacy`)
 > 13. **Proposal cap** per cycle, log rotation, **CI**
 >     (fmt / clippy / test / shellcheck), config validation with

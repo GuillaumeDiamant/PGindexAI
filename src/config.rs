@@ -199,7 +199,8 @@ pub struct PgConfig {
     /// disable | require | verify-ca | verify-full
     #[serde(default = "default_ssl_mode")]
     pub ssl_mode: String,
-    /// Password (optional — required if pg_hba requires scram-sha-256 / md5).
+    /// Password (optional — `null`/absent for local peer auth; required only
+    /// for remote TCP when pg_hba requires scram-sha-256 / md5).
     /// Store this file with 0600 permissions (the daemon reads it at startup).
     #[serde(default)]
     pub password: Option<String>,
@@ -695,7 +696,7 @@ postgresql:
   user: pgindexai
   database: pgindexai_demo
   ssl_mode: disable
-  password: ""
+  password: null
   ssl_root_cert: /etc/ssl/certs/pg-ca.pem
 laya:
   url: http://127.0.0.1:8080

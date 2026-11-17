@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Peer authentication replaces the password (local setup)**: `install.sh`
+  now configures a `pg_ident` map (`pgindexai_map: <daemon OS user> → pgindexai`)
+  and a targeted `local all pgindexai peer map=pgindexai_map` line in
+  `pg_hba.conf`. The `pgindexai` role is created **without a password** and
+  the generated configuration ships `password: null` — **no secret** in
+  `~/.config/PGindexAI/PGindexAI.yaml` for the default Unix-socket setup.
+- **Automatic migration from scram-sha-256 installations**: re-running
+  `sudo ./install.sh` replaces the old `scram-sha-256` / `md5` pg_hba line
+  with the peer line, adds the ident map, and — only after a live peer
+  connection as the daemon OS user is verified — clears the role password
+  (`ALTER ROLE pgindexai PASSWORD NULL`) and rewrites `password:` to `null`
+  in the existing configuration. If the peer check fails, the password is
+  kept and the install stops with the diagnostics (no broken state).
+- `postgresql.password` remains available for **remote TCP** deployments
+  (scram-sha-256 / md5) — set it in the configuration when `pg_hba.conf`
+  requires it.
+- `config/PGindexAI.yaml` (shipped default): `password: ""` →
+  `password: null` with an explanatory comment.
+- `uninstall.sh --purge` now also removes the `pgindexai_map` line (and its
+  comment) from `pg_ident.conf`.
+
 ## [0.2.1] - 2026-11-13
 
 ### Changed

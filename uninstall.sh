@@ -7,13 +7,13 @@
 #
 # By default: stops and disables the service, removes the systemd unit, the
 # binary, the config, the user's data and logs. PRESERVES the
-# pgindexai_demo database, the pgindexai role and the pg_hba line (reinstallable,
-# data preserved).
+# pgindexai_demo database, the pgindexai role, the pg_hba line and the
+# pg_ident map line (reinstallable, data preserved).
 #
 # Options:
 #   --dry-run        full simulation, no modification
 #   --purge          ALSO REMOVES the database + the role + the pg_hba line
-#                    (irreversible, confirmation requested)
+#                    + the pg_ident map line (irreversible, confirmation requested)
 #   --clean-legacy   also removes the remnants of the old name (laya-sql)
 #
 # Safeguards:
@@ -77,6 +77,7 @@ CONFIG_DIR="${TARGET_HOME}/.config/PGindexAI"
 PGINDEXAI_DIR="${TARGET_HOME}/.local/share/pgindexai"
 LOG_DIR="/var/log/pgindexai"
 PG_HBA_DEFAULT="/etc/postgresql/16/main/pg_hba.conf"
+PG_IDENT_MAP="pgindexai_map"   # pg_ident.conf map name (created by install.sh)
 
 # ─────────────────────────────────────────────
 # Argument parsing
@@ -127,6 +128,11 @@ hba_file() {
     local hba
     hba="$(pg_show 'SHOW hba_file' | tr -d '[:space:]')"
     printf '%s\n' "${hba:-$PG_HBA_DEFAULT}"
+}
+
+# ident_file — effective path of pg_ident.conf (same data directory as pg_hba.conf)
+ident_file() {
+    printf '%s\n' "$(hba_file | sed -E 's|pg_hba\.conf$|pg_ident.conf|')"
 }
 
 # ─────────────────────────────────────────────
@@ -180,7 +186,7 @@ remove_dirs() {
 # Step 4 (option --purge): database, role, pg_hba line
 # ─────────────────────────────────────────────
 remove_pg_objects() {
-    step "PostgreSQL objects (database + role + pg_hba)..."
+    step "PostgreSQL objects (database + role + pg_hba + pg_ident)..."
     # Default confirmation is NO (N): without a tty (curl|bash, cron…) the purge
     # is canceled instead of executing — irreversible operation.
     if ! ask "Permanently REMOVE the 'pgindexai_demo' database (all its data) AND the 'pgindexai' role? (irreversible) [y/N]" N; then
@@ -236,6 +242,18 @@ remove_pg_objects() {
         info "No dedicated pg_hba line found (nothing to remove)"
     fi
 
+    # Peer map line (pg_ident.conf) — only the dedicated map name.
+    local ident
+    ident="$(ident_file)"
+    if [[ -f "$ident" ]] && sudo grep -Eq "^[[:space:]]*${PG_IDENT_MAP}[[:space:]]" "$ident"; then
+        run sudo sed -i -E "/^[[:space:]]*${PG_IDENT_MAP}[[:space:]]+.*$/d" "$ident"
+        run sudo sed -i -E "/^# Added by pgindexai install.sh \(peer auth\)$/d" "$ident"
+        run sudo systemctl reload postgresql
+        info "pg_ident map line removed, PostgreSQL reloaded"
+    else
+        info "No pg_ident map line found (nothing to remove)"
+    fi
+
     warn "pg_stat_statements is PRESERVED (shared extension, shared_preload_libraries)."
     warn "Manual removal (if truly desired): remove 'pg_stat_statements' from"
     warn "shared_preload_libraries in postgresql.conf, then restart PostgreSQL."
@@ -276,9 +294,9 @@ verify() {
     echo "  Binary    : $BIN_PATH — removed"
     echo "  Files   : config, data, logs removed"
     if $PURGE; then
-        echo "  PostgreSQL : pgindexai_demo database + pgindexai role + pg_hba line removed"
+        echo "  PostgreSQL : pgindexai_demo database + pgindexai role + pg_hba line + pg_ident map removed"
     else
-        echo "  PostgreSQL : PRESERVED (pgindexai_demo database, pgindexai role, pg_hba line)"
+        echo "  PostgreSQL : PRESERVED (pgindexai_demo database, pgindexai role, pg_hba line, pg_ident map)"
         echo "               → full removal: sudo ./uninstall.sh --purge"
     fi
     echo "  pg_stat_statements : preserved (shared extension)"
