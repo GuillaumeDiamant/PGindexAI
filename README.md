@@ -19,7 +19,7 @@ PGindexAI continuously monitors your PostgreSQL databases, detects unused and fr
 
 **Security hardening (audit)**:
 
-11. **Validated TLS** (rustls) on the PostgreSQL connection — chain + hostname **always** validated, optional `ssl_root_cert` (PEM), dedicated non-superuser role (`pgindexai`) with **peer** authentication (no password)
+11. **Validated TLS** (rustls) on the PostgreSQL connection — chain + hostname **always** validated, optional `ssl_root_cert` (PEM), dedicated non-superuser role (`pgindexai`) with **peer** authentication (no password), **least-privilege grants** (no `SUPERUSER` — the physical bloat criterion uses the narrow `pg_stat_scan_tables` role, see 06-deployment)
 12. **Hardened installer** `install.sh` (no `eval`, targeted pg_hba (peer), `shared_preload_libraries` merge, 0600 config with no secret by default, hardened systemd unit) + **`--dry-run`** mode + idempotent **`uninstall.sh`** (`--purge`, `--clean-legacy`)
 13. **Proposal cap** per cycle (`max_proposals_per_cycle`), audit log rotation (0640, loud failures), config validation with unknown-key warnings, **CI** (fmt / clippy `-D warnings` / test / shellcheck)
 
@@ -134,6 +134,14 @@ criterion is **not reset by VACUUM/ANALYZE/autovacuum**. When `pgstattuple` is
 missing, `use_index_bloat: false`, or the probe fails, the detector degrades
 gracefully to criterion A alone (previous behavior; the daemon warns at startup
 but does not degrade).
+
+> **Permission (least privilege):** since `pgstattuple` ≥ 1.5, calling
+> `pgstatindex()` requires the connection user to be a `SUPERUSER` or a member
+> of the predefined role `pg_stat_scan_tables`. The daemon deliberately stays
+> non-superuser — the minimal grant is
+> `sudo -u postgres psql -d pgindexai_demo -c "GRANT pg_stat_scan_tables TO pgindexai;"`
+> (see 06-deployment). Without it, the probe fails per cycle (`WARN` +
+> fallback to criterion A) — detection and DDL keep working.
 
 **Trigger threshold:** `score ≥ thresholds.fragmentation_pct` (default 70 %)
 
@@ -381,6 +389,9 @@ sudo -u postgres psql -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements;"
 # Dedicated role (recommended — the daemon should not run as the superuser),
 # without a password: peer auth via a pg_ident map
 sudo -u postgres psql -c "CREATE ROLE pgindexai LOGIN;"
+# Least privilege for the physical bloat criterion (pgstattuple >= 1.5):
+# pgstatindex() needs the predefined pg_stat_scan_tables role — NOT superuser
+sudo -u postgres psql -d pgindexai_demo -c "GRANT pg_stat_scan_tables TO pgindexai;"
 # pg_ident.conf — map the daemon OS user to the PG role:
 #   pgindexai_map  <your-user>  pgindexai
 # pg_hba.conf — TARGETED line (prepend): local  all  pgindexai  peer  map=pgindexai_map

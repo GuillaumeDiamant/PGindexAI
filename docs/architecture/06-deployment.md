@@ -51,6 +51,37 @@ The deployed unit contains the hardening: `MemoryMax=512M`,
 `CPUQuota=100%`, `NoNewPrivileges=true`, `ProtectSystem=strict`,
 `PrivateTmp=true`, `Restart=always`.
 
+### Required privileges (least privilege)
+
+The daemon runs as the dedicated role `pgindexai` — **never** as a
+superuser. The complete privilege set is minimal, and every privilege has
+one explicit purpose:
+
+| Privilege | Purpose | Needed for |
+|-----------|---------|------------|
+| `LOGIN`, no password (peer + `pg_ident` map) | local connection from the daemon's OS user | everything |
+| `CONNECT ON DATABASE pgindexai_demo` | access to the target database | everything |
+| `CREATE ON SCHEMA public` | `CREATE/DROP INDEX` (no longer granted by default on PG 15+) | everything |
+| ownership of the target tables/indexes | DDL on those objects | everything |
+| membership in the predefined role **`pg_stat_scan_tables`** | right to call `pgstatindex()` — since **pgstattuple 1.5** this (full index scan) is restricted to superusers or members of this role | the physical bloat criterion only (`use_index_bloat: true`) |
+
+The last line is a **least-privilege** choice: instead of promoting
+`pgindexai` to `SUPERUSER`, the daemon is granted the narrowest predefined
+role that unlocks the physical criterion. Without it, the daemon degrades
+gracefully — the legacy catalog heuristic still applies, one `WARN` per
+cycle, no failure — so a missing grant never blocks detection or DDL.
+
+```sql
+-- One-time, as superuser (idempotent). Role membership is cluster-wide;
+-- it grants EXECUTE on pgstatindex() in every database where the
+-- pgstattuple extension is installed.
+sudo -u postgres psql -d pgindexai_demo -c "GRANT pg_stat_scan_tables TO pgindexai;"
+
+-- Verify (expect: t)
+psql -U pgindexai -d pgindexai_demo -tAc \
+  "SELECT has_function_privilege('pgindexai', 'pgstatindex(regclass)', 'EXECUTE');"
+```
+
 ## 2. Starting the Laya server
 
 ```bash

@@ -24,6 +24,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `uninstall.sh` now stops, disables and removes the `laya.service` unit
   (and kills orphan `laya` processes) — while **preserving** the Laya binary
   and models, which are external components possibly used by other tools.
+- **Least-privilege documentation for the physical bloat criterion**
+  (05-configuration, 06-deployment, README): since `pgstattuple` ≥ 1.5,
+  `pgstatindex()` (full index scan) is restricted to `SUPERUSER` or members of
+  the predefined role `pg_stat_scan_tables`. The daemon role `pgindexai` stays
+  non-superuser — the minimal grant is `GRANT pg_stat_scan_tables TO pgindexai;`
+  — and without it the criterion degrades gracefully (`WARN` per cycle + legacy
+  catalog heuristic; detection and DDL are unaffected).
 
 ### Changed
 

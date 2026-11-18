@@ -320,6 +320,12 @@ setup_role() {
     # by default — without this GRANT, CREATE/DROP INDEX fails (permission denied
     # for schema public) even if pgindexai owns the tables.
     run sudo -u "$POSTGRES_USER" psql -d pgindexai_demo -qc "GRANT CREATE ON SCHEMA public TO pgindexai"
+    # Least privilege for the physical bloat criterion: since pgstattuple 1.5,
+    # pgstatindex() (full index scan) is restricted to SUPERUSER or members of
+    # the predefined role pg_stat_scan_tables. Grant the narrow role — NOT
+    # superuser. Idempotent; without it the daemon degrades gracefully
+    # (legacy bloat heuristic + a WARN per cycle, no DDL impact).
+    run sudo -u "$POSTGRES_USER" psql -d pgindexai_demo -qc "GRANT pg_stat_scan_tables TO pgindexai"
 
     # Ownership transfer (tables + indexes) to pgindexai.
     # NB: re-applied after setup_demo in main() — the demo schema is

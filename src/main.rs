@@ -278,6 +278,29 @@ async fn check_pgstattuple(pool: &deadpool_postgres::Pool) {
         warn!("(since pgstattuple 1.5, the connection user must be a SUPERUSER");
         warn!("or a member of pg_stat_scan_tables to call pgstatindex()).");
     } else {
-        info!("pgstattuple is active (physical bloat detection enabled)");
+        // Extension present — also verify the CALL privilege. Since
+        // pgstattuple 1.5, pgstatindex() (full index scan) is restricted to
+        // SUPERUSER or members of pg_stat_scan_tables; a missing grant would
+        // otherwise surface as a per-cycle WARN. Report it ONCE at startup,
+        // with the least-privilege fix (no superuser needed).
+        let has_priv = client
+            .query_opt(
+                "SELECT has_function_privilege(current_user, 'pgstatindex(regclass)', 'EXECUTE')",
+                &[],
+            )
+            .await
+            .ok()
+            .flatten()
+            .and_then(|r| r.get::<_, Option<bool>>(0))
+            .unwrap_or(false);
+        if has_priv {
+            info!("pgstattuple is active (physical bloat detection enabled)");
+        } else {
+            warn!("pgstattuple is installed, but the connection role CANNOT call pgstatindex()");
+            warn!("(permission denied — since pgstattuple 1.5 it requires SUPERUSER or pg_stat_scan_tables).");
+            warn!("PHYSICAL BLOAT detection degrades to the legacy heuristic (a WARN repeats every cycle).");
+            warn!("Least-privilege fix (no superuser needed):");
+            warn!("  sudo -u postgres psql -d <db> -c \"GRANT pg_stat_scan_tables TO <role>;\"");
+        }
     }
 }
