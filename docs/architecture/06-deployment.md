@@ -55,7 +55,7 @@ The deployed unit contains the hardening: `MemoryMax=512M`,
 
 ```bash
 laya \
-  --model ~/.local/share/pgindexai/models/typed-decisions/ \
+  --model ~/.local/share/laya/models/typed-decisions/ \
   --cpu \
   --server \
   --port 8080

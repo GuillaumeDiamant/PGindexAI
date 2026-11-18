@@ -738,8 +738,9 @@ SERVICE
 # Step 4b: Laya decision engine (optional — required to apply DDL)
 # ─────────────────────────────────────────────
 # Laya is an EXTERNAL binary (not built by this script). When it is found
-# on the machine (new location first, legacy 'laya-sql' layout after),
-# install.sh services it as '$LAYA_SERVICE_NAME' (systemd, hardened).
+# on the machine (neutral 'laya/' layout first, then the legacy 'pgindexai/'
+# and 'laya-sql/' layouts), install.sh services it as '$LAYA_SERVICE_NAME'
+# (systemd, hardened). The neutral name keeps Laya reusable by other tools.
 # When it is missing, the install CONTINUES: the daemon runs in
 # observation mode (proposals generated, no DDL applied) until Laya is
 # reachable — the "no-fallback" policy guarantees the daemon never
@@ -750,6 +751,7 @@ setup_laya_service() {
     # ── Locate the binary ────────────────────────────────────────────
     local laya_bin="" cand
     for cand in \
+        "${TARGET_HOME}/.local/share/laya/laya" \
         "${TARGET_HOME}/.local/share/pgindexai/laya" \
         "${TARGET_HOME}/.local/share/laya-sql/laya"
     do
@@ -759,6 +761,8 @@ setup_laya_service() {
     # ── Locate the model (root dir containing rl_agent_config.json) ──
     local laya_model=""
     for cand in \
+        "${TARGET_HOME}/.local/share/laya/models/typed-decisions/typed-decisions" \
+        "${TARGET_HOME}/.local/share/laya/models/typed-decisions" \
         "${TARGET_HOME}/.local/share/pgindexai/models/typed-decisions/typed-decisions" \
         "${TARGET_HOME}/.local/share/pgindexai/models/typed-decisions" \
         "${TARGET_HOME}/.local/share/laya-sql/models/typed-decisions/typed-decisions" \

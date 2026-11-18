@@ -392,18 +392,20 @@ sudo -u postgres psql -c "CREATE ROLE pgindexai LOGIN;"
 
 ```bash
 # Download the Laya binary (CUDA 12 or CPU)
-mkdir -p ~/.local/share/pgindexai/models
+mkdir -p ~/.local/share/laya/models
 # ... place the typed-decisions model ...
 
 # Start in server mode
-laya --model ~/.local/share/pgindexai/models/typed-decisions/ \
+laya --model ~/.local/share/laya/models/typed-decisions/ \
      --cpu --server --port 8080
 ```
 
 > **Automatic service (recommended)**: `install.sh` detects the Laya binary
-> and model (new `~/.local/share/pgindexai/` layout first, legacy
-> `~/.local/share/laya-sql/` layout after) and deploys a hardened
-> `laya.service` unit (see `config/laya.service` for the reference template).
+> and model (neutral `~/.local/share/laya/` layout first, then the legacy
+> `~/.local/share/pgindexai/` and `~/.local/share/laya-sql/` layouts) and
+> deploys a hardened `laya.service` unit (see `config/laya.service` for the
+> reference template). The neutral `laya/` name keeps the component reusable
+> by other tools.
 > Laya is an **optional** component: if it is not found, the install
 > completes normally and the daemon runs in **observation mode** (proposals
 > only, no DDL) until Laya becomes reachable — the "no fallback" policy

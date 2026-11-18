@@ -11,8 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`laya.service` systemd unit for the Laya decision engine**
   (`config/laya.service` reference template): `install.sh` now detects the
-  Laya binary and model (new `~/.local/share/pgindexai/` layout first, legacy
-  `~/.local/share/laya-sql/` layout after) and deploys a hardened unit
+  Laya binary and model (neutral `~/.local/share/laya/` layout first, then
+  the legacy `~/.local/share/pgindexai/` and `~/.local/share/laya-sql/`
+  layouts) and deploys a hardened unit
   (`Restart=always`, `MemoryMax=4G`, `CPUQuota=100%`, `NoNewPrivileges`,
   `ProtectSystem=strict`, …), stops any orphan manual instance holding port
   8080, and polls `http://127.0.0.1:8080/health` for up to 30 s before
