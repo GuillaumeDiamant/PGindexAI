@@ -1385,6 +1385,23 @@ mod tests {
     }
 
     #[test]
+    fn test_normalized_between_interval_placeholder() {
+        // EXACT pg_stat_statements normalized form: the literal interval
+        // ('30 days') becomes `interval $1` (a placeholder as the interval
+        // qualifier). This is the text the daemon actually parses — it must
+        // still extract the BETWEEN predicate on the qualified column.
+        let q = "SELECT o.id, o.customer_id, o.status, o.total_amount FROM orders o WHERE o.order_date BETWEEN now() - interval $1 AND now() ORDER BY o.order_date DESC";
+        let cols = parse_query_for_sargable(q)
+            .expect("normalized form with `interval $1` must parse");
+        assert!(cols.contains(&(
+            "public".to_string(),
+            "orders".to_string(),
+            "order_date".to_string(),
+            "BETWEEN".to_string()
+        )));
+    }
+
+    #[test]
     fn test_sargable_eq_and_in() {
         let set = colset("SELECT * FROM orders WHERE status = 'open' AND id IN (1,2,3)");
         assert!(set.contains(&(
