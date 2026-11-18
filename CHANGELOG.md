@@ -50,6 +50,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Every real decision failed with HTTP 422 from Laya**
+  (`src/analyzer.rs::apply_proposals`): the option texts sent to the
+  typed-decisions model embedded the full proposal `reason` (~60-100 tokens)
+  in every option, while the model enforces a **48-token limit per
+  question's options** and rejects the payload with `422 "Question 'action'
+  exceeds option token limit (48)"`. The deep health check passed (short
+  test options), so Laya looked healthy while every real proposal was
+  silently skipped (no-fallback policy). Options are now short action
+  labels ("Ignore" / "Create standard index" / "Create filtered index
+  (WHERE IS NOT NULL)" / "Keep" / "Drop" / "Rebuild"); the full context is
+  already carried in the payload `state` field, so no information is lost.
+  The `IS NULL` withholding rule for the filtered option is unchanged.
+  Covered by `test_proposal_options_stay_short` and
+  `test_filtered_option_withheld_for_is_null`.
 - **`<insufficient privilege>` placeholder no longer starves the SARGable
   candidate budget** (`src/db/queries.rs::get_missing_sargable_indexes`):
   some client tools log statements they cannot read under the literal text

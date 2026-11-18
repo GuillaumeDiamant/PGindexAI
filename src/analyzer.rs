@@ -496,56 +496,10 @@ impl Analyzer {
         }
 
         for proposal in proposals {
-            // Build the payload
-            let criteria = match proposal.action {
-                DecisionAction::DropIndex => HashMap::from([
-                    (
-                        "0".to_string(),
-                        "Keep: index might be needed later".to_string(),
-                    ),
-                    (
-                        "1".to_string(),
-                        format!("Drop: index is unused — {}", proposal.reason),
-                    ),
-                ]),
-                DecisionAction::RebuildIndex => HashMap::from([
-                    (
-                        "0".to_string(),
-                        "Keep: fragmentation acceptable".to_string(),
-                    ),
-                    (
-                        "1".to_string(),
-                        format!("Rebuild: index is fragmented — {}", proposal.reason),
-                    ),
-                ]),
-                DecisionAction::CreateIndex | DecisionAction::CreateFilteredIndex => {
-                    let mut m = HashMap::new();
-                    m.insert("0".to_string(), "Ignore: no index needed".to_string());
-                    m.insert(
-                        "1".to_string(),
-                        format!("Create standard index — {}", proposal.reason),
-                    );
-                    // The `WHERE col IS NOT NULL` partial variant can only
-                    // serve `IS NOT NULL` workloads — a query `col IS NULL`
-                    // can never use it. For `IS NULL` proposals it is
-                    // therefore NOT offered (offering a structurally
-                    // useless option would only invite a wrong decision).
-                    if proposal.null_predicate.as_deref() != Some("IS NULL") {
-                        m.insert(
-                            "2".to_string(),
-                            format!(
-                                "Create filtered index (WHERE IS NOT NULL) — {}",
-                                proposal.reason
-                            ),
-                        );
-                    }
-                    m
-                }
-                DecisionAction::Ignore => {
-                    HashMap::from([("0".to_string(), "No action needed".to_string())])
-                }
-            };
-
+            // Build the payload. Options stay short (Laya enforces a 48-token
+            // limit on a question's options — HTTP 422 beyond); the full
+            // context (proposal.reason) rides in the `state` field.
+            let criteria = proposal_options(&proposal);
             let payload = LayaClient::build_payload(&proposal.reason, criteria);
 
             // Call Laya
@@ -835,6 +789,45 @@ impl Analyzer {
     }
 }
 
+/// Build the SHORT option list (`criteria`) for a proposal.
+///
+/// The Laya typed-decisions model enforces a **48-token limit on a
+/// question's options** and rejects the payload with HTTP 422 beyond it.
+/// The full context (`proposal.reason`) is already carried in the payload
+/// `state` field (see `apply_proposals`), so options only name the action —
+/// they must never embed the reason (regression: long reasons duplicated in
+/// every option made every real proposal fail with 422).
+fn proposal_options(proposal: &Proposal) -> HashMap<String, String> {
+    match proposal.action {
+        DecisionAction::DropIndex => HashMap::from([
+            ("0".to_string(), "Keep the index".to_string()),
+            ("1".to_string(), "Drop the index".to_string()),
+        ]),
+        DecisionAction::RebuildIndex => HashMap::from([
+            ("0".to_string(), "Keep the index".to_string()),
+            ("1".to_string(), "Rebuild the index".to_string()),
+        ]),
+        DecisionAction::CreateIndex | DecisionAction::CreateFilteredIndex => {
+            let mut m = HashMap::new();
+            m.insert("0".to_string(), "Ignore".to_string());
+            m.insert("1".to_string(), "Create standard index".to_string());
+            // The `WHERE col IS NOT NULL` partial variant can only
+            // serve `IS NOT NULL` workloads — a query `col IS NULL`
+            // can never use it. For `IS NULL` proposals it is
+            // therefore NOT offered (offering a structurally
+            // useless option would only invite a wrong decision).
+            if proposal.null_predicate.as_deref() != Some("IS NULL") {
+                m.insert(
+                    "2".to_string(),
+                    "Create filtered index (WHERE IS NOT NULL)".to_string(),
+                );
+            }
+            m
+        }
+        DecisionAction::Ignore => HashMap::from([("0".to_string(), "No action needed".to_string())]),
+    }
+}
+
 /// Sanitize a field (column type from the catalog) before inserting it
 /// into a `reason` sent to Laya: alphanumeric + `_ ()/,` only,
 /// bounded length. Everything else is removed — never uncontrolled raw text.
@@ -856,6 +849,76 @@ fn sanitize_reason_field(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A realistic (long) reason, as produced by the SARGable analysis.
+    fn long_reason() -> String {
+        format!(
+            "SARGable query on public.orders: shipping_method = (type: text, 226963 calls, \
+             1835.2ms avg, null_frac: 0.00). No covering index. Proposed btree index. \
+             Target density for text: 25 tuples/page, estimated index size: 4194304 bytes."
+        )
+    }
+
+    /// A proposal of the given action, carrying the long reason.
+    fn sample_proposal(action: DecisionAction, null_predicate: Option<&str>) -> Proposal {
+        Proposal {
+            action,
+            ddl: "CREATE INDEX idx ON public.orders (shipping_method)".to_string(),
+            reason: long_reason(),
+            confidence: 0.0,
+            table: "orders".to_string(),
+            schema: "public".to_string(),
+            index_name: Some("orders_shipping_method_idx".to_string()),
+            column: Some("shipping_method".to_string()),
+            index_method: Some("btree".to_string()),
+            null_predicate: null_predicate.map(str::to_string),
+        }
+    }
+
+    /// Regression (HTTP 422 "option token limit (48)"): Laya rejects any
+    /// payload whose options exceed 48 tokens per question. The full reason
+    /// travels in `state`, so options must stay short — assert every option
+    /// is far below the limit and embeds none of the reason.
+    #[test]
+    fn test_proposal_options_stay_short() {
+        for action in [
+            DecisionAction::Ignore,
+            DecisionAction::CreateIndex,
+            DecisionAction::CreateFilteredIndex,
+            DecisionAction::DropIndex,
+            DecisionAction::RebuildIndex,
+        ] {
+            let opts = proposal_options(&sample_proposal(action, None));
+            assert!(!opts.is_empty(), "{action:?}: options missing");
+            for (k, v) in &opts {
+                // 64 chars ≈ 20 tokens max — comfortably under Laya's 48.
+                assert!(v.len() <= 64, "{action:?}: option {k} too long: {v}");
+                assert!(
+                    !v.contains("SARGable") && !v.contains("orders"),
+                    "{action:?}: option {k} must not embed the reason: {v}"
+                );
+            }
+        }
+    }
+
+    /// The filtered-index option ("2") is withheld for `IS NULL` proposals
+    /// (a `WHERE col IS NOT NULL` index cannot serve them) — and offered
+    /// otherwise.
+    #[test]
+    fn test_filtered_option_withheld_for_is_null() {
+        let is_null = proposal_options(&sample_proposal(
+            DecisionAction::CreateFilteredIndex,
+            Some("IS NULL"),
+        ));
+        assert!(!is_null.contains_key("2"), "IS NULL: option 2 must be withheld");
+        assert!(is_null.contains_key("0") && is_null.contains_key("1"));
+
+        let is_not_null = proposal_options(&sample_proposal(
+            DecisionAction::CreateFilteredIndex,
+            Some("IS NOT NULL"),
+        ));
+        assert!(is_not_null.contains_key("2"), "IS NOT NULL: option 2 offered");
+    }
 
     #[test]
     fn test_sanitize_reason_field() {
