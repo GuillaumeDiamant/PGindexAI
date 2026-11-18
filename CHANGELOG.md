@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-18
+
 ### Added
 
 - **`laya.service` systemd unit for the Laya decision engine**
@@ -105,6 +107,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   evidence shows a single uniform text; a real user query can never be
   mis-excluded. Covered by the live regression test
   `test_sargable_insufficient_privilege_exclusion_live`.
+- **Live regression tests no longer panic on CI runners without PostgreSQL**
+  (`src/db/queries.rs`, `src/ddl.rs`): `deadpool` `create_pool()` is lazy
+  (no I/O), so the `Some(pool)` gate passed even when PostgreSQL was absent
+  and the first `pool.get()` panicked the whole test job. Each live test now
+  probes the socket after pool creation and skips cleanly
+  (`SKIP ...: PostgreSQL not reachable`), mirroring the long-proven
+  `test_cardinality_live` pattern. All four CI jobs are green again
+  (fmt / clippy / tests+release / shellcheck).
 
 ## [0.2.1] - 2026-11-13
 
