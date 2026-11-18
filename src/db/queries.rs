@@ -1391,8 +1391,8 @@ mod tests {
         // qualifier). This is the text the daemon actually parses — it must
         // still extract the BETWEEN predicate on the qualified column.
         let q = "SELECT o.id, o.customer_id, o.status, o.total_amount FROM orders o WHERE o.order_date BETWEEN now() - interval $1 AND now() ORDER BY o.order_date DESC";
-        let cols = parse_query_for_sargable(q)
-            .expect("normalized form with `interval $1` must parse");
+        let cols =
+            parse_query_for_sargable(q).expect("normalized form with `interval $1` must parse");
         assert!(cols.contains(&(
             "public".to_string(),
             "orders".to_string(),
@@ -1709,6 +1709,13 @@ mod tests {
             eprintln!("SKIP test_sargable_system_query_filter_live: no local PostgreSQL");
             return;
         };
+        // create_pool() is lazy (no I/O): the gate above cannot detect a
+        // missing PostgreSQL. Probe the socket and skip cleanly instead of
+        // panicking in the closures (CI runners have no PostgreSQL).
+        if rt.block_on(pool.get()).is_err() {
+            eprintln!("SKIP test_sargable_system_query_filter_live: PostgreSQL not reachable");
+            return;
+        };
         let excluded = |query: &str| {
             rt.block_on(async {
                 let client = pool.get().await.unwrap();
@@ -1758,14 +1765,28 @@ mod tests {
             .ok()
         });
         let Some(pool) = pool else {
-            eprintln!("SKIP test_sargable_insufficient_privilege_exclusion_live: no local PostgreSQL");
+            eprintln!(
+                "SKIP test_sargable_insufficient_privilege_exclusion_live: no local PostgreSQL"
+            );
+            return;
+        };
+        // create_pool() is lazy (no I/O): the gate above cannot detect a
+        // missing PostgreSQL. Probe the socket and skip cleanly instead of
+        // panicking in the closures (CI runners have no PostgreSQL).
+        if rt.block_on(pool.get()).is_err() {
+            eprintln!(
+                "SKIP test_sargable_insufficient_privilege_exclusion_live: PostgreSQL not reachable"
+            );
             return;
         };
         let excluded = |query: &str| {
             rt.block_on(async {
                 let client = pool.get().await.unwrap();
                 client
-                    .query_one("SELECT $1 = $2", &[&query, &SARGABLE_PLACEHOLDER_INSUFFICIENT_PRIVILEGE])
+                    .query_one(
+                        "SELECT $1 = $2",
+                        &[&query, &SARGABLE_PLACEHOLDER_INSUFFICIENT_PRIVILEGE],
+                    )
                     .await
                     .unwrap()
                     .get::<_, bool>(0)
@@ -1774,7 +1795,9 @@ mod tests {
         // Placeholder → MUST be excluded from the candidate pool
         assert!(excluded("<insufficient privilege>"));
         // Real user queries → must NOT be excluded
-        assert!(!excluded("SELECT id, customer_id FROM orders WHERE shipping_method = $1"));
+        assert!(!excluded(
+            "SELECT id, customer_id FROM orders WHERE shipping_method = $1"
+        ));
         assert!(!excluded("SELECT c.name FROM customers c JOIN orders o ON o.customer_id = c.id WHERE o.status = $1"));
     }
 

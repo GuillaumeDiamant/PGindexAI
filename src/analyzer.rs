@@ -499,7 +499,7 @@ impl Analyzer {
             // Build the payload. Options stay short (Laya enforces a 48-token
             // limit on a question's options — HTTP 422 beyond); the full
             // context (proposal.reason) rides in the `state` field.
-            let criteria = proposal_options(&proposal);
+            let criteria = proposal_options(proposal);
             let payload = LayaClient::build_payload(&proposal.reason, criteria);
 
             // Call Laya
@@ -811,13 +811,13 @@ fn proposal_options(proposal: &Proposal) -> HashMap<String, String> {
             ("0".to_string(), "Keep the index".to_string()),
             ("1".to_string(), "Rebuild the index".to_string()),
         ]),
-        DecisionAction::CreateIndex | DecisionAction::CreateFilteredIndex => {
-            HashMap::from([
-                ("0".to_string(), "Ignore".to_string()),
-                ("1".to_string(), "Create index".to_string()),
-            ])
+        DecisionAction::CreateIndex | DecisionAction::CreateFilteredIndex => HashMap::from([
+            ("0".to_string(), "Ignore".to_string()),
+            ("1".to_string(), "Create index".to_string()),
+        ]),
+        DecisionAction::Ignore => {
+            HashMap::from([("0".to_string(), "No action needed".to_string())])
         }
-        DecisionAction::Ignore => HashMap::from([("0".to_string(), "No action needed".to_string())]),
     }
 }
 
@@ -845,11 +845,10 @@ mod tests {
 
     /// A realistic (long) reason, as produced by the SARGable analysis.
     fn long_reason() -> String {
-        format!(
-            "SARGable query on public.orders: shipping_method = (type: text, 226963 calls, \
-             1835.2ms avg, null_frac: 0.00). No covering index. Proposed btree index. \
-             Target density for text: 25 tuples/page, estimated index size: 4194304 bytes."
-        )
+        "SARGable query on public.orders: shipping_method = (type: text, 226963 calls, \
+         1835.2ms avg, null_frac: 0.00). No covering index. Proposed btree index. \
+         Target density for text: 25 tuples/page, estimated index size: 4194304 bytes."
+            .to_string()
     }
 
     /// A proposal of the given action, carrying the long reason.
@@ -919,11 +918,7 @@ mod tests {
                     "{label}: expected options keyed 0 and 1, got: {opts:?}"
                 );
                 assert_eq!(opts.get("0"), Some(&"Ignore".to_string()), "{label}");
-                assert_eq!(
-                    opts.get("1"),
-                    Some(&"Create index".to_string()),
-                    "{label}"
-                );
+                assert_eq!(opts.get("1"), Some(&"Create index".to_string()), "{label}");
             }
         }
     }
