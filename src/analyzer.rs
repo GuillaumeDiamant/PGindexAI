@@ -539,22 +539,15 @@ impl Analyzer {
                             }
                         }
                         DecisionAction::CreateIndex | DecisionAction::CreateFilteredIndex => {
+                            // The question asks only "create, or ignore?" (2
+                            // options — the model's best-calibrated format,
+                            // measured). The STANDARD vs FILTERED variant was
+                            // already decided deterministically at analysis
+                            // time (NULL polarity + null_frac), so a
+                            // "create" confirmation applies the computed
+                            // variant.
                             match choice.as_str() {
-                                "1" => Some(DecisionAction::CreateIndex),
-                                "2" => {
-                                    // Safety net: "2" (filtered) is never
-                                    // OFFERED for IS NULL proposals (see the
-                                    // criteria above) — if Laya returns it
-                                    // anyway, downgrade to the standard
-                                    // variant instead of executing a
-                                    // `WHERE col IS NOT NULL` index that
-                                    // cannot serve the IS NULL workload.
-                                    if proposal.null_predicate.as_deref() == Some("IS NULL") {
-                                        Some(DecisionAction::CreateIndex)
-                                    } else {
-                                        Some(DecisionAction::CreateFilteredIndex)
-                                    }
-                                }
+                                "1" => Some(proposal.action),
                                 _ => Some(DecisionAction::Ignore),
                             }
                         }
@@ -568,9 +561,9 @@ impl Analyzer {
                             DecisionAction::CreateIndex | DecisionAction::CreateFilteredIndex => {
                                 info!("Laya recommended CREATE INDEX: {}", proposal.reason);
                                 if self.config.actions.create_index {
-                                    // Laya's CHOICE (1 = standard, 2 = filtered) determines the
-                                    // DDL executed — not the variant generated at analysis.
-                                    // (Fixed regression: both choices executed the same DDL.)
+                                    // Laya's "1" confirms the CREATE; the STANDARD vs
+                                    // FILTERED variant was fixed at analysis time
+                                    // (NULL polarity + null_frac) — the DDL below uses it.
                                     let filtered = matches!(d, DecisionAction::CreateFilteredIndex);
                                     let ddl_to_run = match (
                                         proposal.index_name.as_deref(),
@@ -791,12 +784,23 @@ impl Analyzer {
 
 /// Build the SHORT option list (`criteria`) for a proposal.
 ///
-/// The Laya typed-decisions model enforces a **48-token limit on a
-/// question's options** and rejects the payload with HTTP 422 beyond it.
-/// The full context (`proposal.reason`) is already carried in the payload
-/// `state` field (see `apply_proposals`), so options only name the action —
-/// they must never embed the reason (regression: long reasons duplicated in
-/// every option made every real proposal fail with 422).
+/// Two constraints shape the options:
+///
+/// - **Length**: the Laya typed-decisions model enforces a **48-token limit
+///   on a question's options** and rejects the payload with HTTP 422 beyond
+///   it. The full context (`proposal.reason`) is already carried in the
+///   payload `state` field (see `apply_proposals`), so options only name the
+///   action — they must never embed the reason (regression: long reasons
+///   duplicated in every option made every real proposal fail with 422).
+/// - **Shape**: the CREATE question is **binary** ("Ignore" / "Create
+///   index") — measured against the live model, the 2-option format is its
+///   best-calibrated bucket (`rl_agent_config.json` `temperature_by_options`
+///   `"choice:2"`): the same real payload scored confidence 0.12 with two
+///   options vs 0.014 with three, and offering a near-duplicate
+///   "standard" / "filtered" pair split probability between two structurally
+///   equivalent choices. The STANDARD vs FILTERED variant is decided
+///   deterministically at analysis time (NULL polarity + null_frac); Laya
+///   only answers the create/ignore question.
 fn proposal_options(proposal: &Proposal) -> HashMap<String, String> {
     match proposal.action {
         DecisionAction::DropIndex => HashMap::from([
@@ -808,21 +812,10 @@ fn proposal_options(proposal: &Proposal) -> HashMap<String, String> {
             ("1".to_string(), "Rebuild the index".to_string()),
         ]),
         DecisionAction::CreateIndex | DecisionAction::CreateFilteredIndex => {
-            let mut m = HashMap::new();
-            m.insert("0".to_string(), "Ignore".to_string());
-            m.insert("1".to_string(), "Create standard index".to_string());
-            // The `WHERE col IS NOT NULL` partial variant can only
-            // serve `IS NOT NULL` workloads — a query `col IS NULL`
-            // can never use it. For `IS NULL` proposals it is
-            // therefore NOT offered (offering a structurally
-            // useless option would only invite a wrong decision).
-            if proposal.null_predicate.as_deref() != Some("IS NULL") {
-                m.insert(
-                    "2".to_string(),
-                    "Create filtered index (WHERE IS NOT NULL)".to_string(),
-                );
-            }
-            m
+            HashMap::from([
+                ("0".to_string(), "Ignore".to_string()),
+                ("1".to_string(), "Create index".to_string()),
+            ])
         }
         DecisionAction::Ignore => HashMap::from([("0".to_string(), "No action needed".to_string())]),
     }
@@ -901,23 +894,38 @@ mod tests {
         }
     }
 
-    /// The filtered-index option ("2") is withheld for `IS NULL` proposals
-    /// (a `WHERE col IS NOT NULL` index cannot serve them) — and offered
-    /// otherwise.
+    /// The CREATE question is binary for every NULL polarity: Laya only
+    /// answers "create, or ignore?" — the STANDARD vs FILTERED variant is
+    /// fixed deterministically at analysis time (NULL polarity + null_frac),
+    /// so it must never appear as a third option (the 2-option format is the
+    /// model's best-calibrated bucket; a near-duplicate "standard" /
+    /// "filtered" pair split probability between equivalent choices).
     #[test]
-    fn test_filtered_option_withheld_for_is_null() {
-        let is_null = proposal_options(&sample_proposal(
-            DecisionAction::CreateFilteredIndex,
-            Some("IS NULL"),
-        ));
-        assert!(!is_null.contains_key("2"), "IS NULL: option 2 must be withheld");
-        assert!(is_null.contains_key("0") && is_null.contains_key("1"));
-
-        let is_not_null = proposal_options(&sample_proposal(
-            DecisionAction::CreateFilteredIndex,
-            Some("IS NOT NULL"),
-        ));
-        assert!(is_not_null.contains_key("2"), "IS NOT NULL: option 2 offered");
+    fn test_create_question_is_binary() {
+        for null_predicate in [None, Some("IS NULL"), Some("IS NOT NULL")] {
+            for action in [
+                DecisionAction::CreateIndex,
+                DecisionAction::CreateFilteredIndex,
+            ] {
+                let opts = proposal_options(&sample_proposal(action, null_predicate));
+                let label = format!("{action:?} / null_predicate={null_predicate:?}");
+                assert_eq!(
+                    opts.len(),
+                    2,
+                    "{label}: expected exactly 2 options, got: {opts:?}"
+                );
+                assert!(
+                    opts.contains_key("0") && opts.contains_key("1"),
+                    "{label}: expected options keyed 0 and 1, got: {opts:?}"
+                );
+                assert_eq!(opts.get("0"), Some(&"Ignore".to_string()), "{label}");
+                assert_eq!(
+                    opts.get("1"),
+                    Some(&"Create index".to_string()),
+                    "{label}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -309,7 +309,10 @@ Each DDL action type is controlled by a flag in the config:
    the config cannot bypass this guarantee (no "heuristic" mode)
 2. **Production**: `drop_unused: false` during the burn-in phase (DROPs remain
    subject to Laya's decision even with the flag active)
-3. **min_confidence**: raise it to `0.9` in production to avoid false positives
+3. **min_confidence**: the default `0.1` is calibrated on the
+   laya-typed-decisions model (measured confidence scale ~0.10-0.38 — it
+   never reaches 0.7). Raise it to `~0.2-0.3` in production to apply only
+   unambiguous cases
 4. **TLS**: for a remote TCP connection, `ssl_mode: verify-full` (or
    `verify-ca`) — rustls **always validates** the chain and the hostname, there
    is no "accept all" mode; add `ssl_root_cert` (PEM)

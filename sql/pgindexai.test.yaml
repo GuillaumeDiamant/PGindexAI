@@ -30,7 +30,7 @@ thresholds:
   use_index_bloat: true         # physical bloat via pgstattuple (installed in the demo DB)
   use_gin_gist_detection: true  # GIN/GIST detection ON (jsonb/hstore/arrays → GIN, ranges → GIST)
   min_sargable_rows: 100
-  min_confidence: 0.7
+  min_confidence: 0.1
   max_proposals_per_cycle: 20
   ddl_timeout_seconds: 60
 

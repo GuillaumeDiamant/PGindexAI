@@ -43,7 +43,10 @@ thresholds:
                                 # SARGable patterns).
   min_sargable_rows: 100   # Min. executions (pg_stat_statements.calls) for a
                            # query to be a candidate for a SARGable index (>= 1)
-  min_confidence: 0.7      # Minimum Laya confidence to apply (0.0..=1.0)
+  min_confidence: 0.1      # Minimum Laya confidence to apply (0.0..=1.0).
+                           # Calibrated on laya-typed-decisions: the model reports
+                           # ~0.10 (weak case) to ~0.38 (strong case) — it never
+                           # reaches 0.7. Raise to ~0.2-0.3 for unambiguous cases only.
   max_proposals_per_cycle: 20  # Proposal budget per cycle (1..=1000)
   ddl_timeout_seconds: 1800  # Timeout of long CONCURRENTLY DDL, in seconds
                              # (0 = unlimited; 0..=86400 — keep generous: a

@@ -425,7 +425,12 @@ fn default_min_sargable() -> u64 {
     100
 }
 fn default_min_confidence() -> f64 {
-    0.7
+    // Calibrated on the laya-typed-decisions model (measured Nov 2026):
+    // its RL confidence head reports ~0.10 for weak cases and ~0.38 for
+    // strong ones — it never reaches 0.7, which used to reject every
+    // decision. 0.10 accepts the model's clear calls; raise to ~0.2-0.3
+    // to only apply unambiguous cases.
+    0.1
 }
 fn default_max_proposals() -> u32 {
     20

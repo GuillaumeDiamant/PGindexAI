@@ -137,7 +137,7 @@ main()
     ├── for each proposal:
     │   ├── build_payload(reason, criteria)  (criteria depend on the type)
     │   ├── laya.decision(payload) → { choice, confidence }
-    │   ├── confidence ≥ min_confidence (0.7)?  else skip
+    │   ├── confidence ≥ min_confidence (0.1)?  else skip
     │   ├── choice applied?  else skip (debug)
     │   ├── action flag enabled (actions.*)?  else skip (warn)
     │   └── match proposal.action:
@@ -310,7 +310,7 @@ Laya response:
 ```
 
 **Conditional application**:
-- `confidence < min_confidence` (default 0.7) → skip (no heuristic)
+- `confidence < min_confidence` (default 0.1, calibrated) → skip (no heuristic)
 - `choice` = APPLY for this proposal type → online DDL execution (CONCURRENTLY)
 - `choice` = Keep/Ignore → log only
 - Unexpected `choice` for this proposal type → `Ignore` (skip, log)

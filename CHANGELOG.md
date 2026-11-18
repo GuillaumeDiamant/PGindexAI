@@ -27,6 +27,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Binary Laya question + calibrated `min_confidence`** (measured against
+  the live `laya-typed-decisions` model, Nov 2026): the CREATE decision is
+  now a strict 2-option question ("Ignore" / "Create index") instead of
+  3 options — the 2-option format is the model's best-calibrated bucket
+  (`rl_agent_config.json` `temperature_by_options` `"choice:2"`), and the
+  same real payload scored confidence **0.12 with two options vs 0.014 with
+  three**; offering a near-duplicate "standard" / "filtered" pair only split
+  probability between two structurally equivalent choices. The STANDARD vs
+  FILTERED variant is decided **deterministically at analysis time**
+  (NULL polarity + `null_frac`) — Laya answers only create/ignore, and a
+  `"1"` confirmation applies the variant the daemon computed
+  (`src/analyzer.rs::proposal_options`, choice mapping). Consequence:
+  `thresholds.min_confidence` default **0.7 → 0.1** — the model's RL
+  confidence head reports ~0.10 for weak cases and ~0.38 for strong ones
+  (never ≥ 0.7, so the old default rejected every decision). Raise to
+  ~0.2-0.3 to apply only unambiguous cases. Shipped config, README and
+  architecture docs updated accordingly. Covered by
+  `test_proposal_options_stay_short` and `test_create_question_is_binary`.
 - **Peer authentication replaces the password (local setup)**: `install.sh`
   now configures a `pg_ident` map (`pgindexai_map: <daemon OS user> → pgindexai`)
   and a targeted `local all pgindexai peer map=pgindexai_map` line in
@@ -58,12 +76,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exceeds option token limit (48)"`. The deep health check passed (short
   test options), so Laya looked healthy while every real proposal was
   silently skipped (no-fallback policy). Options are now short action
-  labels ("Ignore" / "Create standard index" / "Create filtered index
-  (WHERE IS NOT NULL)" / "Keep" / "Drop" / "Rebuild"); the full context is
-  already carried in the payload `state` field, so no information is lost.
-  The `IS NULL` withholding rule for the filtered option is unchanged.
+  labels ("Ignore" / "Create index" / "Keep the index" / "Drop the index"
+  / "Rebuild the index"); the full context is already carried in the
+  payload `state` field, so no information is lost. (The CREATE question
+  is binary — see the "Binary Laya question" entry under Changed.)
   Covered by `test_proposal_options_stay_short` and
-  `test_filtered_option_withheld_for_is_null`.
+  `test_create_question_is_binary`.
 - **`<insufficient privilege>` placeholder no longer starves the SARGable
   candidate budget** (`src/db/queries.rs::get_missing_sargable_indexes`):
   some client tools log statements they cannot read under the literal text

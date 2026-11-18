@@ -261,7 +261,7 @@ thresholds:
   use_index_bloat: true         # Physical bloat detection via pgstattuple (leaf fill);
                                 # false = legacy catalog-statistics heuristic only
   min_sargable_rows: 100        # Minimum executions (pg_stat_statements.calls)
-  min_confidence: 0.7           # Minimum Laya confidence to apply
+  min_confidence: 0.1           # Minimum Laya confidence to apply (calibrated: model scale ~0.10-0.38)
   max_proposals_per_cycle: 20   # Proposal budget per cycle
 
 # Analysis scope (new)

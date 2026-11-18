@@ -62,7 +62,7 @@ thresholds:
   use_index_bloat: true            # Physical bloat via pgstattuple (leaf fill)
   use_gin_gist_detection: true     # GIN/GIST index-need detection (jsonb/arrays/tsvector → GIN, geometry/ranges → GIST)
   min_sargable_rows: 100           # Min. executions (pg_stat_statements.calls)
-  min_confidence: 0.7              # Min. Laya confidence for APPLY (0.0..=1.0)
+  min_confidence: 0.1              # Min. Laya confidence for APPLY (0.0..=1.0) — calibrated: model scale ~0.10-0.38
   max_proposals_per_cycle: 20      # Proposal budget per cycle (1..=1000)
   ddl_timeout_seconds: 1800        # Long CONCURRENTLY DDL timeout (0 = unlimited, 0..=86400)
 
@@ -140,7 +140,7 @@ index_logging:
 | `thresholds.use_index_bloat` | `true` | bool |
 | `thresholds.use_gin_gist_detection` | `true` | bool |
 | `thresholds.min_sargable_rows` | `100` | `>= 1` |
-| `thresholds.min_confidence` | `0.7` | `0.0..=1.0` |
+| `thresholds.min_confidence` | `0.1` (calibrated: model scale ~0.10-0.38) | `0.0..=1.0` |
 | `thresholds.max_proposals_per_cycle` | `20` | `1..=1000` |
 | `thresholds.ddl_timeout_seconds` | `1800` (30 min) | `0..=86400` (0 = unlimited) |
 | `analysis.schemas` | `[]` (all non-system schemas) | list |
@@ -237,7 +237,7 @@ actions:
   rebuild_fragmented: true
 
 thresholds:
-  min_confidence: 0.9
+  min_confidence: 0.2           # conservative in prod (model scale ~0.10-0.38)
   min_sargable_rows: 500
   max_proposals_per_cycle: 10   # conservative budget in prod
 

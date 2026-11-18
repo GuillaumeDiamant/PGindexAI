@@ -400,7 +400,7 @@ pub struct ActionQuestion {
     #[serde(rename = "type")]
     pub type_: String,           // "choice"
     pub instructions: String,    // Instructions for the AI
-    pub criteria: HashMap<String, String>,  // Numbered options "0","1","2"…
+    pub criteria: HashMap<String, String>,  // Numbered options "0","1" (binary question)
 }
 ```
 
@@ -503,7 +503,7 @@ without these sections remains valid.
 | `use_index_bloat` | `true` |
 | `use_gin_gist_detection` | `true` |
 | `min_sargable_rows` | `100` |
-| `min_confidence` | `0.7` |
+| `min_confidence` | `0.1` (calibrated on laya-typed-decisions: model scale ~0.10-0.38) |
 | `max_proposals_per_cycle` | `20` |
 | `analysis.schemas` | `[]` (all non-system schemas) |
 | `pg_pool.max_size` | `16` |
