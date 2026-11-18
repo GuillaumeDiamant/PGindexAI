@@ -902,6 +902,15 @@ mod tests {
             );
             return;
         };
+        // create_pool() is lazy (no I/O): the gate above cannot detect a
+        // missing PostgreSQL. Probe the socket and skip cleanly instead of
+        // panicking below (CI runners have no PostgreSQL).
+        if rt.block_on(pool.get()).is_err() {
+            eprintln!(
+                "SKIP test_execute_create_index_audit_log_states_method: PostgreSQL not reachable"
+            );
+            return;
+        };
 
         let log_file = std::env::temp_dir()
             .join(format!("pgindexai_audit_test_{}", std::process::id()))
