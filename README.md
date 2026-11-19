@@ -317,7 +317,7 @@ index_logging:
 ### Prerequisites
 
 - **PostgreSQL 16+** (ideally with the `pg_stat_statements` extension enabled — without it, the daemon enters degraded mode: missing-index detection disabled)
-- **Laya server** (`laya`) in server mode on a local port — **required to apply DDL**; without it the daemon stays in observation mode (no database modification)
+- **Laya server** (`laya`) in server mode on a local port — **required to apply DDL**; without it the daemon stays in observation mode (no database modification). It is the official **laya.cpp** binary ([`lkarlslund/laya.cpp`](https://github.com/lkarlslund/laya.cpp), MIT) running the [`convaiinnovations/laya-typed-decisions`](https://huggingface.co/convaiinnovations/laya-typed-decisions) Hugging Face model — `install.sh` can fetch both for you (SHA-256 verified)
 - **Rust toolchain** (to build from source)
 
 ### 🔧 Automatic installation script
@@ -368,7 +368,7 @@ The script does the following automatically:
 | 5. Installation | Binary → `/usr/local/bin/pgindexai` |
 | 6. Configuration | Generates `~/.config/PGindexAI/PGindexAI.yaml` as **0600** with `password: null` (no secret) |
 | 7. systemd service | Deploys the **hardened** unit (MemoryMax, NoNewPrivileges, …) and enables it |
-| 7b. Laya service (optional) | If the Laya binary + model are found on the machine, deploys the hardened `laya.service` unit and verifies `http://127.0.0.1:8080/health`; **never aborts the install** if missing (observation mode) |
+| 7b. Laya service (optional) | If the Laya binary + model are found on the machine, deploys the hardened `laya.service` unit and verifies `http://127.0.0.1:8080/health`; if missing, prints the **official install runbook** (laya.cpp release + Hugging Face model, SHA-256 verified) and offers to install in place (interactive prompt); **never aborts the install** (observation mode) |
 | 8. Demo | Loads the demo schema and workload, transfers ownership to `pgindexai` |
 
 ### 1. PostgreSQL (manual)
@@ -399,16 +399,38 @@ sudo -u postgres psql -d pgindexai_demo -c "GRANT pg_stat_scan_tables TO pgindex
 #  a scram-sha-256 pg_hba line; and set the password in the config)
 ```
 
-### 2. Laya server
+### 2. Laya server (external component)
+
+Laya is **not** part of PGindexAI: it is the official **laya.cpp** binary
+([`lkarlslund/laya.cpp`](https://github.com/lkarlslund/laya.cpp), MIT —
+native C++ inference, ggml) running the
+[`convaiinnovations/laya-typed-decisions`](https://huggingface.co/convaiinnovations/laya-typed-decisions)
+model from Hugging Face.
+
+**Easiest path — let `install.sh` do it:** run `install.sh` while Laya is
+missing; it prints a complete, copy-pasteable runbook (official release URL,
+SHA-256 checksum, sanity check) and, interactively, offers to download the
+binary + model in place. Re-run `./install.sh` afterwards and it deploys the
+hardened `laya.service` unit.
+
+**Manual path:**
 
 ```bash
-# Download the Laya binary (CUDA 12 or CPU)
-mkdir -p ~/.local/share/laya/models
-# ... place the typed-decisions model ...
+# 1. Binary — official laya.cpp release. The cuda12 build needs the NVIDIA
+#    driver (libcuda.so.1); the ~78 MB vulkan build needs only libvulkan1.
+#    Take the exact URL + SHA-256 from the runbook printed by install.sh.
+mkdir -p ~/.local/share/laya
+curl -fSL -o ~/.local/share/laya/laya \
+  https://github.com/lkarlslund/laya.cpp/releases/download/r0004/laya-r0004-linux-amd64-cuda12
 
-# Start in server mode
-laya --model ~/.local/share/laya/models/typed-decisions/ \
-     --cpu --server --port 8080
+# 2. Model — Hugging Face (canonical nested layout)
+hf download convaiinnovations/laya-typed-decisions \
+  --local-dir ~/.local/share/laya/models/typed-decisions/typed-decisions
+
+# 3. Start in server mode (CPU inference)
+~/.local/share/laya/laya \
+  --model ~/.local/share/laya/models/typed-decisions/typed-decisions \
+  --cpu --server --port 8080
 ```
 
 > **Automatic service (recommended)**: `install.sh` detects the Laya binary
@@ -586,12 +608,14 @@ pgindexai/
 ├── Cargo.toml              # Rust dependencies (sqlparser 0.52, rustls, …)
 ├── Cargo.lock              # Locked (binary project)
 ├── install.sh              # Hardened installer (dedicated role, targeted pg_hba,
-│                           # 0600 config, systemd unit, --dry-run)
+│                           # 0600 config, systemd unit, --dry-run, official
+│                           # Laya runbook + optional in-place install)
 ├── uninstall.sh            # Uninstallation (service, binary, config,
 │                           # --purge, --clean-legacy, --dry-run)
 ├── config/
 │   ├── PGindexAI.yaml        # Configuration template
-│   └── pgindexai.service    # systemd unit (reference)
+│   ├── pgindexai.service    # systemd unit (reference)
+│   └── laya.service         # Laya server unit (reference; deployed by install.sh)
 ├── sql/
 │   ├── demo_schema.sql     # Demo schema (5 tables, 23 indexes)
 │   └── demo_workload.sql   # Test workload (8 phases)
@@ -650,7 +674,7 @@ pgindexai/
 - **Naming convention** `idx_<table>_<col>` validated (63 bytes, short hash)
 - **Multi-schema** — configurable analysis scope
 - **Explicit degraded mode** when `pg_stat_statements` is absent
-- **Zero external dependencies** other than PostgreSQL and the Laya server
+- **Zero external dependencies** other than PostgreSQL and the Laya server (Laya = official laya.cpp binary + Hugging Face model, installable by `install.sh`)
 - **YAML configuration** with robust defaults
 - **Structured logging** (JSON or text) with file rotation
 - **Complete audit trail** of all index operations
