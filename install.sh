@@ -6,6 +6,9 @@
 #   - PostgreSQL 16+ (psql binary + working cluster)
 #   - Rust toolchain (cargo)
 #   - sudo access
+#   - Laya decision engine (OPTIONAL — when missing, install.sh offers to
+#     download the official laya.cpp binary + Hugging Face model, then
+#     re-runs itself to deploy the hardened 'laya' systemd service)
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/GuillaumeDiamant/PGindexAI/main/install.sh | bash
@@ -68,11 +71,28 @@ BIN_PATH="/usr/local/bin/pgindexai"
 SERVICE_NAME="pgindexai"
 LAYA_SERVICE_NAME="laya"   # Laya decision engine (optional — required to apply DDL)
 LAYA_PORT=8080
+LAYA_BACKEND="${LAYA_BACKEND:-}"   # optional override: 'cuda12' | 'vulkan' (default: auto-detect)
 PG_IDENT_MAP="pgindexai_map"  # pg_ident.conf map name (daemon OS user → pgindexai)
 PG_CONF=""
 PG_HBA=""
 PG_IDENT=""
 PG_SSL="off"
+
+# ─────────────────────────────────────────────
+# Official Laya channel (laya.cpp + Hugging Face model)
+# ─────────────────────────────────────────────
+# Laya is EXTERNAL: it is the official laya.cpp release (native C++ inference
+# for Laya typed decisions — ggml, CUDA/Vulkan/CoreML/CPU backends) plus the
+# 'typed-decisions' model published on Hugging Face. Both are public,
+# checksummed channels. These constants feed the runbook shown when Laya is
+# missing and the optional in-place download (laya_install_official).
+LAYA_UPSTREAM="lkarlslund/laya.cpp"
+LAYA_RELEASE="r0004"
+LAYA_MODEL_REPO="convaiinnovations/laya-typed-decisions"
+# Official SHA-256 of the r0004 linux-amd64 assets (from the release
+# sidecar JSONs — the 'laya-r0004-linux-amd64-<backend>.json' files):
+LAYA_SHA256_CUDA12="ac747f10b86060eae948e51305a75f49619d288876d500e1113a779997c3169d"
+LAYA_SHA256_VULKAN="c12aa6abd3d93b27670825157f9676b4f0038cf1326842d28c575a1a415b6b9c"
 
 # ─────────────────────────────────────────────
 # Argument parsing
@@ -81,7 +101,7 @@ for arg in "$@"; do
     case "$arg" in
         --dry-run) DRY_RUN=true ;;
         -h|--help)
-            sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *) warn "Unknown argument: $arg (ignored)" ;;
@@ -781,7 +801,19 @@ setup_laya_service() {
         warn "Laya not found (binary: ${laya_bin:-missing} — model: ${laya_model:-missing})."
         warn "The daemon will run in OBSERVATION MODE (no DDL) until Laya is"
         warn "reachable — 'no fallback' policy: the daemon never decides alone."
-        warn "Manual start: laya --model <DIR> --cpu --server --port $LAYA_PORT"
+        echo ""
+        laya_print_runbook
+        # NB: default is N — under `curl | bash` (no tty) `ask` returns the
+        # default silently, and an unrequested ~2 GB download in a piped
+        # install would be a surprise. The runbook above is always printed,
+        # so nothing is lost; answer 'y' interactively to install in place.
+        if ask "Install Laya now from the official channel (laya.cpp ${LAYA_RELEASE} + ${LAYA_MODEL_REPO})? [y/N]" N; then
+            laya_install_official || warn "Automatic Laya install failed — follow the manual procedure above."
+        fi
+        echo ""
+        warn "Once Laya is in place, re-run './install.sh': it will deploy the"
+        warn "hardened 'laya' systemd service. The daemon auto-detects Laya on"
+        warn "its next decision batch (deep health check) — no restart needed."
         return 0
     fi
 
@@ -877,6 +909,238 @@ laya_health_up() {
     else
         (exec 3<>"/dev/tcp/127.0.0.1/${LAYA_PORT}") 2>/dev/null
     fi
+}
+
+# ─────────────────────────────────────────────
+# Step 4b (cont.): official Laya channel
+#   binary — laya.cpp releases (https://github.com/lkarlslund/laya.cpp, MIT)
+#   model  — Hugging Face (https://huggingface.co/convaiinnovations/laya-typed-decisions)
+# ─────────────────────────────────────────────
+# laya_pick_backend — pick the official linux-amd64 binary variant:
+#   cuda12 : needs the NVIDIA driver (libcuda.so.1) — ~1.1 GB
+#   vulkan : needs libvulkan.so.1 (e.g. 'sudo apt install libvulkan1') — ~78 MB
+# Override with LAYA_BACKEND=cuda12|vulkan.
+laya_pick_backend() {
+    if [[ "${LAYA_BACKEND:-}" == "cuda12" || "${LAYA_BACKEND:-}" == "vulkan" ]]; then
+        echo "$LAYA_BACKEND"
+        return 0
+    fi
+    if ldconfig -p 2>/dev/null | grep -q 'libcuda\.so\.1'; then
+        echo "cuda12"
+    else
+        echo "vulkan"
+    fi
+}
+
+# laya_backend_spec — echoes: url <TAB> sha256 <TAB> human_size
+laya_backend_spec() {
+    local backend
+    backend="$(laya_pick_backend)"
+    if [[ "$backend" == "cuda12" ]]; then
+        printf '%s\t%s\t%s\n' \
+            "https://github.com/${LAYA_UPSTREAM}/releases/download/${LAYA_RELEASE}/laya-${LAYA_RELEASE}-linux-amd64-cuda12" \
+            "${LAYA_SHA256_CUDA12}" "~1.1 GB"
+    else
+        printf '%s\t%s\t%s\n' \
+            "https://github.com/${LAYA_UPSTREAM}/releases/download/${LAYA_RELEASE}/laya-${LAYA_RELEASE}-linux-amd64-vulkan" \
+            "${LAYA_SHA256_VULKAN}" "~78 MB"
+    fi
+}
+
+# sha256_of FILE — SHA-256 with the first available tool (empty if none)
+sha256_of() {
+    local f="$1" out=""
+    if command -v sha256sum &>/dev/null; then
+        out="$(sha256sum "$f" 2>/dev/null | awk '{print $1}')" || out=""
+    elif command -v shasum &>/dev/null; then
+        out="$(shasum -a 256 "$f" 2>/dev/null | awk '{print $1}')" || out=""
+    elif command -v openssl &>/dev/null; then
+        out="$(openssl dgst -sha256 -r "$f" 2>/dev/null | awk '{print $1}')" || out=""
+    fi
+    echo "${out:-}"
+}
+
+# laya_print_runbook — self-contained, copy-pasteable procedure to install
+# the official Laya (binary + model + sanity check + service re-run).
+# Always printed when Laya is missing — even under `curl | bash`.
+laya_print_runbook() {
+    local url sha size backend
+    IFS=$'\t' read -r url sha size <<<"$(laya_backend_spec)"
+    backend="$(laya_pick_backend)"
+
+    cat <<EOF
+============================================================================
+  Laya decision engine — official install procedure (laya.cpp ${LAYA_RELEASE})
+============================================================================
+  Binary (laya.cpp, MIT) : https://github.com/${LAYA_UPSTREAM}
+  Model  (Hugging Face)  : ${LAYA_MODEL_REPO}
+  Backend                : ${backend}   (override: LAYA_BACKEND=cuda12|vulkan)
+    cuda12 : needs the NVIDIA driver (libcuda.so.1) — ~1.1 GB
+    vulkan : needs libvulkan1 (e.g. sudo apt install libvulkan1) — ~78 MB
+
+  # 1. Binary (laya.cpp ${LAYA_RELEASE}, backend: ${backend})
+  mkdir -p ~/.local/share/laya
+  curl -fSL -o ~/.local/share/laya/laya '${url}'
+  echo '${sha}  ~/.local/share/laya/laya' | sha256sum -c -
+
+  # 2. Model (~807 MB)
+  #    Option A — HF CLI: pip install -U huggingface_hub
+  hf download ${LAYA_MODEL_REPO} --local-dir ~/.local/share/laya/models/typed-decisions/typed-decisions
+  #    Option B — direct download (curl only)
+  M=~/.local/share/laya/models/typed-decisions/typed-decisions
+  mkdir -p \${M}/encoder \${M}/tokenizer
+  for f in config.json rl_agent_config.json model.safetensors encoder/config.json tokenizer/tokenizer.json tokenizer/tokenizer_config.json; do
+      curl -fSL -o "\${M}/\${f}" "https://huggingface.co/${LAYA_MODEL_REPO}/resolve/main/\${f}"
+  done
+
+  # 3. Sanity check (CPU inference — the model takes ~20 s to load)
+  ~/.local/share/laya/laya --model ~/.local/share/laya/models/typed-decisions/typed-decisions --cpu --server --port ${LAYA_PORT} &
+  sleep 20 && curl -sf http://127.0.0.1:${LAYA_PORT}/health && echo "  → Laya OK"
+  pkill -x laya || true
+
+  # 4. Deploy the hardened 'laya' systemd service (re-run the installer)
+  sudo ./install.sh
+  #    The PGindexAI daemon auto-detects Laya on its next decision batch
+  #    (deep health check) — NO daemon restart required.
+============================================================================
+EOF
+}
+
+# laya_install_official — download the official Laya (binary + model) into
+# the canonical layout, verify the checksums, sanity-check the HTTP server.
+# Idempotent: existing pieces are kept. DRY_RUN-safe. The systemd service
+# itself is NOT deployed here — the re-run of install.sh does it
+# (setup_laya_service then finds the binary + model and services them).
+laya_install_official() {
+    local url sha size backend
+    IFS=$'\t' read -r url sha size <<<"$(laya_backend_spec)"
+    backend="$(laya_pick_backend)"
+
+    local laya_home="${TARGET_HOME}/.local/share/laya"
+    local model_dir="${laya_home}/models/typed-decisions/typed-decisions"
+
+    if $DRY_RUN; then
+        echo -e "${CYAN}[dry-run]${NC} mkdir -p ${model_dir}"
+        echo -e "${CYAN}[dry-run]${NC} download laya.cpp ${LAYA_RELEASE} '${backend}' binary (${size}) → ${laya_home}/laya  [sha256 ${sha}]"
+        echo -e "${CYAN}[dry-run]${NC} download model ${LAYA_MODEL_REPO} (~807 MB) → ${model_dir}"
+        echo -e "${CYAN}[dry-run]${NC} sanity check: laya --model <dir> --cpu --server --port ${LAYA_PORT} + GET /health"
+        return 0
+    fi
+
+    if ! command -v curl &>/dev/null; then
+        error "curl is required for the download — follow the manual procedure above"
+        return 1
+    fi
+
+    run mkdir -p "$model_dir"
+    if [[ "$(id -u)" -eq 0 ]]; then
+        run chown -R "$TARGET_USER" "${TARGET_HOME}/.local/share/laya"
+    fi
+
+    # ── 1) Binary (official release — SHA-256 verified) ───────────────
+    if [[ -x "${laya_home}/laya" ]]; then
+        info "Binary already present — skipping download: ${laya_home}/laya"
+    else
+        step "Downloading the Laya binary (laya.cpp ${LAYA_RELEASE}, '${backend}', ${size})..."
+        local tmp
+        tmp="$(mktemp)"
+        if ! run curl -fSL --retry 3 -o "$tmp" "$url"; then
+            rm -f "$tmp"
+            error "Binary download failed: $url"
+            return 1
+        fi
+        local got
+        got="$(sha256_of "$tmp")"
+        if [[ -z "$got" || "$got" != "$sha" ]]; then
+            rm -f "$tmp"
+            error "SHA-256 MISMATCH — expected ${sha}"
+            error "               got      ${got:-unavailable (no sha256 tool?)}"
+            error "Refusing to install a binary whose checksum cannot be verified."
+            return 1
+        fi
+        run mv "$tmp" "${laya_home}/laya"
+        run chmod 755 "${laya_home}/laya"
+        info "Binary installed: ${laya_home}/laya (sha256 verified)"
+    fi
+
+    # ── 2) Model (Hugging Face, direct files — no extra tooling) ──────
+    if [[ -f "${model_dir}/rl_agent_config.json" && -f "${model_dir}/model.safetensors" ]]; then
+        info "Model already present — skipping download: ${model_dir}"
+    else
+        step "Downloading the Laya model (${LAYA_MODEL_REPO}, ~807 MB)..."
+        local base="https://huggingface.co/${LAYA_MODEL_REPO}/resolve/main"
+        local f dl_ok=true
+        for f in config.json rl_agent_config.json model.safetensors \
+                 encoder/config.json tokenizer/tokenizer.json tokenizer/tokenizer_config.json; do
+            if ! run curl -fSL --retry 3 -o "${model_dir}/${f}" "${base}/${f}"; then
+                warn "Model file download failed: ${f}"
+                dl_ok=false
+            fi
+        done
+        if [[ "$dl_ok" != "true" ]]; then
+            error "Model download incomplete — re-run, or use the HF CLI (Option A above)"
+            return 1
+        fi
+        local ms
+        ms="$(stat -c %s "${model_dir}/model.safetensors" 2>/dev/null || echo 0)"
+        if [[ "$ms" -lt 100000000 ]]; then
+            error "model.safetensors looks incomplete (${ms} bytes) — re-run the download"
+            return 1
+        fi
+        info "Model installed: ${model_dir}"
+    fi
+
+    if [[ "$(id -u)" -eq 0 ]]; then
+        run chown -R "$TARGET_USER" "${laya_home}"
+    fi
+
+    # ── 3) Sanity check (CPU server + /health), then stop it ──────────
+    if laya_health_up; then
+        info "Laya already answers on http://127.0.0.1:${LAYA_PORT}/health (existing instance kept)"
+    else
+        step "Sanity check: starting Laya (--cpu --server --port ${LAYA_PORT})..."
+        local server_log
+        server_log="$(mktemp)"
+        if [[ "$(id -u)" -eq 0 ]]; then
+            # Root branch: redirect through `sudo tee` so the log is written
+            # in the target user's context (a bare `>file` after `sudo` would
+            # create a root-owned file — SC2024).
+            sudo -u "$TARGET_USER" "${laya_home}/laya" --model "$model_dir" --cpu --server --port "$LAYA_PORT" 2>&1 \
+                | sudo tee "$server_log" >/dev/null &
+        else
+            "${laya_home}/laya" --model "$model_dir" --cpu --server --port "$LAYA_PORT" >"$server_log" 2>&1 &
+        fi
+        local up=false
+        for _ in {1..30}; do
+            if laya_health_up; then
+                up=true
+                break
+            fi
+            sleep 2
+        done
+        if $up; then
+            info "Sanity check OK — Laya answers on http://127.0.0.1:${LAYA_PORT}/health"
+        else
+            warn "Laya did not answer within 60 s — last log lines:"
+            tail -n 20 "$server_log" 2>/dev/null | sed 's/^/    /' || true
+        fi
+        # Stop the probe instance: the systemd service (deployed on the
+        # re-run) is the canonical owner of the port.
+        if command -v pkill &>/dev/null; then
+            run pkill -x "${LAYA_SERVICE_NAME}" || true
+            sleep 1
+        fi
+        rm -f "$server_log"
+    fi
+
+    # ── 4) Re-run to deploy the hardened systemd service ──────────────
+    echo ""
+    info "Laya is installed and verified."
+    info "Re-run the installer to deploy the hardened 'laya' systemd service:"
+    info "    sudo ./install.sh"
+    info "The PGindexAI daemon auto-detects Laya on its next decision batch"
+    info "(deep health check) — NO daemon restart required."
+    return 0
 }
 
 # ─────────────────────────────────────────────

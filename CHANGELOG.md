@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`install.sh`: official Laya install runbook + optional in-place download.**
+  When the Laya decision engine is missing, the installer now prints a
+  self-contained, copy-pasteable procedure (always, even via `curl | bash`):
+  1) download the official **laya.cpp** `r0004` linux-amd64 binary
+  (`lkarlslund/laya.cpp`, SHA-256 verified — `cuda12` build when the NVIDIA
+  driver is present, otherwise the ~78 MB `vulkan` build),
+  2) download the `convaiinnovations/laya-typed-decisions` model from
+  Hugging Face (HF CLI or plain curl), 3) sanity-check
+  `laya --model <dir> --cpu --server --port 8080` + `GET /health`,
+  4) re-run `./install.sh` to deploy the hardened `laya` systemd service.
+  Interactively, the installer can also perform steps 1–3 in place
+  (`Install Laya now?` prompt — defaults to **no** in non-interactive /
+  piped installs, so `curl | bash` never triggers an unrequested ~2 GB
+  download); existing binaries/models are kept (idempotent), and a binary
+  whose checksum cannot be verified is refused. The daemon still needs no
+  restart: it auto-detects Laya on its next decision batch (deep health
+  check).
+
 ## [0.3.0] - 2026-11-18
 
 ### Added
