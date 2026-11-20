@@ -819,13 +819,23 @@ setup_laya_service() {
         # default silently, and an unrequested ~2 GB download in a piped
         # install would be a surprise. The runbook above is always printed,
         # so nothing is lost; answer 'y' interactively to install in place.
+        local in_place_ok=false
         if ask "Install Laya now from the official channel (laya.cpp ${LAYA_RELEASE} + ${LAYA_MODEL_REPO})? [y/N]" N; then
-            laya_install_official || warn "Automatic Laya install failed — follow the manual procedure above."
+            if laya_install_official; then
+                in_place_ok=true
+            else
+                warn "Automatic Laya install failed — follow the manual procedure above."
+            fi
         fi
         echo ""
-        warn "Once Laya is in place, re-run './install.sh': it will deploy the"
-        warn "hardened 'laya' systemd service. The daemon auto-detects Laya on"
-        warn "its next decision batch (deep health check) — no restart needed."
+        # When the in-place install succeeded, IT already announced the re-run
+        # (step 4 of its output) — do not repeat the instruction here. Print
+        # the reminder only when Laya is not yet installed on this machine.
+        if ! $in_place_ok; then
+            warn "Once Laya is in place, re-run the installer: it will deploy the"
+            warn "hardened 'laya' systemd service. The daemon auto-detects Laya on"
+            warn "its next decision batch (deep health check) — no restart needed."
+        fi
         return 0
     fi
 
@@ -1016,7 +1026,8 @@ laya_print_runbook() {
   pkill -x laya || true
 
   # 4. Deploy the hardened 'laya' systemd service (re-run the installer)
-  sudo ./install.sh
+  #    - with a local clone of the PGindexAI repo:  sudo ./install.sh (from the repo dir)
+  #    - or re-run the 'curl | bash' command that started this install
   #    The PGindexAI daemon auto-detects Laya on its next decision batch
   #    (deep health check) — NO daemon restart required.
 ============================================================================
@@ -1066,7 +1077,12 @@ laya_install_official() {
     else
         step "Downloading the Laya binary (laya.cpp ${LAYA_RELEASE}, '${backend}', ${size})..."
         local tmp
-        tmp="$(mktemp)"
+        # Stage the download inside laya_home (created above) instead of /tmp:
+        # /tmp is often a small tmpfs that cannot hold a 1.1 GB cuda12 binary,
+        # and a cross-filesystem `mv` would re-copy the whole file. A hidden
+        # dotfile in the target dir stays on the same filesystem, so the `mv`
+        # below is an atomic rename.
+        tmp="$(mktemp "${laya_home}/.laya.XXXXXX")"
         if ! run curl -fSL --retry 3 -o "$tmp" "$url"; then
             rm -f "$tmp"
             error "Binary download failed: $url"

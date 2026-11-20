@@ -63,6 +63,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     (`LAYA_MODEL_FILES`) used by the runbook, the in-place installer, the
     subdirectory creation and the completeness check — the two lists can no
     longer drift apart.
+  - The "re-run the installer" instruction is no longer printed twice when
+    the in-place install succeeded (the installer announces it once; the
+    surrounding message is only shown when Laya was not installed in place).
+  - Step 4 of the printed runbook no longer assumes `./install.sh` is in the
+    current directory: it now states both how to re-run from a cloned repo
+    and that the original `curl | bash` command can simply be re-run.
+  - The official Laya binary (up to ~1.1 GB for the `cuda12` build) is now
+    staged inside the target `~/.local/share/laya` directory instead of
+    `/tmp` — avoiding tmpfs size limits and a cross-filesystem copy; the
+    final placement is an atomic rename.
 
 ## [0.3.0] - 2026-11-18
 
