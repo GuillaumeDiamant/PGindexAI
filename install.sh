@@ -93,6 +93,18 @@ LAYA_MODEL_REPO="convaiinnovations/laya-typed-decisions"
 # sidecar JSONs — the 'laya-r0004-linux-amd64-<backend>.json' files):
 LAYA_SHA256_CUDA12="ac747f10b86060eae948e51305a75f49619d288876d500e1113a779997c3169d"
 LAYA_SHA256_VULKAN="c12aa6abd3d93b27670825157f9676b4f0038cf1326842d28c575a1a415b6b9c"
+# Files of the 'typed-decisions' model, paths relative to the model dir.
+# Single source of truth: the runbook (Option B), the in-place installer,
+# the subdirectory creation and the "model complete" check all derive from
+# this list, so they can no longer drift apart.
+LAYA_MODEL_FILES=(
+    config.json
+    rl_agent_config.json
+    model.safetensors
+    encoder/config.json
+    tokenizer/tokenizer.json
+    tokenizer/tokenizer_config.json
+)
 
 # ─────────────────────────────────────────────
 # Argument parsing
@@ -723,7 +735,7 @@ Wants=postgresql.service
 Type=simple
 User=$TARGET_USER
 Group=$TARGET_USER
-ExecStart=$BIN_PATH daemon --config $CONFIG_FILE
+ExecStart="$BIN_PATH" daemon --config "$CONFIG_FILE"
 Restart=always
 RestartSec=10
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -853,7 +865,7 @@ After=network.target
 Type=simple
 User=$TARGET_USER
 Group=$TARGET_USER
-ExecStart=$laya_bin --model $laya_model --cpu --server --port $LAYA_PORT
+ExecStart="$laya_bin" --model "$laya_model" --cpu --server --port $LAYA_PORT
 Restart=always
 RestartSec=5
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -867,7 +879,7 @@ CPUQuota=100%
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=$laya_model
+ReadWritePaths="$laya_model"
 PrivateTmp=true
 PrivateDevices=true
 RestrictSUIDSGID=true
@@ -924,6 +936,11 @@ laya_pick_backend() {
     if [[ "${LAYA_BACKEND:-}" == "cuda12" || "${LAYA_BACKEND:-}" == "vulkan" ]]; then
         echo "$LAYA_BACKEND"
         return 0
+    fi
+    if [[ -n "${LAYA_BACKEND:-}" ]]; then
+        # warn() writes to stderr — it cannot pollute the value captured
+        # through command substitution by the caller.
+        warn "Invalid LAYA_BACKEND='${LAYA_BACKEND}' (expected: cuda12|vulkan) — falling back to auto-detect"
     fi
     if ldconfig -p 2>/dev/null | grep -q 'libcuda\.so\.1'; then
         echo "cuda12"
@@ -988,8 +1005,8 @@ laya_print_runbook() {
   hf download ${LAYA_MODEL_REPO} --local-dir ~/.local/share/laya/models/typed-decisions/typed-decisions
   #    Option B — direct download (curl only)
   M=~/.local/share/laya/models/typed-decisions/typed-decisions
-  mkdir -p \${M}/encoder \${M}/tokenizer
-  for f in config.json rl_agent_config.json model.safetensors encoder/config.json tokenizer/tokenizer.json tokenizer/tokenizer_config.json; do
+  for f in ${LAYA_MODEL_FILES[@]}; do
+      mkdir -p "\${M}/\$(dirname "\${f}")"   # subdirs: curl cannot write into a missing directory
       curl -fSL -o "\${M}/\${f}" "https://huggingface.co/${LAYA_MODEL_REPO}/resolve/main/\${f}"
   done
 
@@ -1020,7 +1037,7 @@ laya_install_official() {
     local model_dir="${laya_home}/models/typed-decisions/typed-decisions"
 
     if $DRY_RUN; then
-        echo -e "${CYAN}[dry-run]${NC} mkdir -p ${model_dir}"
+        echo -e "${CYAN}[dry-run]${NC} mkdir -p ${model_dir} (incl. encoder/ and tokenizer/ subdirectories)"
         echo -e "${CYAN}[dry-run]${NC} download laya.cpp ${LAYA_RELEASE} '${backend}' binary (${size}) → ${laya_home}/laya  [sha256 ${sha}]"
         echo -e "${CYAN}[dry-run]${NC} download model ${LAYA_MODEL_REPO} (~807 MB) → ${model_dir}"
         echo -e "${CYAN}[dry-run]${NC} sanity check: laya --model <dir> --cpu --server --port ${LAYA_PORT} + GET /health"
@@ -1032,7 +1049,13 @@ laya_install_official() {
         return 1
     fi
 
-    run mkdir -p "$model_dir"
+    # Create the model dir AND every subdirectory the files need (encoder/,
+    # tokenizer/): curl refuses to write a file whose parent directory does
+    # not exist (curl error 23 — "Failure writing output to destination").
+    # A plain `mkdir -p "$model_dir"` alone is not enough.
+    for f in "${LAYA_MODEL_FILES[@]}"; do
+        run mkdir -p "$(dirname "${model_dir}/${f}")"
+    done
     if [[ "$(id -u)" -eq 0 ]]; then
         run chown -R "$TARGET_USER" "${TARGET_HOME}/.local/share/laya"
     fi
@@ -1064,15 +1087,32 @@ laya_install_official() {
     fi
 
     # ── 2) Model (Hugging Face, direct files — no extra tooling) ──────
-    if [[ -f "${model_dir}/rl_agent_config.json" && -f "${model_dir}/model.safetensors" ]]; then
+    # The model is "complete" only if EVERY expected file is present and
+    # non-empty AND model.safetensors is at least 100 MB. A partial or
+    # truncated download from an earlier failed run must never be accepted
+    # on a re-run — the missing pieces are re-fetched below.
+    local base="https://huggingface.co/${LAYA_MODEL_REPO}/resolve/main"
+    local f p ms
+    local model_complete=true
+    for f in "${LAYA_MODEL_FILES[@]}"; do
+        [[ -s "${model_dir}/${f}" ]] || model_complete=false
+    done
+    ms="$(stat -c %s "${model_dir}/model.safetensors" 2>/dev/null || echo 0)"
+    [[ "$ms" -ge 100000000 ]] || model_complete=false
+    if $model_complete; then
         info "Model already present — skipping download: ${model_dir}"
     else
         step "Downloading the Laya model (${LAYA_MODEL_REPO}, ~807 MB)..."
-        local base="https://huggingface.co/${LAYA_MODEL_REPO}/resolve/main"
-        local f dl_ok=true
-        for f in config.json rl_agent_config.json model.safetensors \
-                 encoder/config.json tokenizer/tokenizer.json tokenizer/tokenizer_config.json; do
-            if ! run curl -fSL --retry 3 -o "${model_dir}/${f}" "${base}/${f}"; then
+        local dl_ok=true
+        for f in "${LAYA_MODEL_FILES[@]}"; do
+            p="${model_dir}/${f}"
+            if [[ "$f" == "model.safetensors" ]]; then
+                ms="$(stat -c %s "$p" 2>/dev/null || echo 0)"
+                [[ "$ms" -ge 100000000 ]] && continue   # large file already valid — keep it
+            elif [[ -s "$p" ]]; then
+                continue   # idempotent: keep valid files, fetch only what is missing
+            fi
+            if ! run curl -fSL --retry 3 -o "$p" "${base}/${f}"; then
                 warn "Model file download failed: ${f}"
                 dl_ok=false
             fi
@@ -1081,7 +1121,6 @@ laya_install_official() {
             error "Model download incomplete — re-run, or use the HF CLI (Option A above)"
             return 1
         fi
-        local ms
         ms="$(stat -c %s "${model_dir}/model.safetensors" 2>/dev/null || echo 0)"
         if [[ "$ms" -lt 100000000 ]]; then
             error "model.safetensors looks incomplete (${ms} bytes) — re-run the download"
@@ -1095,6 +1134,7 @@ laya_install_official() {
     fi
 
     # ── 3) Sanity check (CPU server + /health), then stop it ──────────
+    local sanity_ok=true
     if laya_health_up; then
         info "Laya already answers on http://127.0.0.1:${LAYA_PORT}/health (existing instance kept)"
     else
@@ -1121,7 +1161,8 @@ laya_install_official() {
         if $up; then
             info "Sanity check OK — Laya answers on http://127.0.0.1:${LAYA_PORT}/health"
         else
-            warn "Laya did not answer within 60 s — last log lines:"
+            sanity_ok=false
+            warn "Sanity check FAILED — Laya did not answer within 60 s. Last log lines:"
             tail -n 20 "$server_log" 2>/dev/null | sed 's/^/    /' || true
         fi
         # Stop the probe instance: the systemd service (deployed on the
@@ -1133,8 +1174,13 @@ laya_install_official() {
         rm -f "$server_log"
     fi
 
-    # ── 4) Re-run to deploy the hardened systemd service ──────────────
+    # ── 4) Result ─────────────────────────────────────────────────────
     echo ""
+    if ! $sanity_ok; then
+        warn "Laya is installed but NOT verified: the sanity check failed (see above)."
+        warn "Fix the cause, then re-run:  sudo ./install.sh"
+        return 1
+    fi
     info "Laya is installed and verified."
     info "Re-run the installer to deploy the hardened 'laya' systemd service:"
     info "    sudo ./install.sh"
@@ -1177,12 +1223,23 @@ setup_demo() {
 
     if ! sudo -u "$POSTGRES_USER" psql -d pgindexai_demo -tAc \
         "SELECT 1 FROM information_schema.tables WHERE table_name = 'customers' LIMIT 1" 2>/dev/null | grep -q 1; then
+        # The SQL goes through STDIN, not `psql -f`: the postgres user cannot
+        # read files under a private (drwxr-x---) home directory, so `psql -f`
+        # fails with "Permission denied" even though the SQL itself is valid.
+        # Feeding it on stdin lets OUR shell (which owns the file) do the read.
         if [[ -f "$repo_dir/sql/demo_schema.sql" ]]; then
-            run sudo -u "$POSTGRES_USER" psql -d pgindexai_demo -v ON_ERROR_STOP=1 -f "$repo_dir/sql/demo_schema.sql"
-            info "Demo schema installed"
+            if run sudo -u "$POSTGRES_USER" psql -d pgindexai_demo -v ON_ERROR_STOP=1 < "$repo_dir/sql/demo_schema.sql"; then
+                info "Demo schema installed"
+            else
+                warn "Demo schema installation FAILED — see the psql output above"
+            fi
         fi
         if [[ -f "$repo_dir/sql/demo_workload.sql" ]]; then
-            run sudo -u "$POSTGRES_USER" psql -d pgindexai_demo -v ON_ERROR_STOP=1 -f "$repo_dir/sql/demo_workload.sql" || warn "Partial demo workload"
+            if run sudo -u "$POSTGRES_USER" psql -d pgindexai_demo -v ON_ERROR_STOP=1 < "$repo_dir/sql/demo_workload.sql"; then
+                info "Demo workload installed"
+            else
+                warn "Partial demo workload — the workload SQL failed (see psql output above)"
+            fi
         fi
     else
         info "Demo schema already installed"

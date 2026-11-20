@@ -27,6 +27,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   restart: it auto-detects Laya on its next decision batch (deep health
   check).
 
+### Fixed
+
+- **`install.sh`: fresh-install failures (reported from a real clean VM
+  install) and re-run state bugs in the official Laya install:**
+  - The model subdirectories (`encoder/`, `tokenizer/`) are now created
+    before the file downloads. Previously `curl` failed with error 23
+    ("Failure writing output to destination") on the 3 nested model files,
+    aborting **every fresh install** — while the manual runbook (which did
+    create the subdirectories) worked.
+  - The demo SQL (`demo_schema.sql`, `demo_workload.sql`) is now fed to
+    `psql` via **stdin** instead of `psql -f`: the `postgres` user cannot
+    read files under a private (`drwxr-x---`) home directory, so the old
+    form failed with "Permission non accordée" — and the installer still
+    printed `[✓] Demo schema installed`. Success/failure messages are now
+    conditional on the actual `psql` exit status.
+  - The "model already present" check now requires **all six** model files
+    to be present and non-empty, plus a `model.safetensors` of at least
+    100 MB. A partial or truncated download from a failed run is detected
+    and the missing pieces are re-fetched (previously a re-run could accept
+    a 10 MB weights file, or permanently skip the 3 nested files that were
+    never downloaded).
+  - A failed sanity check no longer ends with "Laya is installed and
+    verified." and exit code 0 — it now reports the failure and returns a
+    non-zero status. The installation as a whole still completes: Laya
+    remains optional, and the daemon stays in observation mode until Laya
+    answers on port 8080.
+  - An invalid `LAYA_BACKEND` value (e.g. `cuda11`) is now warned about
+    before falling back to auto-detection, instead of being silently
+    ignored.
+  - The generated systemd units now quote the binary/model/config paths
+    (`ExecStart=`, `ReadWritePaths=`), so a target home directory that
+    contains a space can no longer split the command line.
+  - The model file list is now a single shared constant
+    (`LAYA_MODEL_FILES`) used by the runbook, the in-place installer, the
+    subdirectory creation and the completeness check — the two lists can no
+    longer drift apart.
+
 ## [0.3.0] - 2026-11-18
 
 ### Added
