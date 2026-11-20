@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`install.sh`: choose the demo database vs. an existing one, and opt into the test suite.**
+  New options: `--demo` (default — previous behavior: create `pgindexai_demo`,
+  load the demo schema + workload, attach the daemon), `--no-demo` (skip the
+  demo and attach the daemon to a database of yours), `--db NAME` (target
+  database, implies `--no-demo`), `--test` (run `cargo test --all-targets`
+  before installing — a failing test aborts the installation; OFF by default).
+  With no flag and a terminal, the installer asks which mode to use (demo is
+  the default answer). In custom mode the installer grants `pgindexai`
+  `CONNECT` + `CREATE ON SCHEMA public` + `pg_stat_scan_tables` on the
+  pre-existing database — and never transfers ownership of your objects;
+  `rebuild_fragmented` is then set to `false` in the generated config
+  (REINDEX requires table ownership, which the daemon legitimately does not
+  hold on a database it does not own). `--db` values are validated as
+  unquoted PostgreSQL identifiers (no injection into the generated SQL).
+
 - **`install.sh`: official Laya install runbook + optional in-place download.**
   When the Laya decision engine is missing, the installer now prints a
   self-contained, copy-pasteable procedure (always, even via `curl | bash`):

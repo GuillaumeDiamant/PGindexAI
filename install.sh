@@ -13,7 +13,19 @@
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/GuillaumeDiamant/PGindexAI/main/install.sh | bash
 #   # or
-#   ./install.sh [--dry-run]
+#   ./install.sh [OPTIONS]
+#
+# Options:
+#   --demo           Install the demo database 'pgindexai_demo' (schema + workload
+#                    data) and point the daemon at it. This is the DEFAULT.
+#   --no-demo        Skip the demo; the daemon manages an EXISTING database of
+#                    yours instead (the installer grants it the needed rights).
+#   --db NAME        Target database for the daemon (implies --no-demo). NAME must
+#                    already exist and be a valid PostgreSQL identifier.
+#   --test           Run the full test suite (cargo test --all-targets) BEFORE
+#                    installing; a failing test aborts the installation.
+#   --dry-run        Show the actions without applying them.
+#   -h, --help       Show this help and exit.
 #
 # Guarantees:
 #   - Dedicated NON-superuser PostgreSQL role (pgindexai) with PEER auth —
@@ -45,6 +57,10 @@ step()  { echo -e "${CYAN}→${NC} $*"; }
 # Global variables
 # ─────────────────────────────────────────────
 DRY_RUN=false
+RUN_TESTS=false       # --test: run the full test suite before installing
+INSTALL_DEMO=true     # --demo (default) / --no-demo: demo DB or a pre-existing one
+TARGET_DB="pgindexai_demo"  # database the daemon manages (validated identifier)
+DB_CHOSEN=false       # true once the user explicitly fixed the target DB
 POSTGRES_USER="${POSTGRES_USER:-postgres}"
 
 # Target user: the one owning the daemon, the config and the repo.
@@ -107,17 +123,104 @@ LAYA_MODEL_FILES=(
 )
 
 # ─────────────────────────────────────────────
+# Demo / target-database choice
+# ─────────────────────────────────────────────
+# validate_db_name "NAME" — accepts only a valid, UNQUOTED PostgreSQL
+# identifier. The name is interpolated into SQL (CREATE DATABASE, GRANT …),
+# so quotes, spaces and injection are ruled out by construction.
+validate_db_name() {
+    [[ "${1:-}" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]]
+}
+
+# prompt_target_db — reads an existing-database name from /dev/tty and
+# re-asks until it is a valid identifier (EOF aborts the install).
+prompt_target_db() {
+    local name=""
+    while true; do
+        if ! IFS= read -r -p "Target database (must already exist): " name </dev/tty; then
+            error "No database name given — custom mode cannot continue without one."
+            error "Re-run with --db NAME (existing database) or --demo (demo database)."
+            exit 1
+        fi
+        name="$(xargs <<<"$name" 2>/dev/null || true)"
+        if validate_db_name "$name"; then
+            echo "$name"
+            return 0
+        fi
+        warn "'${name:-<empty>}' is not a valid PostgreSQL identifier (letters, digits, '_'; must not start with a digit)"
+    done
+}
+
+# resolve_demo_choice — settles demo/custom mode.
+# Flags (--demo / --no-demo / --db NAME) win; with no flag and a terminal,
+# the installer asks (demo = default, i.e. the previous behavior).
+resolve_demo_choice() {
+    local has_tty=false
+    if ( : </dev/tty ) 2>/dev/null; then
+        has_tty=true
+    fi
+    if ! $DB_CHOSEN && $has_tty; then
+        if ask "Install the demo database (schema + workload data) and attach the daemon to it? [Y/n]" Y; then
+            INSTALL_DEMO=true
+        else
+            INSTALL_DEMO=false
+            local db
+            db="$(prompt_target_db)"
+            TARGET_DB="$db"
+            DB_CHOSEN=true
+        fi
+    fi
+    if ! $INSTALL_DEMO && ! $DB_CHOSEN; then
+        error "Custom mode (--no-demo) needs a target database."
+        error "Re-run with --db NAME (an existing database) or --demo (demo database)."
+        exit 1
+    fi
+    if $INSTALL_DEMO; then
+        info "Mode: demo — the daemon will manage '$TARGET_DB'"
+    else
+        info "Mode: custom — the daemon will manage the existing database '$TARGET_DB'"
+    fi
+}
+
+# ─────────────────────────────────────────────
 # Argument parsing
 # ─────────────────────────────────────────────
-for arg in "$@"; do
-    case "$arg" in
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --demo) INSTALL_DEMO=true ;;
+        --no-demo) INSTALL_DEMO=false ;;
+        --db)
+            if [[ $# -lt 2 || -z "${2:-}" || "${2:0:1}" == "-" ]]; then
+                error "--db requires a database name (e.g. --db mydb)"
+                exit 1
+            fi
+            if ! validate_db_name "$2"; then
+                error "'$2' is not a valid PostgreSQL identifier (letters, digits, '_'; must not start with a digit)"
+                exit 1
+            fi
+            TARGET_DB="$2"
+            DB_CHOSEN=true
+            INSTALL_DEMO=false
+            shift
+            ;;
+        --db=*)
+            if ! validate_db_name "${1#--db=}"; then
+                error "'${1#--db=}' is not a valid PostgreSQL identifier (letters, digits, '_'; must not start with a digit)"
+                exit 1
+            fi
+            TARGET_DB="${1#--db=}"
+            DB_CHOSEN=true
+            INSTALL_DEMO=false
+            ;;
+        --test) RUN_TESTS=true ;;
         --dry-run) DRY_RUN=true ;;
         -h|--help)
-            sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,39p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
-        *) warn "Unknown argument: $arg (ignored)" ;;
+        *) warn "Unknown argument: $1 (ignored)" ;;
     esac
+    shift
 done
 
 # run CMD [ARGS...] — no eval: each argument is passed as-is
@@ -246,16 +349,31 @@ check_rust() {
 # ─────────────────────────────────────────────
 # Step 1: PostgreSQL (dedicated role, targeted hba, pg_stat_statements)
 # ─────────────────────────────────────────────
-ensure_demo_db() {
-    if [[ -n "$(pg_show "SELECT 1 FROM pg_database WHERE datname = 'pgindexai_demo'")" ]]; then
-        info "Database 'pgindexai_demo' present"
+# ensure_target_db — demo mode: create '$TARGET_DB' if missing (previous
+# behavior). Custom mode: '$TARGET_DB' MUST already exist — we attach the
+# daemon to the user's database, we never create it implicitly.
+ensure_target_db() {
+    local present
+    present="$(pg_show "SELECT 1 FROM pg_database WHERE datname = '$TARGET_DB'")"
+    if [[ -n "$present" ]]; then
+        if $INSTALL_DEMO; then
+            info "Database '$TARGET_DB' present"
+        else
+            info "Using existing database '$TARGET_DB'"
+        fi
         return
     fi
-    step "Creating database 'pgindexai_demo'..."
-    run sudo -u "$POSTGRES_USER" psql -qc "CREATE DATABASE pgindexai_demo"
+    if $INSTALL_DEMO; then
+        step "Creating demo database '$TARGET_DB'..."
+        run sudo -u "$POSTGRES_USER" psql -qc "CREATE DATABASE $TARGET_DB"
+    else
+        error "Database '$TARGET_DB' does not exist — custom mode requires a pre-existing database."
+        error "Create it first (CREATE DATABASE $TARGET_DB;) or re-run the installer with --demo."
+        exit 1
+    fi
 }
 
-# Ownership transfer of pgindexai_demo objects to pgindexai:
+# Ownership transfer of the target-database objects to pgindexai (DEMO MODE):
 # CREATE INDEX / DROP INDEX / REINDEX require ownership of the table/index.
 # NB: 'pg_toast' is EXCLUDED — TOAST indexes are system catalogs;
 # an ALTER ... OWNER on them fails and ABORTs the whole DO block, canceling
@@ -291,18 +409,18 @@ END
 \$\$;
 "
     if $DRY_RUN; then
-        run sudo -u "$POSTGRES_USER" psql -d pgindexai_demo -qc "$sql"
+        run sudo -u "$POSTGRES_USER" psql -d "$TARGET_DB" -qc "$sql"
         return 0
     fi
     local err
-    if ! err="$(sudo -u "$POSTGRES_USER" psql -d pgindexai_demo -qc "$sql" 2>&1 >/dev/null)"; then
-        error "Ownership transfer FAILED — the daemon will NOT be able to create/drop indexes until the pgindexai_demo objects are owned by 'pgindexai'."
+    if ! err="$(sudo -u "$POSTGRES_USER" psql -d "$TARGET_DB" -qc "$sql" 2>&1 >/dev/null)"; then
+        error "Ownership transfer FAILED — the daemon will NOT be able to create/drop indexes until the '$TARGET_DB' objects are owned by 'pgindexai'."
         if [[ -n "$err" ]]; then
             error "Detail: $(head -c 300 <<<"$err" | tr '\n' ' ')"
         fi
         return 1
     fi
-    info "Ownership applied (tables + indexes of pgindexai_demo → pgindexai)"
+    info "Ownership applied (tables + indexes of '$TARGET_DB' → pgindexai)"
 }
 
 setup_role() {
@@ -332,7 +450,7 @@ setup_role() {
             echo -e "  ${CYAN}(dry-run)${NC} verify peer auth as '$TARGET_USER' + ALTER ROLE pgindexai PASSWORD NULL"
         else
             local peer_check
-            peer_check="$(sudo -u "$TARGET_USER" psql -U pgindexai -d pgindexai_demo -tAc "SELECT 1" 2>&1 || true)"
+            peer_check="$(sudo -u "$TARGET_USER" psql -U pgindexai -d "$TARGET_DB" -tAc "SELECT 1" 2>&1 || true)"
             if [[ "$peer_check" == "1" ]]; then
                 psql_stdin "ALTER ROLE pgindexai PASSWORD NULL"
                 info "Password removed from 'pgindexai' (peer auth verified for '$TARGET_USER')"
@@ -347,30 +465,36 @@ setup_role() {
         fi
     fi
 
-    run sudo -u "$POSTGRES_USER" psql -qc "GRANT CONNECT ON DATABASE pgindexai_demo TO pgindexai"
+    run sudo -u "$POSTGRES_USER" psql -qc "GRANT CONNECT ON DATABASE $TARGET_DB TO pgindexai"
     # PostgreSQL 15+: CREATE is no longer granted to everyone on the public schema
     # by default — without this GRANT, CREATE/DROP INDEX fails (permission denied
     # for schema public) even if pgindexai owns the tables.
-    run sudo -u "$POSTGRES_USER" psql -d pgindexai_demo -qc "GRANT CREATE ON SCHEMA public TO pgindexai"
+    # Custom mode: these GRANTs are the daemon's access to the user's database —
+    # they are the "additional rights" requested for pre-existing databases.
+    run sudo -u "$POSTGRES_USER" psql -d "$TARGET_DB" -qc "GRANT CREATE ON SCHEMA public TO pgindexai"
     # Least privilege for the physical bloat criterion: since pgstattuple 1.5,
     # pgstatindex() (full index scan) is restricted to SUPERUSER or members of
     # the predefined role pg_stat_scan_tables. Grant the narrow role — NOT
     # superuser. Idempotent; without it the daemon degrades gracefully
     # (legacy bloat heuristic + a WARN per cycle, no DDL impact).
-    run sudo -u "$POSTGRES_USER" psql -d pgindexai_demo -qc "GRANT pg_stat_scan_tables TO pgindexai"
+    run sudo -u "$POSTGRES_USER" psql -d "$TARGET_DB" -qc "GRANT pg_stat_scan_tables TO pgindexai"
 
-    # Ownership transfer (tables + indexes) to pgindexai.
-    # NB: re-applied after setup_demo in main() — the demo schema is
-    # created BY postgres and must be re-attributed so the daemon can
-    # execute DDL on it (otherwise: permission denied on CREATE/DROP INDEX).
-    transfer_ownership
+    # Ownership transfer (tables + indexes) to pgindexai — DEMO MODE ONLY:
+    # the demo schema is created BY postgres and must be re-attributed so the
+    # daemon can execute DDL on it (otherwise: permission denied on CREATE/DROP
+    # INDEX). Custom mode: the pre-existing objects stay owned by their owner
+    # (we never steal ownership of user data) — the daemon relies on the
+    # GRANTs above instead. NB (demo): re-applied after setup_demo in main().
+    if $INSTALL_DEMO; then
+        transfer_ownership
+    fi
 }
 
 ensure_hba() {
     step "pg_hba.conf: targeted line for pgindexai (peer)..."
     local hba="${PG_HBA:-/etc/postgresql/16/main/pg_hba.conf}"
-    # pg_hba.conf: TYPE  DATABASE  USER  METHOD — the daemon connects to the
-    # database pgindexai_demo (not a database « pgindexai ») → DATABASE = « all ».
+    # pg_hba.conf: TYPE  DATABASE  USER  METHOD — the daemon connects to its
+    # target database '$TARGET_DB' (not a database « pgindexai ») → DATABASE = « all ».
     # peer + map: ONLY the mapped OS user (TARGET_USER) can log in as pgindexai.
     local line="local   all   pgindexai   peer   map=${PG_IDENT_MAP}"
 
@@ -474,8 +598,10 @@ ensure_pg_stat_statements() {
     step "Enabling pg_stat_statements..."
     local lib="pg_stat_statements"
 
-    if [[ -n "$(pg_show "SELECT 1 FROM pg_extension WHERE extname = '$lib'")" ]]; then
-        info "pg_stat_statements is active"
+    # The extension is PER-DATABASE: check (and create) it in the daemon's
+    # own database, where it will actually be queried.
+    if [[ -n "$(sudo -u "$POSTGRES_USER" psql -d "$TARGET_DB" -tAc "SELECT 1 FROM pg_extension WHERE extname = '$lib'" 2>/dev/null || true)" ]]; then
+        info "pg_stat_statements is active in '$TARGET_DB'"
         return 0
     fi
 
@@ -513,7 +639,7 @@ ensure_pg_stat_statements() {
     fi
 
     # Restart if needed (pg_hba.conf, for its part, is reloaded by « reload » — handled in ensure_hba)
-    if [[ -z "$(pg_show "SELECT 1 FROM pg_extension WHERE extname = '$lib'")" ]]; then
+    if [[ -z "$(sudo -u "$POSTGRES_USER" psql -d "$TARGET_DB" -tAc "SELECT 1 FROM pg_extension WHERE extname = '$lib'" 2>/dev/null || true)" ]]; then
         warn "Restarting PostgreSQL (shared_preload_libraries modified)..."
         run sudo systemctl restart postgresql
         # Activity polling (30 s)
@@ -527,13 +653,13 @@ ensure_pg_stat_statements() {
             error "PostgreSQL did not restart — check: sudo journalctl -u postgresql"
             return 1
         fi
-        run sudo -u "$POSTGRES_USER" psql -d pgindexai_demo -qc "CREATE EXTENSION IF NOT EXISTS $lib"
+        run sudo -u "$POSTGRES_USER" psql -d "$TARGET_DB" -qc "CREATE EXTENSION IF NOT EXISTS $lib"
         info "pg_stat_statements enabled"
     fi
 }
 
 setup_postgresql() {
-    ensure_demo_db
+    ensure_target_db
     # Order matters (scram → peer migration): 1. pg_ident map + 2. pg_hba
     # peer line (+ reload) FIRST, then 3. setup_role — it clears the role
     # password only AFTER a real peer connection as TARGET_USER is verified.
@@ -547,19 +673,41 @@ setup_postgresql() {
 # Step 2: Compilation & installation
 # ─────────────────────────────────────────────
 build_and_install() {
-    step "Compiling pgindexai..."
     local repo_dir
     repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     # Under root: compile AS the target user (cargo in their home, target/ in their name)
+    local cargo_exe="cargo"
     if [[ "$(id -u)" -eq 0 ]]; then
-        local cargo_exe
         if command -v cargo &>/dev/null; then
             cargo_exe="$(command -v cargo)"
         elif [[ -n "${TARGET_HOME:-}" && -x "${TARGET_HOME}/.cargo/bin/cargo" ]]; then
             cargo_exe="${TARGET_HOME}/.cargo/bin/cargo"
-        else
-            cargo_exe="cargo"
         fi
+    fi
+
+    # --test gate: run the full suite BEFORE anything is installed; a failing
+    # test aborts the installation (the binary is not copied, the service is
+    # not started). Dry-run: the suite is echoed, not run (nothing is
+    # verifiable without executing it).
+    if $RUN_TESTS; then
+        step "Running the test suite (cargo test --all-targets)..."
+        local tests_ok=true
+        if [[ "$(id -u)" -eq 0 ]]; then
+            ( cd "$repo_dir" && run sudo -u "$TARGET_USER" "$cargo_exe" test --all-targets ) || tests_ok=false
+        else
+            ( cd "$repo_dir" && run cargo test --all-targets ) || tests_ok=false
+        fi
+        if ! $tests_ok; then
+            error "Test suite FAILED — aborting the installation."
+            error "Fix the failing tests, or re-run without --test to install anyway."
+            exit 1
+        fi
+        info "Test suite OK"
+        echo ""
+    fi
+
+    step "Compiling pgindexai..."
+    if [[ "$(id -u)" -eq 0 ]]; then
         ( cd "$repo_dir" && run sudo -u "$TARGET_USER" "$cargo_exe" build --release )
     else
         ( cd "$repo_dir" && run cargo build --release )
@@ -618,6 +766,16 @@ setup_config() {
     # DNS-only): « 127.0.0.1 » would NOT work (src/db/mod.rs).
     local ssl_mode="disable"
 
+    # REINDEX requires table ownership. Custom mode: the daemon manages a
+    # pre-existing database whose objects it does NOT own (we never transfer
+    # ownership of user data) → rebuild_fragmented is disabled; the daemon
+    # still creates/drops indexes (CREATE on schema public is granted).
+    local rebuild_fragmented="true"
+    if ! $INSTALL_DEMO; then
+        rebuild_fragmented="false"
+        warn "Custom mode: 'rebuild_fragmented' will be set to false (REINDEX requires table ownership)."
+    fi
+
     run mkdir -p "$CONFIG_DIR"
 
     if $DRY_RUN; then
@@ -632,7 +790,7 @@ postgresql:
   host: "/var/run/postgresql"   # Local Unix socket (TLS not applicable on socket → disable)
   port: 5432
   user: "pgindexai"
-  database: "pgindexai_demo"
+  database: "$TARGET_DB"
   password: null               # peer auth (pg_ident map) — set a value only for remote TCP with scram
   ssl_mode: "${ssl_mode}"
   # ssl_root_cert: "/etc/ssl/certs/your-ca.pem"   # Self-signed CA (TCP only: verify-ca/verify-full)
@@ -644,7 +802,7 @@ laya:
 actions:
   create_index: true
   drop_unused: true
-  rebuild_fragmented: true
+  rebuild_fragmented: ${rebuild_fragmented}
 
 # Decision thresholds
 thresholds:
@@ -1237,21 +1395,21 @@ setup_demo() {
     local repo_dir
     repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-    if ! sudo -u "$POSTGRES_USER" psql -d pgindexai_demo -tAc \
+    if ! sudo -u "$POSTGRES_USER" psql -d "$TARGET_DB" -tAc \
         "SELECT 1 FROM information_schema.tables WHERE table_name = 'customers' LIMIT 1" 2>/dev/null | grep -q 1; then
         # The SQL goes through STDIN, not `psql -f`: the postgres user cannot
         # read files under a private (drwxr-x---) home directory, so `psql -f`
         # fails with "Permission denied" even though the SQL itself is valid.
         # Feeding it on stdin lets OUR shell (which owns the file) do the read.
         if [[ -f "$repo_dir/sql/demo_schema.sql" ]]; then
-            if run sudo -u "$POSTGRES_USER" psql -d pgindexai_demo -v ON_ERROR_STOP=1 < "$repo_dir/sql/demo_schema.sql"; then
+            if run sudo -u "$POSTGRES_USER" psql -d "$TARGET_DB" -v ON_ERROR_STOP=1 < "$repo_dir/sql/demo_schema.sql"; then
                 info "Demo schema installed"
             else
                 warn "Demo schema installation FAILED — see the psql output above"
             fi
         fi
         if [[ -f "$repo_dir/sql/demo_workload.sql" ]]; then
-            if run sudo -u "$POSTGRES_USER" psql -d pgindexai_demo -v ON_ERROR_STOP=1 < "$repo_dir/sql/demo_workload.sql"; then
+            if run sudo -u "$POSTGRES_USER" psql -d "$TARGET_DB" -v ON_ERROR_STOP=1 < "$repo_dir/sql/demo_workload.sql"; then
                 info "Demo workload installed"
             else
                 warn "Partial demo workload — the workload SQL failed (see psql output above)"
@@ -1271,7 +1429,12 @@ verify() {
     echo "  PGindexAI installation finished"
     echo "============================================"
     echo ""
+    local mode="existing database"
+    if $INSTALL_DEMO; then
+        mode="demo database"
+    fi
     echo "  Binary     : $BIN_PATH"
+    echo "  Target DB  : $TARGET_DB  ($mode)"
     echo "  Config     : $CONFIG_FILE  (0600, password: null)"
     echo "  Auth       : peer — pg_ident map '$PG_IDENT_MAP: $TARGET_USER → pgindexai' (no password)"
     echo "  Logs       : /var/log/pgindexai/"
@@ -1308,6 +1471,7 @@ main() {
     check_postgres
     check_rust
     echo ""
+    resolve_demo_choice
     setup_postgresql
     echo ""
     build_and_install
@@ -1324,10 +1488,14 @@ main() {
     local daemon_ok=true
     start_daemon || daemon_ok=false
     echo ""
-    setup_demo || true
-    # The demo schema is created BY postgres (after setup_role): re-apply
-    # the ownership transfer so pgindexai can execute DDL on it.
-    transfer_ownership
+    # Demo mode only: load the demo schema + workload, then re-apply the
+    # ownership transfer (the schema is created BY postgres — the daemon
+    # needs DDL rights on it). Custom mode: nothing to load, and the
+    # pre-existing objects are NOT re-attributed (no ownership stealing).
+    if $INSTALL_DEMO; then
+        setup_demo || true
+        transfer_ownership
+    fi
     echo ""
     verify
     # If the daemon is not active, the installation cannot declare itself
