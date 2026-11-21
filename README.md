@@ -316,7 +316,7 @@ index_logging:
 
 ### Prerequisites
 
-- **PostgreSQL 16+** (ideally with the `pg_stat_statements` extension enabled — without it, the daemon enters degraded mode: missing-index detection disabled)
+- **PostgreSQL 16+** (ideally with the `pg_stat_statements` extension enabled — without it, the daemon enters degraded mode: missing-index detection disabled). **Admin connection** for the installer: by default `sudo -u postgres psql` (peer auth, no password); if the `postgres` role has a password, pass `--pg-password PASS` or `PG_PASSWORD` (pg_hba must allow `scram-sha-256`/`md5`; `PGHOST`/`PGPORT` select a TCP endpoint)
 - **Laya server** (`laya`) in server mode on a local port — **required**: `install.sh` sets it up **before** creating or attaching the target database and aborts if it is missing or unhealthy; at runtime, without it the daemon stays in observation mode (no database modification). It is the official **laya.cpp** binary ([`lkarlslund/laya.cpp`](https://github.com/lkarlslund/laya.cpp), MIT) running the [`convaiinnovations/laya-typed-decisions`](https://huggingface.co/convaiinnovations/laya-typed-decisions) Hugging Face model — `install.sh` can fetch both for you (SHA-256 verified)
 - **Rust toolchain** (to build from source)
 
@@ -333,6 +333,15 @@ curl -fsSL https://raw.githubusercontent.com/GuillaumeDiamant/PGindexAI/main/ins
 
 # Simulation mode (no modification)
 ./install.sh --dry-run
+
+# If the 'postgres' role has a password (instead of the default
+# 'sudo -u postgres' peer auth) — prefer the env var (not visible
+# in `ps` / shell history):
+PG_PASSWORD='…' ./install.sh
+# or:  ./install.sh --pg-password '…'
+
+# TCP endpoint instead of the local socket:
+PGHOST=127.0.0.1 PGPORT=5432 PG_PASSWORD='…' ./install.sh
 ```
 
 ### ♻️ Uninstallation
@@ -361,7 +370,7 @@ The script does the following automatically:
 
 | Step | Action |
 |-------|--------|
-| 1. Prerequisites | Checks PostgreSQL, Rust, sudo access |
+| 1. Prerequisites | Checks PostgreSQL (with a **fail-fast admin-connection probe** — aborts **before any modification** with mode-specific diagnostics: peer `sudo -u postgres` or password `--pg-password`/`PG_PASSWORD`), Rust, sudo access |
 | 2. Laya service (**required**) | If the Laya binary + model are found on the machine, deploys the hardened `laya.service` unit and verifies `http://127.0.0.1:8080/health`; if missing, prints the **official install runbook** (laya.cpp release + Hugging Face model, SHA-256 verified) and offers to install in place (interactive prompt — a successful in-place install deploys the service in the **same run**); **aborts the install, before any database work, if Laya is still unavailable** |
 | 3. PostgreSQL | Detection via `SHOW config_file/hba_file/ssl`; **merges** `pg_stat_statements` into `shared_preload_libraries` (never overwrites); restarts if needed |
 | 4. Dedicated role | Creates `pgindexai` (non-superuser, **no password**); **adds** the `pg_ident` map `pgindexai_map: <your user> → pgindexai` and **prepends** the targeted line `local all pgindexai peer map=pgindexai_map` in `pg_hba.conf` |

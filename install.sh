@@ -5,7 +5,9 @@
 # Prerequisites:
 #   - PostgreSQL 16+ (psql binary + working cluster)
 #   - Rust toolchain (cargo)
-#   - sudo access
+#   - sudo access (default admin connection: 'sudo -u postgres psql' peer auth
+#     — or --pg-password PASS / PG_PASSWORD env var when the 'postgres' role
+#     has a password and pg_hba.conf allows it)
 #   - Laya decision engine (REQUIRED — configured BEFORE the target
 #     database; when missing, install.sh offers to download the official
 #     laya.cpp binary + Hugging Face model and deploys the hardened 'laya'
@@ -24,6 +26,12 @@
 #                    yours instead (the installer grants it the needed rights).
 #   --db NAME        Target database for the daemon (implies --no-demo). NAME must
 #                    already exist and be a valid PostgreSQL identifier.
+#   --pg-password PASS
+#                   Connect to the instance as the 'postgres' role with a
+#                   PASSWORD (scram-sha-256 / md5) instead of the default
+#                   'sudo -u postgres' (peer). Prefer the PG_PASSWORD env var
+#                   (not visible in ps / shell history). PGHOST / PGPORT select
+#                   a TCP endpoint.
 #   --test           Run the full test suite (cargo test --all-targets) BEFORE
 #                    installing; a failing test aborts the installation.
 #   --dry-run        Show the actions without applying them.
@@ -64,6 +72,9 @@ INSTALL_DEMO=true     # --demo (default) / --no-demo: demo DB or a pre-existing 
 TARGET_DB="pgindexai_demo"  # database the daemon manages (validated identifier)
 DB_CHOSEN=false       # true once the user explicitly fixed the target DB
 POSTGRES_USER="${POSTGRES_USER:-postgres}"
+PG_PASSWORD="${PG_PASSWORD:-}"   # optional — password for the postgres role
+                                 # (used instead of 'sudo -u postgres' peer
+                                 # connections; prefer the PG_PASSWORD env var)
 
 # Target user: the one owning the daemon, the config and the repo.
 # - script as non-root → the current user
@@ -214,10 +225,25 @@ while [[ $# -gt 0 ]]; do
             DB_CHOSEN=true
             INSTALL_DEMO=false
             ;;
+        --pg-password)
+            if [[ $# -lt 2 || -z "${2:-}" || "${2:0:1}" == "-" ]]; then
+                error "--pg-password requires a password"
+                exit 1
+            fi
+            PG_PASSWORD="$2"
+            shift
+            ;;
+        --pg-password=*)
+            if [[ -z "${1#--pg-password=}" ]]; then
+                error "--pg-password requires a password"
+                exit 1
+            fi
+            PG_PASSWORD="${1#--pg-password=}"
+            ;;
         --test) RUN_TESTS=true ;;
         --dry-run) DRY_RUN=true ;;
         -h|--help)
-            sed -n '2,39p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,48p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *) warn "Unknown argument: $1 (ignored)" ;;
@@ -234,6 +260,21 @@ run() {
     fi
 }
 
+# pg_psql [psql options...] — runs psql as role $POSTGRES_USER, choosing
+# the connection mode:
+#   PG_PASSWORD set → PGPASSWORD=… psql -U postgres (scram-sha-256/md5 —
+#                     local socket by default; PGHOST/PGPORT for TCP)
+#   otherwise       → sudo -u postgres psql (peer auth, no password)
+# Every installer call goes through this one helper, so the connection
+# mode switches everywhere at once.
+pg_psql() {
+    if [[ -n "$PG_PASSWORD" ]]; then
+        PGPASSWORD="$PG_PASSWORD" psql -U "$POSTGRES_USER" "$@"
+    else
+        sudo -u "$POSTGRES_USER" psql "$@"
+    fi
+}
+
 # psql_stdin "SQL" [psql options...] — runs the SQL via STDIN, not as
 # a command argument: a sensitive value (password) never goes
 # through the local process list (`ps`) EVER.
@@ -243,9 +284,9 @@ psql_stdin() {
     local sql="$1"
     shift
     if $DRY_RUN; then
-        echo -e "${CYAN}[dry-run]${NC} sudo -u $POSTGRES_USER psql -q -v ON_ERROR_STOP=1 $* [SQL via stdin]"
+        echo -e "${CYAN}[dry-run]${NC} pg_psql -q -v ON_ERROR_STOP=1 $* [SQL via stdin]"
     else
-        printf '%s\n' "$sql" | sudo -u "$POSTGRES_USER" psql -q -v ON_ERROR_STOP=1 "$@"
+        printf '%s\n' "$sql" | pg_psql -q -v ON_ERROR_STOP=1 "$@"
     fi
 }
 
@@ -263,10 +304,11 @@ ask() {
     [[ "${answer:-$def}" =~ ^[Yy] ]]
 }
 
-# pg_show "SQL" — runs a query with -tAc as $POSTGRES_USER
-# (via sudo -u, no password). Returns an empty string on failure.
+# pg_show "SQL" — runs a query with -tAc as $POSTGRES_USER (connection
+# mode: see pg_psql — sudo peer or password). Returns an empty string on
+# failure.
 pg_show() {
-    sudo -u "$POSTGRES_USER" psql -tAc "$1" 2>/dev/null || true
+    pg_psql -tAc "$1" 2>/dev/null || true
 }
 
 # ─────────────────────────────────────────────
@@ -295,6 +337,33 @@ check_postgres() {
         warn "PostgreSQL 16+ required (found version ${version:-unknown})"
     fi
 
+    # Fail-fast connection probe: EVERYTHING downstream (role, grants,
+    # extensions, demo) needs a working admin connection, so a broken one
+    # aborts BEFORE any modification — with a mode-specific diagnosis.
+    local probe
+    if ! probe="$(pg_psql -tAc "SELECT 1" 2>&1)"; then
+        if [[ -n "$PG_PASSWORD" ]]; then
+            error "Cannot connect to PostgreSQL as role '$POSTGRES_USER' with the provided password."
+            error "Check: the password is correct for role '$POSTGRES_USER';"
+            error "pg_hba.conf allows 'scram-sha-256' (or 'md5') for this role"
+            error "(local socket by default — set PGHOST / PGPORT to use TCP)."
+        else
+            error "Cannot connect to PostgreSQL as role '$POSTGRES_USER' ('sudo -u $POSTGRES_USER psql' failed)."
+            error "Check: 'sudo -u $POSTGRES_USER psql' works on this machine;"
+            error "or re-run with --pg-password PASS / PG_PASSWORD=… if the role"
+            error "has a password and pg_hba.conf allows it (scram-sha-256 / md5)."
+        fi
+        if [[ -n "$probe" ]]; then
+            error "Detail: $(head -c 200 <<<"$probe" | tr '\n' ' ')"
+        fi
+        exit 1
+    fi
+    if [[ -n "$PG_PASSWORD" ]]; then
+        info "Admin connection OK (password — role '$POSTGRES_USER')"
+    else
+        info "Admin connection OK (sudo peer — 'sudo -u $POSTGRES_USER')"
+    fi
+
     # Detecting config files via the server itself (no hardcoded path)
     PG_CONF="$(pg_show "SHOW config_file" | tr -d '[:space:]')"
     PG_HBA="$(pg_show "SHOW hba_file" | tr -d '[:space:]')"
@@ -304,7 +373,7 @@ check_postgres() {
         info "pg_hba.conf     : ${PG_HBA:-?}"
         info "ssl             : ${PG_SSL:-?}"
     else
-        warn "Cannot read the server state (sudo -u $POSTGRES_USER psql?)."
+        warn "Cannot read the server state."
         warn "Automatic configuration will be limited."
     fi
 }
@@ -367,7 +436,7 @@ ensure_target_db() {
     fi
     if $INSTALL_DEMO; then
         step "Creating demo database '$TARGET_DB'..."
-        run sudo -u "$POSTGRES_USER" psql -qc "CREATE DATABASE $TARGET_DB"
+        run pg_psql -qc "CREATE DATABASE $TARGET_DB"
     else
         error "Database '$TARGET_DB' does not exist — custom mode requires a pre-existing database."
         error "Create it first (CREATE DATABASE $TARGET_DB;) or re-run the installer with --demo."
@@ -411,11 +480,11 @@ END
 \$\$;
 "
     if $DRY_RUN; then
-        run sudo -u "$POSTGRES_USER" psql -d "$TARGET_DB" -qc "$sql"
+        run pg_psql -d "$TARGET_DB" -qc "$sql"
         return 0
     fi
     local err
-    if ! err="$(sudo -u "$POSTGRES_USER" psql -d "$TARGET_DB" -qc "$sql" 2>&1 >/dev/null)"; then
+    if ! err="$(pg_psql -d "$TARGET_DB" -qc "$sql" 2>&1 >/dev/null)"; then
         error "Ownership transfer FAILED — the daemon will NOT be able to create/drop indexes until the '$TARGET_DB' objects are owned by 'pgindexai'."
         if [[ -n "$err" ]]; then
             error "Detail: $(head -c 300 <<<"$err" | tr '\n' ' ')"
@@ -467,19 +536,19 @@ setup_role() {
         fi
     fi
 
-    run sudo -u "$POSTGRES_USER" psql -qc "GRANT CONNECT ON DATABASE $TARGET_DB TO pgindexai"
+    run pg_psql -qc "GRANT CONNECT ON DATABASE $TARGET_DB TO pgindexai"
     # PostgreSQL 15+: CREATE is no longer granted to everyone on the public schema
     # by default — without this GRANT, CREATE/DROP INDEX fails (permission denied
     # for schema public) even if pgindexai owns the tables.
     # Custom mode: these GRANTs are the daemon's access to the user's database —
     # they are the "additional rights" requested for pre-existing databases.
-    run sudo -u "$POSTGRES_USER" psql -d "$TARGET_DB" -qc "GRANT CREATE ON SCHEMA public TO pgindexai"
+    run pg_psql -d "$TARGET_DB" -qc "GRANT CREATE ON SCHEMA public TO pgindexai"
     # Least privilege for the physical bloat criterion: since pgstattuple 1.5,
     # pgstatindex() (full index scan) is restricted to SUPERUSER or members of
     # the predefined role pg_stat_scan_tables. Grant the narrow role — NOT
     # superuser. Idempotent; without it the daemon degrades gracefully
     # (legacy bloat heuristic + a WARN per cycle, no DDL impact).
-    run sudo -u "$POSTGRES_USER" psql -d "$TARGET_DB" -qc "GRANT pg_stat_scan_tables TO pgindexai"
+    run pg_psql -d "$TARGET_DB" -qc "GRANT pg_stat_scan_tables TO pgindexai"
 
     # Ownership transfer (tables + indexes) to pgindexai — DEMO MODE ONLY:
     # the demo schema is created BY postgres and must be re-attributed so the
@@ -602,7 +671,7 @@ ensure_pg_stat_statements() {
 
     # The extension is PER-DATABASE: check (and create) it in the daemon's
     # own database, where it will actually be queried.
-    if [[ -n "$(sudo -u "$POSTGRES_USER" psql -d "$TARGET_DB" -tAc "SELECT 1 FROM pg_extension WHERE extname = '$lib'" 2>/dev/null || true)" ]]; then
+    if [[ -n "$(pg_psql -d "$TARGET_DB" -tAc "SELECT 1 FROM pg_extension WHERE extname = '$lib'" 2>/dev/null || true)" ]]; then
         info "pg_stat_statements is active in '$TARGET_DB'"
         return 0
     fi
@@ -641,7 +710,7 @@ ensure_pg_stat_statements() {
     fi
 
     # Restart if needed (pg_hba.conf, for its part, is reloaded by « reload » — handled in ensure_hba)
-    if [[ -z "$(sudo -u "$POSTGRES_USER" psql -d "$TARGET_DB" -tAc "SELECT 1 FROM pg_extension WHERE extname = '$lib'" 2>/dev/null || true)" ]]; then
+    if [[ -z "$(pg_psql -d "$TARGET_DB" -tAc "SELECT 1 FROM pg_extension WHERE extname = '$lib'" 2>/dev/null || true)" ]]; then
         warn "Restarting PostgreSQL (shared_preload_libraries modified)..."
         run sudo systemctl restart postgresql
         # Activity polling (30 s)
@@ -655,7 +724,7 @@ ensure_pg_stat_statements() {
             error "PostgreSQL did not restart — check: sudo journalctl -u postgresql"
             return 1
         fi
-        run sudo -u "$POSTGRES_USER" psql -d "$TARGET_DB" -qc "CREATE EXTENSION IF NOT EXISTS $lib"
+        run pg_psql -d "$TARGET_DB" -qc "CREATE EXTENSION IF NOT EXISTS $lib"
         info "pg_stat_statements enabled"
     fi
 }
@@ -1408,21 +1477,21 @@ setup_demo() {
     local repo_dir
     repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-    if ! sudo -u "$POSTGRES_USER" psql -d "$TARGET_DB" -tAc \
+    if ! pg_psql -d "$TARGET_DB" -tAc \
         "SELECT 1 FROM information_schema.tables WHERE table_name = 'customers' LIMIT 1" 2>/dev/null | grep -q 1; then
         # The SQL goes through STDIN, not `psql -f`: the postgres user cannot
         # read files under a private (drwxr-x---) home directory, so `psql -f`
         # fails with "Permission denied" even though the SQL itself is valid.
         # Feeding it on stdin lets OUR shell (which owns the file) do the read.
         if [[ -f "$repo_dir/sql/demo_schema.sql" ]]; then
-            if run sudo -u "$POSTGRES_USER" psql -d "$TARGET_DB" -v ON_ERROR_STOP=1 < "$repo_dir/sql/demo_schema.sql"; then
+            if run pg_psql -d "$TARGET_DB" -v ON_ERROR_STOP=1 < "$repo_dir/sql/demo_schema.sql"; then
                 info "Demo schema installed"
             else
                 warn "Demo schema installation FAILED — see the psql output above"
             fi
         fi
         if [[ -f "$repo_dir/sql/demo_workload.sql" ]]; then
-            if run sudo -u "$POSTGRES_USER" psql -d "$TARGET_DB" -v ON_ERROR_STOP=1 < "$repo_dir/sql/demo_workload.sql"; then
+            if run pg_psql -d "$TARGET_DB" -v ON_ERROR_STOP=1 < "$repo_dir/sql/demo_workload.sql"; then
                 info "Demo workload installed"
             else
                 warn "Partial demo workload — the workload SQL failed (see psql output above)"
@@ -1446,10 +1515,17 @@ verify() {
     if $INSTALL_DEMO; then
         mode="demo database"
     fi
+    local pg_admin
+    if [[ -n "$PG_PASSWORD" ]]; then
+        pg_admin="password (PGPASSWORD → role '$POSTGRES_USER')"
+    else
+        pg_admin="sudo -u $POSTGRES_USER (peer)"
+    fi
     echo "  Binary     : $BIN_PATH"
     echo "  Target DB  : $TARGET_DB  ($mode)"
     echo "  Config     : $CONFIG_FILE  (0600, password: null)"
     echo "  Auth       : peer — pg_ident map '$PG_IDENT_MAP: $TARGET_USER → pgindexai' (no password)"
+    echo "  PG admin   : $pg_admin  (installer admin connection)"
     echo "  Logs       : /var/log/pgindexai/"
     echo "  Service    : systemctl status $SERVICE_NAME"
     echo "  Laya       : systemctl status $LAYA_SERVICE_NAME  (decision engine — prerequisite, up before the DB steps)"

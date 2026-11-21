@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`install.sh`: `--pg-password` / `PG_PASSWORD` — admin connection by password.**
+  New option `--pg-password PASS` (or the `PG_PASSWORD` environment variable —
+  the flag wins) connects to the instance as the `postgres` role with a
+  password (`PGPASSWORD` is exported only for each psql command, so it never
+  lingers in the installer's environment or shows up in `ps`), instead of the
+  default `sudo -u postgres psql` (peer auth, no password). `PGHOST` /
+  `PGPORT` (honored natively by psql) select a TCP endpoint instead of the
+  local socket. The daemon is unchanged: it still connects as `pgindexai` via
+  peer auth with `password: null` — this password is installer-admin only.
+  All installer psql calls route through a single `pg_psql` helper, so the
+  connection mode switches everywhere at once.
+
+- **`install.sh`: `check_postgres` now runs a fail-fast admin-connection
+  probe.** A broken admin connection (either mode) aborts **before any
+  modification**, with mode-specific diagnostics: password mode points at the
+  password, the pg_hba `scram-sha-256`/`md5` requirement and `PGHOST`/`PGPORT`
+  for TCP; peer mode checks `sudo -u postgres psql` and suggests the
+  `--pg-password` alternative. A working connection is announced explicitly
+  (`Admin connection OK (…)`), and the `verify()` summary now reports the
+  active mode as `PG admin`.
+
 - **`install.sh`: choose the demo database vs. an existing one, and opt into the test suite.**
   New options: `--demo` (default — previous behavior: create `pgindexai_demo`,
   load the demo schema + workload, attach the daemon), `--no-demo` (skip the
