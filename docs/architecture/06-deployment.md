@@ -16,6 +16,10 @@
 ```
 
 `install.sh` (shellcheck-clean, no `eval`, prompts via `/dev/tty`):
+- sets up the **Laya decision engine first (required prerequisite)** — if the
+  binary + model are missing it prints the official runbook, offers the
+  in-place install (interactive), and **aborts before any database work** if
+  Laya is still unavailable or unhealthy;
 - detects the PostgreSQL cluster via `SHOW config_file/hba_file/ssl`;
 - creates the **dedicated non-superuser role `pgindexai`** **without a password**;
 - adds a **`pg_ident` map** (`pgindexai_map: <daemon OS user> → pgindexai`) in

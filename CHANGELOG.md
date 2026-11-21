@@ -24,6 +24,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hold on a database it does not own). `--db` values are validated as
   unquoted PostgreSQL identifiers (no injection into the generated SQL).
 
+### Changed
+
+- **`install.sh`: Laya is now a hard prerequisite, set up BEFORE the target
+  database.** The installer now configures the Laya decision engine (binary
+  + model + hardened `laya.service`) before creating the demo database or
+  attaching to an existing one, and **aborts** if Laya is missing or
+  unhealthy — previously Laya was optional and a missing Laya only left the
+  daemon in observation mode (no database work was blocked). A successful
+  in-place install now deploys the `laya` service in the **same run** (no
+  installer re-run needed); without a terminal (`curl | bash`) the installer
+  aborts with the runbook instead of triggering an unrequested ~2 GB
+  download.
+
 - **`install.sh`: official Laya install runbook + optional in-place download.**
   When the Laya decision engine is missing, the installer now prints a
   self-contained, copy-pasteable procedure (always, even via `curl | bash`):

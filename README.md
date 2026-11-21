@@ -317,7 +317,7 @@ index_logging:
 ### Prerequisites
 
 - **PostgreSQL 16+** (ideally with the `pg_stat_statements` extension enabled — without it, the daemon enters degraded mode: missing-index detection disabled)
-- **Laya server** (`laya`) in server mode on a local port — **required to apply DDL**; without it the daemon stays in observation mode (no database modification). It is the official **laya.cpp** binary ([`lkarlslund/laya.cpp`](https://github.com/lkarlslund/laya.cpp), MIT) running the [`convaiinnovations/laya-typed-decisions`](https://huggingface.co/convaiinnovations/laya-typed-decisions) Hugging Face model — `install.sh` can fetch both for you (SHA-256 verified)
+- **Laya server** (`laya`) in server mode on a local port — **required**: `install.sh` sets it up **before** creating or attaching the target database and aborts if it is missing or unhealthy; at runtime, without it the daemon stays in observation mode (no database modification). It is the official **laya.cpp** binary ([`lkarlslund/laya.cpp`](https://github.com/lkarlslund/laya.cpp), MIT) running the [`convaiinnovations/laya-typed-decisions`](https://huggingface.co/convaiinnovations/laya-typed-decisions) Hugging Face model — `install.sh` can fetch both for you (SHA-256 verified)
 - **Rust toolchain** (to build from source)
 
 ### 🔧 Automatic installation script
@@ -362,14 +362,14 @@ The script does the following automatically:
 | Step | Action |
 |-------|--------|
 | 1. Prerequisites | Checks PostgreSQL, Rust, sudo access |
-| 2. PostgreSQL | Detection via `SHOW config_file/hba_file/ssl`; **merges** `pg_stat_statements` into `shared_preload_libraries` (never overwrites); restarts if needed |
-| 3. Dedicated role | Creates `pgindexai` (non-superuser, **no password**); **adds** the `pg_ident` map `pgindexai_map: <your user> → pgindexai` and **prepends** the targeted line `local all pgindexai peer map=pgindexai_map` in `pg_hba.conf` |
-| 4. Compilation | `cargo build --release` |
-| 5. Installation | Binary → `/usr/local/bin/pgindexai` |
-| 6. Configuration | Generates `~/.config/PGindexAI/PGindexAI.yaml` as **0600** with `password: null` (no secret) |
-| 7. systemd service | Deploys the **hardened** unit (MemoryMax, NoNewPrivileges, …) and enables it |
-| 7b. Laya service (optional) | If the Laya binary + model are found on the machine, deploys the hardened `laya.service` unit and verifies `http://127.0.0.1:8080/health`; if missing, prints the **official install runbook** (laya.cpp release + Hugging Face model, SHA-256 verified) and offers to install in place (interactive prompt); **never aborts the install** (observation mode) |
-| 8. Demo | Loads the demo schema and workload, transfers ownership to `pgindexai` |
+| 2. Laya service (**required**) | If the Laya binary + model are found on the machine, deploys the hardened `laya.service` unit and verifies `http://127.0.0.1:8080/health`; if missing, prints the **official install runbook** (laya.cpp release + Hugging Face model, SHA-256 verified) and offers to install in place (interactive prompt — a successful in-place install deploys the service in the **same run**); **aborts the install, before any database work, if Laya is still unavailable** |
+| 3. PostgreSQL | Detection via `SHOW config_file/hba_file/ssl`; **merges** `pg_stat_statements` into `shared_preload_libraries` (never overwrites); restarts if needed |
+| 4. Dedicated role | Creates `pgindexai` (non-superuser, **no password**); **adds** the `pg_ident` map `pgindexai_map: <your user> → pgindexai` and **prepends** the targeted line `local all pgindexai peer map=pgindexai_map` in `pg_hba.conf` |
+| 5. Compilation | `cargo test --all-targets` (only with `--test`) + `cargo build --release` |
+| 6. Installation | Binary → `/usr/local/bin/pgindexai` |
+| 7. Configuration | Generates `~/.config/PGindexAI/PGindexAI.yaml` as **0600** with `password: null` (no secret) |
+| 8. systemd service | Deploys the **hardened** unit (MemoryMax, NoNewPrivileges, …) and enables it |
+| 9. Demo | Loads the demo schema and workload, transfers ownership to `pgindexai` |
 
 ### 1. PostgreSQL (manual)
 
@@ -439,10 +439,12 @@ hf download convaiinnovations/laya-typed-decisions \
 > deploys a hardened `laya.service` unit (see `config/laya.service` for the
 > reference template). The neutral `laya/` name keeps the component reusable
 > by other tools.
-> Laya is an **optional** component: if it is not found, the install
-> completes normally and the daemon runs in **observation mode** (proposals
-> only, no DDL) until Laya becomes reachable — the "no fallback" policy
-> guarantees the daemon never decides on its own.
+> Laya is a **required** prerequisite: the installer configures it
+> **before** creating or attaching the target database and **aborts** if it
+> is missing or unhealthy — no database work without the decision engine.
+> At runtime the "no fallback" policy still applies: until Laya is active
+> and valid, the daemon stays in **observation mode** (proposals only, no
+> DDL), so it never decides on its own.
 
 ### 3. PGindexAI
 
@@ -609,7 +611,8 @@ pgindexai/
 ├── Cargo.lock              # Locked (binary project)
 ├── install.sh              # Hardened installer (dedicated role, targeted pg_hba,
 │                           # 0600 config, systemd unit, --dry-run, official
-│                           # Laya runbook + optional in-place install)
+│                           # Laya runbook + in-place install — required
+│                           # prerequisite, set up before the DB steps)
 ├── uninstall.sh            # Uninstallation (service, binary, config,
 │                           # --purge, --clean-legacy, --dry-run)
 ├── config/

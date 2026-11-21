@@ -6,9 +6,11 @@
 #   - PostgreSQL 16+ (psql binary + working cluster)
 #   - Rust toolchain (cargo)
 #   - sudo access
-#   - Laya decision engine (OPTIONAL — when missing, install.sh offers to
-#     download the official laya.cpp binary + Hugging Face model, then
-#     re-runs itself to deploy the hardened 'laya' systemd service)
+#   - Laya decision engine (REQUIRED — configured BEFORE the target
+#     database; when missing, install.sh offers to download the official
+#     laya.cpp binary + Hugging Face model and deploys the hardened 'laya'
+#     systemd service in the same run — and ABORTS if Laya is still
+#     unavailable, so no database is created or attached without it)
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/GuillaumeDiamant/PGindexAI/main/install.sh | bash
@@ -85,7 +87,7 @@ CONFIG_DIR="${TARGET_HOME}/.config/PGindexAI"
 CONFIG_FILE="$CONFIG_DIR/PGindexAI.yaml"
 BIN_PATH="/usr/local/bin/pgindexai"
 SERVICE_NAME="pgindexai"
-LAYA_SERVICE_NAME="laya"   # Laya decision engine (optional — required to apply DDL)
+LAYA_SERVICE_NAME="laya"   # Laya decision engine (REQUIRED — must be up before the database steps)
 LAYA_PORT=8080
 LAYA_BACKEND="${LAYA_BACKEND:-}"   # optional override: 'cuda12' | 'vulkan' (default: auto-detect)
 PG_IDENT_MAP="pgindexai_map"  # pg_ident.conf map name (daemon OS user → pgindexai)
@@ -931,18 +933,19 @@ SERVICE
 }
 
 # ─────────────────────────────────────────────
-# Step 4b: Laya decision engine (optional — required to apply DDL)
+# Laya decision engine (REQUIRED — configured before the database steps)
 # ─────────────────────────────────────────────
 # Laya is an EXTERNAL binary (not built by this script). When it is found
 # on the machine (neutral 'laya/' layout first, then the legacy 'pgindexai/'
 # and 'laya-sql/' layouts), install.sh services it as '$LAYA_SERVICE_NAME'
 # (systemd, hardened). The neutral name keeps Laya reusable by other tools.
-# When it is missing, the install CONTINUES: the daemon runs in
-# observation mode (proposals generated, no DDL applied) until Laya is
-# reachable — the "no-fallback" policy guarantees the daemon never
-# decides on its own.
+# Laya is a PREREQUISITE: this step runs BEFORE the target database is
+# created or attached, and a missing or unhealthy Laya ABORTS the install —
+# no database work without the decision engine. The daemon's own
+# "no-fallback" policy (observation mode until Laya is reachable) still
+# guards runtime; the installer simply guarantees Laya comes first.
 setup_laya_service() {
-    step "Laya decision engine (optional — required to apply DDL)..."
+    step "Laya decision engine (REQUIRED — before the database steps)..."
 
     # ── Locate the binary ────────────────────────────────────────────
     local laya_bin="" cand
@@ -969,32 +972,42 @@ setup_laya_service() {
 
     if [[ -z "$laya_bin" || -z "$laya_model" ]]; then
         warn "Laya not found (binary: ${laya_bin:-missing} — model: ${laya_model:-missing})."
-        warn "The daemon will run in OBSERVATION MODE (no DDL) until Laya is"
-        warn "reachable — 'no fallback' policy: the daemon never decides alone."
+        warn "Laya is a PREREQUISITE: the installer aborts BEFORE creating or"
+        warn "attaching the target database if the decision engine is unavailable."
+        if $DRY_RUN; then
+            warn "[dry-run] a real run would stop here unless Laya is installed first."
+            echo ""
+            laya_print_runbook
+            return 0
+        fi
         echo ""
         laya_print_runbook
         # NB: default is N — under `curl | bash` (no tty) `ask` returns the
         # default silently, and an unrequested ~2 GB download in a piped
         # install would be a surprise. The runbook above is always printed,
         # so nothing is lost; answer 'y' interactively to install in place.
-        local in_place_ok=false
-        if ask "Install Laya now from the official channel (laya.cpp ${LAYA_RELEASE} + ${LAYA_MODEL_REPO})? [y/N]" N; then
-            if laya_install_official; then
-                in_place_ok=true
-            else
-                warn "Automatic Laya install failed — follow the manual procedure above."
-            fi
+        if ! ask "Install Laya now from the official channel (laya.cpp ${LAYA_RELEASE} + ${LAYA_MODEL_REPO})? [y/N]" N; then
+            error "Laya is required before the database steps — install it (runbook above), then re-run the installer."
+            return 1
         fi
-        echo ""
-        # When the in-place install succeeded, IT already announced the re-run
-        # (step 4 of its output) — do not repeat the instruction here. Print
-        # the reminder only when Laya is not yet installed on this machine.
-        if ! $in_place_ok; then
-            warn "Once Laya is in place, re-run the installer: it will deploy the"
-            warn "hardened 'laya' systemd service. The daemon auto-detects Laya on"
-            warn "its next decision batch (deep health check) — no restart needed."
+        if ! laya_install_official; then
+            error "Automatic Laya install failed — follow the manual procedure above, then re-run the installer."
+            return 1
         fi
-        return 0
+        # laya_install_official places the pieces at the canonical paths (the
+        # first candidates of the two detection loops above) — verify and
+        # adopt them, then continue to the service deployment below: the
+        # hardened 'laya' unit is deployed in THIS same run, no re-run of
+        # the installer needed.
+        if [[ -x "${TARGET_HOME}/.local/share/laya/laya" \
+              && -f "${TARGET_HOME}/.local/share/laya/models/typed-decisions/typed-decisions/rl_agent_config.json" ]]; then
+            laya_bin="${TARGET_HOME}/.local/share/laya/laya"
+            laya_model="${TARGET_HOME}/.local/share/laya/models/typed-decisions/typed-decisions"
+        else
+            error "In-place Laya install reported success but the files are missing —"
+            error "follow the manual procedure above, then re-run the installer."
+            return 1
+        fi
     fi
 
     info "Laya found — binary: $laya_bin"
@@ -1195,8 +1208,8 @@ EOF
 # laya_install_official — download the official Laya (binary + model) into
 # the canonical layout, verify the checksums, sanity-check the HTTP server.
 # Idempotent: existing pieces are kept. DRY_RUN-safe. The systemd service
-# itself is NOT deployed here — the re-run of install.sh does it
-# (setup_laya_service then finds the binary + model and services them).
+# itself is NOT deployed here — setup_laya_service adopts the freshly
+# installed files (canonical paths) and deploys it in the same run.
 laya_install_official() {
     local url sha size backend
     IFS=$'\t' read -r url sha size <<<"$(laya_backend_spec)"
@@ -1439,7 +1452,7 @@ verify() {
     echo "  Auth       : peer — pg_ident map '$PG_IDENT_MAP: $TARGET_USER → pgindexai' (no password)"
     echo "  Logs       : /var/log/pgindexai/"
     echo "  Service    : systemctl status $SERVICE_NAME"
-    echo "  Laya       : systemctl status $LAYA_SERVICE_NAME  (decision engine — required to apply DDL)"
+    echo "  Laya       : systemctl status $LAYA_SERVICE_NAME  (decision engine — prerequisite, up before the DB steps)"
     echo "  Daemon     : journalctl -u $SERVICE_NAME -f"
     echo ""
     echo "  Useful commands:"
@@ -1472,6 +1485,13 @@ main() {
     check_rust
     echo ""
     resolve_demo_choice
+    echo ""
+    # Hard prerequisite: Laya must be available BEFORE the target database
+    # is created or attached — no database work without the decision
+    # engine. A missing or unhealthy Laya aborts the install here (under
+    # `set -e`, a non-zero return stops the script before setup_postgresql).
+    setup_laya_service
+    echo ""
     setup_postgresql
     echo ""
     build_and_install
@@ -1479,11 +1499,6 @@ main() {
     setup_config
     echo ""
     setup_systemd
-    echo ""
-    # Optional component: a missing Laya must NEVER abort the install —
-    # the daemon simply stays in observation mode (no DDL) until Laya is
-    # reachable. A Laya health failure only downgrades the final status.
-    setup_laya_service || true
     echo ""
     local daemon_ok=true
     start_daemon || daemon_ok=false
