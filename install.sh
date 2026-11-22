@@ -297,7 +297,11 @@ psql_stdin() {
 #              TABLE, INSERT 0 N, DO, … — and all server messages) is
 #              teed to $DEMO_LOG — strictly more detailed than the screen;
 #   * screen → only the curated NOTICE/WARNING/ERROR lines (per-step
-#              explanations + digests), the server prefix stripped.
+#              explanations + digests), the server prefix stripped; while
+#              psql is silent (e.g. the long [8/9] phase) an ASCII activity
+#              spinner (|/-\ + elapsed time) keeps ticking so the run
+#              visibly works — it never reaches the log, and only shows
+#              when stdout is a terminal.
 # The connection mirrors pg_psql (password vs. peer mode). `stdbuf -oL`
 # (coreutils, optional) keeps psql's stdout line-buffered so the raw log
 # interleaves with the server messages in execution order.
@@ -330,25 +334,137 @@ demo_psql() {
         return 0
     fi
     # Screen filter: server messages only (the curated NOTICEs, warnings,
-    # errors), prefix stripped. `sed -n` always exits 0, so the pipeline
-    # status under `set -o pipefail` is psql's.
-    local -a filt=(sed -n -e 's/^NOTICE:[[:space:]]*//p' -e 's/^WARNING:[[:space:]]*//p' -e 's/^ERROR:[[:space:]]*//p')
+    # errors), prefix stripped — see _demo_filter. It always exits 0, so
+    # the pipeline status under `set -o pipefail` is psql's.
+    local -a filt=(_demo_filter)
     # If the log file's directory is missing or not writable (e.g. a
     # read-only checkout), fall back to a screen-only run without capture.
+    local use_tee=1
     log_dir="$(dirname "$DEMO_LOG")"
     if [[ ! -d "$log_dir" || ! -w "$log_dir" ]]; then
         warn "demo log directory not writable — skipping demo_install.log capture"
-        "${cmd[@]}" -v ON_ERROR_STOP=1 -d "$TARGET_DB" < "$file" 2>&1 | "${filt[@]}"
-        return $?
+        use_tee=0
     fi
-    printf '\n=== %s - %s ===\n' "$label" "$(date '+%Y-%m-%d %H:%M:%S')" >> "$DEMO_LOG"
-    if "${cmd[@]}" -v ON_ERROR_STOP=1 -d "$TARGET_DB" < "$file" 2>&1 | tee -a "$DEMO_LOG" | "${filt[@]}"; then
+    if [[ $use_tee -eq 1 ]]; then
+        printf '\n=== %s - %s ===\n' "$label" "$(date '+%Y-%m-%d %H:%M:%S')" >> "$DEMO_LOG"
+    fi
+
+    # ── No terminal: plain streaming (a spinner would corrupt piped output) ──
+    if [[ ! -t 1 ]]; then
+        if [[ $use_tee -eq 1 ]]; then
+            if "${cmd[@]}" -v ON_ERROR_STOP=1 -d "$TARGET_DB" < "$file" 2>&1 | tee -a "$DEMO_LOG" | "${filt[@]}"; then
+                return 0
+            fi
+        else
+            if "${cmd[@]}" -v ON_ERROR_STOP=1 -d "$TARGET_DB" < "$file" 2>&1 | "${filt[@]}"; then
+                return 0
+            fi
+        fi
+        warn "psql failed ($label) — last 20 lines of the raw output:"
+        if [[ $use_tee -eq 1 ]]; then
+            tail -n 20 "$DEMO_LOG"
+        fi
+        return 1
+    fi
+
+    # ── Terminal: the pipeline runs in the background; its filtered output
+    # flows through a FIFO that this foreground process consumes line by
+    # line, drawing the activity spinner (|/-\ + elapsed time) in the gaps.
+    # One process owns the screen, so the spinner never interleaves with the
+    # output lines — and it never reaches demo_install.log.
+    local tmpd fifo rcfile pipe_pid
+    tmpd="$(mktemp -d "${TMPDIR:-/tmp}/pgindexai.XXXXXX")"
+    fifo="$tmpd/screen"
+    rcfile="$tmpd/rc"
+    mkfifo "$fifo"
+    # $tmpd is function-local and gone by the time the trap fires, so the
+    # path MUST be expanded now, not at signal time.
+    # shellcheck disable=SC2064
+    trap "rm -rf '$tmpd' 2>/dev/null || true" EXIT
+    if [[ $use_tee -eq 1 ]]; then
+        (
+            rc=0
+            "${cmd[@]}" -v ON_ERROR_STOP=1 -d "$TARGET_DB" < "$file" 2>&1 | tee -a "$DEMO_LOG" | "${filt[@]}" > "$fifo" || rc=$?
+            printf '%s\n' "$rc" > "$rcfile"
+        ) &
+    else
+        (
+            rc=0
+            "${cmd[@]}" -v ON_ERROR_STOP=1 -d "$TARGET_DB" < "$file" 2>&1 | "${filt[@]}" > "$fifo" || rc=$?
+            printf '%s\n' "$rc" > "$rcfile"
+        ) &
+    fi
+    pipe_pid=$!
+    # Blocks until the background pipeline opens the FIFO for writing.
+    exec 3< "$fifo"
+
+    local frames='|/-\' idx=0 printed=0 line
+    local t0
+    t0="$(date +%s)"
+    while :; do
+        if IFS= read -r -t 0.5 line <&3; then
+            if (( printed )); then
+                printf '\r\033[K'
+                printed=0
+            fi
+            printf '%s\n' "$line"
+            continue
+        fi
+        # No line in the last 0.5s — pipeline finished, or just silent?
+        if [[ -f "$rcfile" ]]; then
+            break
+        fi
+        idx=$(( (idx + 1) % 4 ))
+        printf '\r\033[K  %s %s... %s elapsed' "${frames:idx:1}" "$label" "$(_demo_mmss $(( $(date +%s) - t0 )))"
+        printed=1
+    done
+    # Writer is done: drain whatever is left in the FIFO.
+    while IFS= read -r line <&3; do
+        printf '%s\n' "$line"
+    done
+    exec 3<&-
+    if (( printed )); then
+        printf '\r\033[K'
+    fi
+    wait "$pipe_pid" 2>/dev/null || true
+    local rc
+    rc="$(cat "$rcfile" 2>/dev/null || echo 1)"
+    rm -rf "$tmpd"
+    trap - EXIT
+    if [[ "$rc" == "0" ]]; then
         return 0
     fi
     # `set -o pipefail`: a non-zero pipeline status means psql itself failed.
     warn "psql failed ($label) — last 20 lines of the raw output:"
-    tail -n 20 "$DEMO_LOG"
+    if [[ $use_tee -eq 1 ]]; then
+        tail -n 20 "$DEMO_LOG"
+    fi
     return 1
+}
+
+# _demo_filter — pass through only NOTICE/WARNING/ERROR server messages,
+# prefix stripped. A bash read/printf loop on purpose: sed/awk buffer a
+# non-tty stdout until EOF (every line would arrive at the END of the run,
+# killing the live output); bash printf is an unbuffered write(2), so the
+# output flows line by line. Always exits 0 → under `set -o pipefail` the
+# pipeline status is psql's.
+_demo_filter() {
+    local line out
+    while IFS= read -r line; do
+        case "$line" in
+            NOTICE:*)   out="${line#NOTICE:}" ;;
+            WARNING:*)  out="${line#WARNING:}" ;;
+            ERROR:*)    out="${line#ERROR:}" ;;
+            *)          continue ;;
+        esac
+        out="${out#"${out%%[![:space:]]*}"}"
+        printf '%s\n' "$out"
+    done
+}
+
+# _demo_mmss SECONDS — format a duration as M:SS (activity spinner).
+_demo_mmss() {
+    printf '%d:%02d' $(( $1 / 60 )) $(( $1 % 60 ))
 }
 
 # ask "question" [default Y|N] — reads /dev/tty (works even via curl | bash),

@@ -127,7 +127,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **full raw output** (every `CREATE TABLE` / `INSERT 0 N` / `DO` command
   tag, all server messages) to `demo_install.log`, and
   shows **only** the curated `NOTICE`/`WARNING`/`ERROR` lines on screen —
-  the log is a strict superset of what you see. `stdbuf -oL` (optional,
+  the log is a strict superset of what you see. While psql is silent
+  (e.g. the long `[8/9]` phase) an ASCII activity spinner (`|/-\` +
+  elapsed time) keeps ticking on screen so the run visibly works —
+  screen-only: it appears only when stdout is a terminal and is never
+  written to `demo_install.log`. The screen filter runs in a bash read
+  loop because `sed`/`awk` fully buffer a non-tty stdout until EOF
+  (every line would arrive only at the end of the run). `stdbuf -oL`
+  (optional,
   coreutils) keeps the raw log interleaved in execution order. The
   workload (queries, DML, counts) is unchanged — only the narration and
   the screen/log split changed.
