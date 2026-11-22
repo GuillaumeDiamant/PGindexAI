@@ -76,7 +76,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   restart: it auto-detects Laya on its next decision batch (deep health
   check).
 
+- **`install.sh`: the Laya gate now runs the daemon's `deep_health()` check,
+  not only `/health` (review note M2).** A new `laya_deep_health_up()` POSTs
+  a real decision payload to `/v1/systemone` (the same shape as
+  `LayaClient::deep_health` in `src/laya/mod.rs`) and validates the answer
+  the same way the daemon does: `choice ∈ {0,1}` and `confidence ∈ [0,1]` —
+  the confidence regex carries a terminator that rejects `12` / `1.5`
+  false-positives (verified against 17 mock responses). It runs at both
+  installer gates: after the `laya` systemd service is up (non-fatal — the
+  install continues, with the exact fix printed, because the daemon still
+  works for REINDEX + unused-index analysis) and in the official-channel
+  sanity check (fatal there — it flips `sanity_ok`, so the run is reported
+  as installed but NOT verified). A broken decision pipeline (model not
+  loaded, malformed answers) can no longer hide behind a green `/health`.
+  The probe needs `curl`; without it, the check is skipped with a warning
+  and the daemon's own `deep_health` gate still guards the first proposal
+  batch.
+
 ### Fixed
+
+- **`install.sh`: a missing `pg_stat_statements` is now announced loudly
+  instead of swallowed by `|| true` (review note L6).** When the extension
+  cannot be enabled (no `shared_preload_libraries` write, restart refused,
+  …), the install used to continue silently — a green install with half the
+  daemon disabled (no missing-index / SARGable detection). It still
+  continues (the daemon works in DEGRADED mode: REINDEX + unused-index
+  analysis only, and announces the degraded state every cycle), but now
+  prints a banner naming the exact consequence and the three-step fix
+  (`shared_preload_libraries += 'pg_stat_statements'` + restart +
+  `CREATE EXTENSION`) plus the hint to re-run the idempotent installer.
 
 - **`install.sh`: generated config shipped `min_confidence: 0.7` — the
   calibrated value is `0.1`.** The installer's config template still wrote

@@ -19,7 +19,11 @@
 - sets up the **Laya decision engine first (required prerequisite)** — if the
   binary + model are missing it prints the official runbook, offers the
   in-place install (interactive), and **aborts before any database work** if
-  Laya is still unavailable or unhealthy;
+  Laya is still unavailable or unhealthy; once `/health` answers, it runs the
+  same **deep check** as the daemon (a real decision payload to
+  `/v1/systemone`, answer validated) and reports loudly if the decision
+  pipeline is broken — so a green install never hides a model that would
+  cause every proposal to be skipped;
 - detects the PostgreSQL cluster via `SHOW config_file/hba_file/ssl`;
 - creates the **dedicated non-superuser role `pgindexai`** **without a password**;
 - adds a **`pg_ident` map** (`pgindexai_map: <daemon OS user> → pgindexai`) in
@@ -27,7 +31,10 @@
   `local all pgindexai peer map=pgindexai_map` in `pg_hba.conf`
   (never touches the other lines);
 - **merges** `pg_stat_statements` into `shared_preload_libraries` (never
-  overrides it) then restarts PostgreSQL if needed;
+  overrides it) then restarts PostgreSQL if needed; if it cannot be enabled,
+  the install continues (the daemon runs in **degraded** mode — REINDEX +
+  unused-index analysis only) but prints a loud banner with the exact fix,
+  instead of failing silently;
 - installs the binary to `/usr/local/bin/pgindexai`;
 - generates `~/.config/PGindexAI/PGindexAI.yaml` with **0600** permissions and `password: null` (no secret by default);
 - moves ownership of the demo objects to `pgindexai` (if the database exists);

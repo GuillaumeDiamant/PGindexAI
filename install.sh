@@ -748,7 +748,23 @@ setup_postgresql() {
     ensure_pg_ident
     ensure_hba
     setup_role
-    ensure_pg_stat_statements || true
+    # pg_stat_statements is REQUIRED for missing-index (SARGable) detection.
+    # If it cannot be enabled, the daemon still works (REINDEX + unused-index
+    # analysis) — it announces DEGRADED mode every cycle — so the install is
+    # NOT aborted. But the previous `|| true` hid the failure entirely
+    # (review note L6): the user got a green install with half the daemon
+    # silently disabled. Make the gap impossible to miss:
+    if ! ensure_pg_stat_statements; then
+        warn "────────────────────────────────────────────────────────────────"
+        warn "pg_stat_statements is NOT active in '$TARGET_DB'."
+        warn "The daemon will run in DEGRADED mode: missing-index (SARGable)"
+        warn "detection is DISABLED — only REINDEX + unused-index analysis work."
+        warn "To fix:  shared_preload_libraries += 'pg_stat_statements' in postgresql.conf"
+        warn "          sudo systemctl restart postgresql"
+        warn "          CREATE EXTENSION IF NOT EXISTS pg_stat_statements;"
+        warn "          then re-run ./install.sh (idempotent)"
+        warn "────────────────────────────────────────────────────────────────"
+    fi
 }
 
 # ─────────────────────────────────────────────
@@ -1108,6 +1124,16 @@ setup_laya_service() {
     local service_file="/etc/systemd/system/${LAYA_SERVICE_NAME}.service"
     if [[ -f "$service_file" ]]; then
         if ! ask "Existing Laya service → $service_file. Replace it? [Y/n]" Y; then
+            # Keep the existing deployment — but do not claim « Laya OK »
+            # without checking it (review note M2): if it answers, run the
+            # same deep check the daemon gates on; if it does not answer,
+            # say so (the daemon stays in observation mode until it is up).
+            if laya_health_up; then
+                laya_report_deep_check || true
+            else
+                warn "Laya is not answering on 127.0.0.1:${LAYA_PORT} — the daemon will run in"
+                warn "OBSERVATION mode (no DDL) until the service is up."
+            fi
             return 0
         fi
     fi
@@ -1177,13 +1203,25 @@ SERVICE
     # Activity polling (30 s) — the model is loaded at startup
     for _ in {1..15}; do
         if laya_health_up; then
-            info "Laya service is active (http://127.0.0.1:${LAYA_PORT}/health OK)"
-            return 0
+            break
         fi
         sleep 2
     done
-    error "Laya is not answering after 30 s — check: sudo journalctl -u $LAYA_SERVICE_NAME -n 30"
-    return 1
+    if ! laya_health_up; then
+        error "Laya is not answering after 30 s — check: sudo journalctl -u $LAYA_SERVICE_NAME -n 30"
+        return 1
+    fi
+    info "Laya service is active (http://127.0.0.1:${LAYA_PORT}/health OK)"
+
+    # Deep check (review note M2): /health alone can answer OK while the
+    # decision pipeline is broken — the daemon would then skip EVERY
+    # proposal (its deep_health gate has no fallback). The installer must
+    # not claim « Laya OK » on /health alone: mirror the daemon's check.
+    if ! laya_report_deep_check; then
+        warn "Install continues — after fixing the model:"
+        warn "    sudo systemctl restart ${LAYA_SERVICE_NAME}"
+    fi
+    return 0
 }
 
 # laya_health_up — probe the Laya HTTP endpoint (curl when available,
@@ -1194,6 +1232,48 @@ laya_health_up() {
     else
         (exec 3<>"/dev/tcp/127.0.0.1/${LAYA_PORT}") 2>/dev/null
     fi
+}
+
+# laya_deep_health_up — the SAME structural check the daemon's
+# LayaClient::deep_health runs before applying any proposal: POST a real
+# decision payload to /v1/systemone and require a structured answer
+# (choice ∈ {0,1}, confidence ∈ [0,1]). /health alone can answer OK while
+# the decision pipeline (model load, response format) is broken — the daemon
+# would then skip EVERY proposal (its deep_health gate has no fallback).
+# Requires curl (a POST with a body; the /dev/tcp fallback of
+# laya_health_up cannot cover it).
+laya_deep_health_up() {
+    local body
+    body="$(curl -sf -m 60 -X POST "http://127.0.0.1:${LAYA_PORT}/v1/systemone" \
+        -H 'Content-Type: application/json' \
+        -d '{"state":"install-deep-health-check","questions":{"action":{"type":"choice","instructions":"Choose the single best action for this PostgreSQL index situation.","criteria":{"0":"Option A: no action needed","1":"Option B: perform a maintenance action"}}}}' 2>/dev/null)" \
+        || return 1
+    grep -qE '"choice"[[:space:]]*:[[:space:]]*"(0|1)"' <<<"$body" || return 1
+    # Terminator ([^0-9.]|$) after the value: rejects 12 (read as "1"+"2")
+    # and 1.5 (read as "1"+".").
+    grep -qE '"confidence"[[:space:]]*:[[:space:]]*(0(\.[0-9]+)?|1(\.0+)?)([^0-9.]|$)' <<<"$body"
+}
+
+# laya_report_deep_check — run laya_deep_health_up with user-visible reporting.
+# Returns 1 only when the decision pipeline is broken; 0 when OK, or when the
+# probe cannot run at all (no curl — the daemon runs its own deep_health on
+# the first proposal in that case).
+laya_report_deep_check() {
+    if ! command -v curl &>/dev/null; then
+        warn "curl unavailable — Laya deep check skipped (the daemon runs its own"
+        warn "deep_health probe on the first proposal)."
+        return 0
+    fi
+    if laya_deep_health_up; then
+        info "Laya deep check OK — the decision pipeline answers a real payload (choice + confidence valid)"
+        return 0
+    fi
+    warn "Laya /health is OK but the DECISION pipeline failed the deep check:"
+    warn "a real /v1/systemone payload got no valid answer (choice ∈ {0,1},"
+    warn "confidence ∈ [0,1] — the same validation the daemon's deep_health runs)."
+    warn "Consequence: the daemon will SKIP every proposal (deep_health gate, no fallback)."
+    warn "Fix the model (file, --model flag, variant), then restart the service."
+    return 1
 }
 
 # ─────────────────────────────────────────────
@@ -1314,7 +1394,7 @@ laya_install_official() {
         echo -e "${CYAN}[dry-run]${NC} mkdir -p ${model_dir} (incl. encoder/ and tokenizer/ subdirectories)"
         echo -e "${CYAN}[dry-run]${NC} download laya.cpp ${LAYA_RELEASE} '${backend}' binary (${size}) → ${laya_home}/laya  [sha256 ${sha}]"
         echo -e "${CYAN}[dry-run]${NC} download model ${LAYA_MODEL_REPO} (~807 MB) → ${model_dir}"
-        echo -e "${CYAN}[dry-run]${NC} sanity check: laya --model <dir> --cpu --server --port ${LAYA_PORT} + GET /health"
+        echo -e "${CYAN}[dry-run]${NC} sanity check: laya --model <dir> --cpu --server --port ${LAYA_PORT} + GET /health + deep check (POST /v1/systemone)"
         return 0
     fi
 
@@ -1412,10 +1492,13 @@ laya_install_official() {
         run chown -R "$TARGET_USER" "${laya_home}"
     fi
 
-    # ── 3) Sanity check (CPU server + /health), then stop it ──────────
+    # ── 3) Sanity check (CPU server + /health + deep decision), then stop it ──
     local sanity_ok=true
     if laya_health_up; then
         info "Laya already answers on http://127.0.0.1:${LAYA_PORT}/health (existing instance kept)"
+        # Review note M2: /health OK is not enough — the daemon gates every
+        # proposal on a real decision answer (deep_health, no fallback).
+        laya_report_deep_check || sanity_ok=false
     else
         step "Sanity check: starting Laya (--cpu --server --port ${LAYA_PORT})..."
         local server_log
@@ -1439,6 +1522,11 @@ laya_install_official() {
         done
         if $up; then
             info "Sanity check OK — Laya answers on http://127.0.0.1:${LAYA_PORT}/health"
+            # Review note M2: /health OK is not enough — the daemon gates every
+            # proposal on a real decision answer (deep_health, no fallback).
+            # Probe it now, while this instance owns the port (it is stopped
+            # right below).
+            laya_report_deep_check || sanity_ok=false
         else
             sanity_ok=false
             warn "Sanity check FAILED — Laya did not answer within 60 s. Last log lines:"
