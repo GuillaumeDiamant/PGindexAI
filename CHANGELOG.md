@@ -93,6 +93,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the daemon's own `deep_health` gate still guards the first proposal
   batch.
 
+- **`install.sh` + `sql/`: the demo install now prints a compact digest
+  instead of ~1,400 raw psql lines — without losing any of it.** The demo
+  SQL runs with `psql -q` (no welcome banner, no `CREATE TABLE` /
+  `INSERT 0 N` / `DO` command tags), and the **full raw output is teed to
+  `/var/log/pgindexai/demo_install.log`** (reported in the `verify()`
+  summary); on failure the last 20 lines of that log are shown for
+  diagnosis. On screen, `demo_schema.sql` now ends with one digest line
+  (`Schema: 7 tables, 767000 rows, 25 indexes, 45 MB`) instead of a
+  30-line per-object listing, and `demo_workload.sql` shows:
+  `[1/9]…[9/9]` phase progress lines; a one-line sanity check
+  (`Users: 430 active admins, 160 logins in the last 7 days`) replacing
+  the 426 + 152-row sample dumps; and three report digests — index usage
+  (`11 of 26 indexes never scanned (11 unused per detector #1), 10 MB
+  reclaimable — largest: …`), fragmentation (`9 indexes on
+  orders/order_items — largest: order_items_pkey (363 rows/page)`), and
+  SARGable (`22 tracked queries (>100 calls) — slowest: …`) — instead of
+  four multi-row tables. Every digest keeps the counts, sizes and top
+  offenders the old tables showed (the "unused indexes" report is merged
+  into the index-usage line), and the workload itself (22,000+ queries,
+  DML, fragmentation) is byte-for-byte untouched, so the three detectors
+  see exactly the same conditions as before.
+
 ### Fixed
 
 - **`install.sh`: a missing `pg_stat_statements` is now announced loudly

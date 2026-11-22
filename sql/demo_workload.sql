@@ -7,6 +7,10 @@
    1. Unused indexes (idx_scan = 0, idx_tup_read = 0)
    2. Fragmented indexes (measurable density via pg_class)
    3. SARGable queries without index (pg_stat_statements, >100 calls)
+
+    Output: compact digest only (progress + summary NOTICE lines). The
+    installer tees the full raw psql output to
+    /var/log/pgindexai/demo_install.log — nothing is lost.
    ============================================================================ */
 
 -- ─────────────────────────────────────────────
@@ -23,8 +27,7 @@ SET pg_stat_statements.track = 'all';
 
 -- ─────────────────────────────────────────────
 -- Phase 0: User workload (generates pg_stat_statements)
--- ─────────────────────────────────────────────
-SELECT '=== Phase 0: User workload (generates pg_stat_statements) ===';
+DO $$ BEGIN RAISE NOTICE '[1/9] %', 'User workload (generates pg_stat_statements)'; END $$;
 
 -- 0a: orders workload — shipping_method (NO INDEX, SARGable)
 DO $$
@@ -161,8 +164,7 @@ END $$;
 
 -- ─────────────────────────────────────────────
 -- Phase 1: Client workload (order search)
--- ─────────────────────────────────────────────
-SELECT '=== Phase 1: Search by client ===';
+DO $$ BEGIN RAISE NOTICE '[2/9] %', 'Search by client'; END $$;
 
 DO $$
 DECLARE
@@ -179,8 +181,7 @@ END $$;
 
 -- ─────────────────────────────────────────────
 -- Phase 2: Catalog workload (product search)
--- ─────────────────────────────────────────────
-SELECT '=== Phase 2: Product search ===';
+DO $$ BEGIN RAISE NOTICE '[3/9] %', 'Product search'; END $$;
 
 DO $$
 DECLARE
@@ -205,8 +206,7 @@ END $$;
 
 -- ─────────────────────────────────────────────
 -- Phase 3: Admin workload (reports)
--- ─────────────────────────────────────────────
-SELECT '=== Phase 3: Admin reports ===';
+DO $$ BEGIN RAISE NOTICE '[4/9] %', 'Admin reports'; END $$;
 
 DO $$
 DECLARE
@@ -229,8 +229,7 @@ END $$;
 
 -- ─────────────────────────────────────────────
 -- Phase 4: order_items workload
--- ─────────────────────────────────────────────
-SELECT '=== Phase 4: Order items ===';
+DO $$ BEGIN RAISE NOTICE '[5/9] %', 'Order items'; END $$;
 
 DO $$
 DECLARE
@@ -247,19 +246,23 @@ END $$;
 
 -- ─────────────────────────────────────────────
 -- Phase 5: Users workload
--- ─────────────────────────────────────────────
-SELECT '=== Phase 5: User management ===';
+DO $$ BEGIN RAISE NOTICE '[6/9] %', 'User management'; END $$;
 
-SELECT u.username, u.last_login
-FROM users u
-WHERE u.role = 'admin'
-  AND u.is_active = true
-ORDER BY u.last_login DESC;
+-- Digest: how many admins / recent logins (no row dump on screen)
+DO $$
+DECLARE
+    n_admin  INT;
+    n_recent INT;
+BEGIN
+    SELECT count(*) INTO n_admin
+    FROM users WHERE role = 'admin' AND is_active = true;
 
-SELECT u.username, u.role
-FROM users u
-WHERE u.last_login > NOW() - interval '7 days'
-ORDER BY u.last_login DESC;
+    SELECT count(*) INTO n_recent
+    FROM users WHERE last_login > NOW() - interval '7 days';
+
+    RAISE NOTICE 'Users: % active admins, % logins in the last 7 days',
+        n_admin, n_recent;
+END $$;
 
 DO $$
 DECLARE
@@ -275,8 +278,7 @@ END $$;
 
 -- ─────────────────────────────────────────────
 -- Phase 6: Realistic fragmentation generation
--- ─────────────────────────────────────────────
-SELECT '=== Phase 6: Realistic fragmentation ===';
+DO $$ BEGIN RAISE NOTICE '[7/9] %', 'Realistic fragmentation'; END $$;
 
 -- 6a: Massive row deletion (creates holes)
 DELETE FROM order_items WHERE order_id < 100000;
@@ -315,9 +317,8 @@ CREATE INDEX IF NOT EXISTS idx_orders_temp_status ON orders (status) WHERE statu
 
 -- ─────────────────────────────────────────────
 -- Phase 7: Repetitive SARGable workload (pg_stat_statements)
--- ─────────────────────────────────────────────
+DO $$ BEGIN RAISE NOTICE '[8/9] %', 'Repetitive SARGable workload'; END $$;
 -- Use EXECUTE ... USING so that pg_stat_statements groups the queries
-SELECT '=== Phase 7: Repetitive SARGable workload ===';
 
 -- 7a: 5000 identical queries on shipping_method (NO INDEX, SARGable)
 --     → PRIMARY TARGET: must reach >5000 calls
@@ -393,12 +394,11 @@ END $$;
 
 -- ─────────────────────────────────────────────
 -- Phase 8: GIN/GIST workload (jsonb / array / range)
--- ─────────────────────────────────────────────
+DO $$ BEGIN RAISE NOTICE '[9/9] %', 'GIN/GIST workload (jsonb / array / range)'; END $$;
 -- Triggers the GIN/GIST detector (detector #3, extended):
 --   events.payload @> {...}  → GIN (jsonb containment)
 --   events.tags   && ARRAY   → GIN (array overlap)
 --   bookings.period @> range → GIST (range containment)
-SELECT '=== Phase 8: GIN/GIST workload (jsonb / array / range) ===';
 
 -- 8a: 2000 jsonb containment queries (GIN target — events.payload, NO INDEX)
 DO $$
@@ -436,79 +436,104 @@ END $$;
 -- ─────────────────────────────────────────────
 -- End of workload
 -- ─────────────────────────────────────────────
-SELECT '=== Workload completed ===';
+DO $$ BEGIN RAISE NOTICE 'Workload completed — reports follow'; END $$;
 
 -- Force stats update
 ANALYZE;
 
 -- ─────────────────────────────────────────────
--- Report: used vs unused indexes
+-- Report: index usage (unused = DROP target) — digest
 -- ─────────────────────────────────────────────
-SELECT '--- Index usage (scans = 0 → DROP target) ---';
+DO $$
+DECLARE
+    n_total   INT;
+    n_zero    INT;   -- never scanned (idx_scan = 0)
+    n_unused  INT;   -- never scanned AND never read (detector #1 criterion)
+    zero_bytes BIGINT;
+    top_names TEXT;
+BEGIN
+    SELECT count(*) INTO n_total FROM pg_stat_user_indexes;
 
-SELECT
-    schemaname || '.' || relname AS table,
-    indexrelname AS index_name,
-    idx_scan AS scans,
-    pg_size_pretty(pg_relation_size(indexrelid)) AS size,
-    idx_tup_read AS tuples_read
-FROM pg_stat_user_indexes
-WHERE idx_scan = 0
-ORDER BY pg_relation_size(indexrelid) DESC;
+    SELECT count(*), COALESCE(sum(pg_relation_size(indexrelid)), 0)
+      INTO n_zero, zero_bytes
+    FROM pg_stat_user_indexes
+    WHERE idx_scan = 0;
 
--- ─────────────────────────────────────────────
--- Report: fragmentation (actual density via pg_class)
--- ─────────────────────────────────────────────
-SELECT '--- Fragmentation (pg_class density) ---';
+    SELECT count(*) INTO n_unused
+    FROM pg_stat_user_indexes
+    WHERE idx_scan = 0 AND idx_tup_read = 0;
 
-SELECT
-    c.relname AS table_name,
-    i.relname AS index_name,
-    pg_size_pretty((c2.relpages * 8192)::bigint) AS index_size,
-    c2.relpages AS pages,
-    c.reltuples AS estimated_rows,
-    CASE
-        WHEN c2.relpages > 0 THEN ROUND(
-            (c.reltuples::float / GREATEST(c2.relpages, 1))::numeric, 0
-        )
-        ELSE 0
-    END AS rows_per_page
-FROM pg_class c
-JOIN pg_class i ON i.relkind = 'i'
-JOIN pg_index ix ON ix.indrelid = c.oid AND ix.indexrelid = i.oid
-JOIN pg_class c2 ON c2.oid = i.oid
-WHERE c.relname IN ('orders', 'order_items')
-  AND c2.relpages > 0
-ORDER BY c2.relpages DESC;
+    SELECT left(string_agg(indexrelname, ', '
+               ORDER BY pg_relation_size(indexrelid) DESC), 80)
+      INTO top_names
+    FROM pg_stat_user_indexes
+    WHERE idx_scan = 0;
+
+    RAISE NOTICE 'Index usage: % of % indexes never scanned (% unused per detector #1), % reclaimable — largest: %',
+        n_zero, n_total, n_unused, pg_size_pretty(zero_bytes), top_names;
+END $$;
 
 -- ─────────────────────────────────────────────
--- Report: SARGable queries detected by pg_stat_statements
+-- Report: fragmentation (actual density via pg_class) — digest
 -- ─────────────────────────────────────────────
-SELECT '--- Top queries by exec_time (pg_stat_statements) ---';
+DO $$
+DECLARE
+    n_frag   INT;
+    top_name TEXT;
+    top_rpp  NUMERIC;
+BEGIN
+    SELECT count(*) INTO n_frag
+    FROM pg_class c
+    JOIN pg_class i ON i.relkind = 'i'
+    JOIN pg_index ix ON ix.indrelid = c.oid AND ix.indexrelid = i.oid
+    JOIN pg_class c2 ON c2.oid = i.oid
+    WHERE c.relname IN ('orders', 'order_items')
+      AND c2.relpages > 0;
 
-SELECT
-    queryid,
-    LEFT(query, 120) AS query_short,
-    calls,
-    ROUND((total_exec_time / calls)::numeric, 2) AS avg_ms,
-    ROUND((total_exec_time / 1000)::numeric, 2) AS total_s
-FROM pg_stat_statements
-WHERE dbid = (SELECT oid FROM pg_database WHERE datname = 'pgindexai_demo')
-  AND query !~ '^SET|^BEGIN|^COMMIT|^ANALYZE|^DELETE FROM|^INSERT INTO|^VACUUM|^UPDATE '
-  AND calls > 100
-ORDER BY total_exec_time DESC
-LIMIT 30;
+    SELECT i.relname,
+           ROUND((c.reltuples::float / GREATEST(c2.relpages, 1))::numeric, 0)
+      INTO top_name, top_rpp
+    FROM pg_class c
+    JOIN pg_class i ON i.relkind = 'i'
+    JOIN pg_index ix ON ix.indrelid = c.oid AND ix.indexrelid = i.oid
+    JOIN pg_class c2 ON c2.oid = i.oid
+    WHERE c.relname IN ('orders', 'order_items')
+      AND c2.relpages > 0
+    ORDER BY c2.relpages DESC
+    LIMIT 1;
+
+    RAISE NOTICE 'Fragmentation: % indexes on orders/order_items — largest: % (% rows/page)',
+        n_frag, top_name, top_rpp;
+END $$;
 
 -- ─────────────────────────────────────────────
--- Report: detected unused indexes
+-- Report: SARGable queries (pg_stat_statements) — digest
 -- ─────────────────────────────────────────────
-SELECT '--- Unused indexes (idx_scan=0, idx_tup_read=0) ---';
+DO $$
+DECLARE
+    n_tracked INT;
+    top       TEXT;
+BEGIN
+    SELECT count(*) INTO n_tracked
+    FROM pg_stat_statements
+    WHERE dbid = (SELECT oid FROM pg_database WHERE datname = 'pgindexai_demo')
+      AND query !~ '^SET|^BEGIN|^COMMIT|^ANALYZE|^DELETE FROM|^INSERT INTO|^VACUUM|^UPDATE '
+      AND calls > 100;
 
-SELECT
-    schemaname || '.' || relname AS table,
-    indexrelname AS index_name,
-    pg_size_pretty(pg_relation_size(indexrelid)) AS size
-FROM pg_stat_user_indexes
-WHERE idx_scan = 0
-  AND idx_tup_read = 0
-ORDER BY pg_relation_size(indexrelid) DESC;
+    SELECT left(string_agg(s.q, ' | ' ORDER BY s.t DESC), 120)
+      INTO top
+    FROM (
+        SELECT LEFT(regexp_replace(query, E'[\\n\\r]+', ' ', 'g'), 70) AS q,
+               total_exec_time AS t
+        FROM pg_stat_statements
+        WHERE dbid = (SELECT oid FROM pg_database WHERE datname = 'pgindexai_demo')
+          AND query !~ '^SET|^BEGIN|^COMMIT|^ANALYZE|^DELETE FROM|^INSERT INTO|^VACUUM|^UPDATE '
+          AND calls > 100
+        ORDER BY total_exec_time DESC
+        LIMIT 3
+    ) s;
+
+    RAISE NOTICE 'SARGable: % tracked queries (>100 calls) — slowest: %',
+        n_tracked, top;
+END $$;
+

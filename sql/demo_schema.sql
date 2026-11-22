@@ -222,23 +222,25 @@ ANALYZE users;
 ANALYZE events;
 ANALYZE bookings;
 
--- ── Summary ──────────────────────────────────────────────────────────────
+-- ── Summary (compact digest) ─────────────────────────────────────────────
+-- One line, no per-object listing: the installer prints only these digest
+-- NOTICEs on screen (psql -q) and keeps the full raw psql output in its
+-- log (/var/log/pgindexai/demo_install.log) — nothing is lost.
 DO $$
 DECLARE
-    r RECORD;
+    n_tables   INT;
+    total_rows BIGINT;
+    n_indexes  INT;
+    idx_bytes  BIGINT;
 BEGIN
-    RAISE NOTICE '=== pgindexai_demo demo schema ===';
-    FOR r IN SELECT relname, n_live_tup
-              FROM pg_stat_user_tables
-              ORDER BY relname
-    LOOP
-        RAISE NOTICE '  %: % rows', r.relname, r.n_live_tup;
-    END LOOP;
-    RAISE NOTICE '=== Index ===';
-    FOR r IN SELECT indexrelname, pg_size_pretty(pg_relation_size(indexrelid)) AS size
-              FROM pg_stat_user_indexes
-              ORDER BY indexrelname
-    LOOP
-        RAISE NOTICE '  %: %', r.indexrelname, r.size;
-    END LOOP;
+    SELECT count(*), COALESCE(sum(n_live_tup), 0)
+      INTO n_tables, total_rows
+      FROM pg_stat_user_tables;
+
+    SELECT count(*), COALESCE(sum(pg_relation_size(indexrelid)), 0)
+      INTO n_indexes, idx_bytes
+      FROM pg_stat_user_indexes;
+
+    RAISE NOTICE 'Schema: % tables, % rows, % indexes, %',
+        n_tables, total_rows, n_indexes, pg_size_pretty(idx_bytes);
 END $$;

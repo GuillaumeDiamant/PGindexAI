@@ -98,6 +98,7 @@ CONFIG_DIR="${TARGET_HOME}/.config/PGindexAI"
 CONFIG_FILE="$CONFIG_DIR/PGindexAI.yaml"
 BIN_PATH="/usr/local/bin/pgindexai"
 SERVICE_NAME="pgindexai"
+DEMO_LOG="/var/log/pgindexai/demo_install.log"  # full raw psql output of the demo install
 LAYA_SERVICE_NAME="laya"   # Laya decision engine (REQUIRED — must be up before the database steps)
 LAYA_PORT=8080
 LAYA_BACKEND="${LAYA_BACKEND:-}"   # optional override: 'cuda12' | 'vulkan' (default: auto-detect)
@@ -288,6 +289,36 @@ psql_stdin() {
     else
         printf '%s\n' "$sql" | pg_psql -q -v ON_ERROR_STOP=1 "$@"
     fi
+}
+
+# demo_psql "LABEL" SQL_FILE — runs a demo SQL file in digest mode:
+#   * `-q` → no welcome message, no command tags (CREATE TABLE,
+#            INSERT 0 N, DO, ANALYZE, …): only the curated NOTICE digest
+#            lines and server messages reach the screen;
+#   * the FULL raw output is teed to $DEMO_LOG — the digest on screen is
+#     a summary of it, so nothing is lost.
+# On failure, the tail of the raw output is shown for diagnosis.
+demo_psql() {
+    local label="$1" file="$2"
+    if $DRY_RUN; then
+        echo -e "${CYAN}[dry-run]${NC} pg_psql -q -v ON_ERROR_STOP=1 -d $TARGET_DB < $file"
+        echo -e "${CYAN}[dry-run]${NC} full output -> $DEMO_LOG"
+        return 0
+    fi
+    # If the log dir is missing (should not happen — setup_systemd creates
+    # it before any demo work), fall back to a plain run without capture.
+    if [[ ! -d /var/log/pgindexai || ! -w /var/log/pgindexai ]]; then
+        run pg_psql -q -v ON_ERROR_STOP=1 -d "$TARGET_DB" < "$file"
+        return $?
+    fi
+    printf '\n=== %s - %s ===\n' "$label" "$(date '+%Y-%m-%d %H:%M:%S')" >> "$DEMO_LOG"
+    if pg_psql -q -v ON_ERROR_STOP=1 -d "$TARGET_DB" < "$file" 2>&1 | tee -a "$DEMO_LOG"; then
+        return 0
+    fi
+    # `set -o pipefail`: a non-zero pipeline status means pg_psql itself failed.
+    warn "psql failed ($label) — last 20 lines of the raw output:"
+    tail -n 20 "$DEMO_LOG"
+    return 1
 }
 
 # ask "question" [default Y|N] — reads /dev/tty (works even via curl | bash),
@@ -1595,19 +1626,20 @@ setup_demo() {
         # fails with "Permission denied" even though the SQL itself is valid.
         # Feeding it on stdin lets OUR shell (which owns the file) do the read.
         if [[ -f "$repo_dir/sql/demo_schema.sql" ]]; then
-            if run pg_psql -d "$TARGET_DB" -v ON_ERROR_STOP=1 < "$repo_dir/sql/demo_schema.sql"; then
+            if demo_psql "schema" "$repo_dir/sql/demo_schema.sql"; then
                 info "Demo schema installed"
             else
                 warn "Demo schema installation FAILED — see the psql output above"
             fi
         fi
         if [[ -f "$repo_dir/sql/demo_workload.sql" ]]; then
-            if run pg_psql -d "$TARGET_DB" -v ON_ERROR_STOP=1 < "$repo_dir/sql/demo_workload.sql"; then
+            if demo_psql "workload" "$repo_dir/sql/demo_workload.sql"; then
                 info "Demo workload installed"
             else
                 warn "Partial demo workload — the workload SQL failed (see psql output above)"
             fi
         fi
+        info "Full psql output: $DEMO_LOG"
     else
         info "Demo schema already installed"
     fi
@@ -1638,6 +1670,9 @@ verify() {
     echo "  Auth       : peer — pg_ident map '$PG_IDENT_MAP: $TARGET_USER → pgindexai' (no password)"
     echo "  PG admin   : $pg_admin  (installer admin connection)"
     echo "  Logs       : /var/log/pgindexai/"
+    if $INSTALL_DEMO; then
+        echo "  Demo log   : $DEMO_LOG  (full raw psql output of the demo install)"
+    fi
     echo "  Service    : systemctl status $SERVICE_NAME"
     echo "  Laya       : systemctl status $LAYA_SERVICE_NAME  (decision engine — prerequisite, up before the DB steps)"
     echo "  Daemon     : journalctl -u $SERVICE_NAME -f"
