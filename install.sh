@@ -900,7 +900,11 @@ thresholds:
   unused_minutes: 10080    # Observation window (7 days) before DROP of an unused index
   fragmentation_pct: 70    # % of fragmentation triggering a REINDEX CONCURRENTLY
   min_sargable_rows: 100   # Min. executions (pg_stat_statements.calls) for a SARGable index
-  min_confidence: 0.7      # Minimum Laya confidence to apply a decision
+  min_confidence: 0.1      # Minimum Laya confidence to apply a decision
+                          # (calibrated on laya-typed-decisions: the model's
+                          #  confidence head reports ~0.10-0.38 and never
+                          #  reaches 0.7 — a 0.7 floor silently rejects
+                          #  EVERY decision, leaving "Applied: 0" forever)
   max_proposals_per_cycle: 20  # Proposal budget per cycle
 
 # Analysis scope (multi-schema)

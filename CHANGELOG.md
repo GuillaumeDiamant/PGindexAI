@@ -78,6 +78,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`install.sh`: generated config shipped `min_confidence: 0.7` — the
+  calibrated value is `0.1`.** The installer's config template still wrote
+  the pre-calibration threshold, while the Rust default, the config
+  template, and every doc say `0.1`. The laya-typed-decisions model's
+  confidence head reports ~0.10–0.38 (measured: 0.09–0.26 across
+  decisions) and **never reaches 0.7** — so on an installed daemon every
+  Laya-approved decision was silently skipped by the confidence gate
+  (debug-level log only, not counted) and the daemon logged
+  `Applied: 0 proposal(s)` forever, even with `choice=1` (observed on a
+  real VM: two CREATE INDEX approved at confidence 0.149/0.140, both
+  under 0.7). The generated config now writes `min_confidence: 0.1` with
+  the calibration note. Existing installs:
+  `sed -i 's/min_confidence: 0\.7/min_confidence: 0.1/' ~/.config/PGindexAI/PGindexAI.yaml`
+  then `sudo systemctl restart pgindexai`.
+
 - **The daemon can now read the `pg_stat_statements` query text of OTHER
   roles — the root cause of "0 proposals" on fresh installs.**
   `pg_stat_statements` itself hides the query text (and queryid) of
