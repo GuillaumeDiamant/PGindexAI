@@ -12,3 +12,6 @@ target/
 # OS
 .DS_Store
 Thumbs.db
+
+# Installer artifact (full raw psql output of the demo install)
+demo_install.log

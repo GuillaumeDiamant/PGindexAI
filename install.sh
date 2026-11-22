@@ -98,7 +98,7 @@ CONFIG_DIR="${TARGET_HOME}/.config/PGindexAI"
 CONFIG_FILE="$CONFIG_DIR/PGindexAI.yaml"
 BIN_PATH="/usr/local/bin/pgindexai"
 SERVICE_NAME="pgindexai"
-DEMO_LOG="/var/log/pgindexai/demo_install.log"  # full raw psql output of the demo install
+DEMO_LOG="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/demo_install.log"  # full raw psql output of the demo install — in the directory containing install.sh
 LAYA_SERVICE_NAME="laya"   # Laya decision engine (REQUIRED — must be up before the database steps)
 LAYA_PORT=8080
 LAYA_BACKEND="${LAYA_BACKEND:-}"   # optional override: 'cuda12' | 'vulkan' (default: auto-detect)
@@ -299,15 +299,16 @@ psql_stdin() {
 #     a summary of it, so nothing is lost.
 # On failure, the tail of the raw output is shown for diagnosis.
 demo_psql() {
-    local label="$1" file="$2"
+    local label="$1" file="$2" log_dir
     if $DRY_RUN; then
         echo -e "${CYAN}[dry-run]${NC} pg_psql -q -v ON_ERROR_STOP=1 -d $TARGET_DB < $file"
         echo -e "${CYAN}[dry-run]${NC} full output -> $DEMO_LOG"
         return 0
     fi
-    # If the log dir is missing (should not happen — setup_systemd creates
-    # it before any demo work), fall back to a plain run without capture.
-    if [[ ! -d /var/log/pgindexai || ! -w /var/log/pgindexai ]]; then
+    # If the log file's directory is missing or not writable (e.g. a
+    # read-only checkout), fall back to a plain run without capture.
+    log_dir="$(dirname "$DEMO_LOG")"
+    if [[ ! -d "$log_dir" || ! -w "$log_dir" ]]; then
         run pg_psql -q -v ON_ERROR_STOP=1 -d "$TARGET_DB" < "$file"
         return $?
     fi

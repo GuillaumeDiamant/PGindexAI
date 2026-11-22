@@ -9,8 +9,8 @@
    3. SARGable queries without index (pg_stat_statements, >100 calls)
 
     Output: compact digest only (progress + summary NOTICE lines). The
-    installer tees the full raw psql output to
-    /var/log/pgindexai/demo_install.log — nothing is lost.
+    installer tees the full raw psql output to demo_install.log (in the
+    directory containing install.sh) — nothing is lost.
    ============================================================================ */
 
 -- ─────────────────────────────────────────────

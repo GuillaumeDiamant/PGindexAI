@@ -97,9 +97,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of ~1,400 raw psql lines — without losing any of it.** The demo
   SQL runs with `psql -q` (no welcome banner, no `CREATE TABLE` /
   `INSERT 0 N` / `DO` command tags), and the **full raw output is teed to
-  `/var/log/pgindexai/demo_install.log`** (reported in the `verify()`
-  summary); on failure the last 20 lines of that log are shown for
-  diagnosis. On screen, `demo_schema.sql` now ends with one digest line
+  `demo_install.log` in the directory that contains `install.sh`**
+  (reported in the `verify()` summary); on failure the last 20 lines of
+  that log are shown for diagnosis. On screen, `demo_schema.sql` now ends with one digest line
   (`Schema: 7 tables, 767000 rows, 25 indexes, 45 MB`) instead of a
   30-line per-object listing, and `demo_workload.sql` shows:
   `[1/9]…[9/9]` phase progress lines; a one-line sanity check

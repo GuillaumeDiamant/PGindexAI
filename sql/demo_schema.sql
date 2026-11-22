@@ -224,8 +224,8 @@ ANALYZE bookings;
 
 -- ── Summary (compact digest) ─────────────────────────────────────────────
 -- One line, no per-object listing: the installer prints only these digest
--- NOTICEs on screen (psql -q) and keeps the full raw psql output in its
--- log (/var/log/pgindexai/demo_install.log) — nothing is lost.
+-- NOTICEs on screen (psql -q) and keeps the full raw psql output in
+-- demo_install.log (in the directory containing install.sh) — nothing is lost.
 DO $$
 DECLARE
     n_tables   INT;
