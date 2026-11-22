@@ -8,9 +8,11 @@
    2. Fragmented indexes (measurable density via pg_class)
    3. SARGable queries without index (pg_stat_statements, >100 calls)
 
-    Output: compact digest only (progress + summary NOTICE lines). The
-    installer tees the full raw psql output to demo_install.log (in the
-    directory containing install.sh) — nothing is lost.
+    Output split (driven by install.sh `demo_psql`):
+      * screen → only the explanatory NOTICE lines (progress + digests);
+      * log    → the FULL raw psql output (every command tag, all server
+                 messages) in demo_install.log, next to install.sh —
+                 strictly more detailed than the screen.
    ============================================================================ */
 
 -- ─────────────────────────────────────────────
@@ -26,8 +28,21 @@
 SET pg_stat_statements.track = 'all';
 
 -- ─────────────────────────────────────────────
+-- Narration (screen output — see demo_psql in install.sh)
+-- ─────────────────────────────────────────────
+DO $$
+BEGIN
+    RAISE NOTICE 'Demo workload: 9 steps simulating real application traffic, so the 3 detectors (unused indexes, fragmented indexes, missing / GIN-GIST indexes) have actual evidence to act on.';
+    RAISE NOTICE 'Screen: one explanation per step + final digests. demo_install.log: the full raw psql output of this run.';
+END $$;
+
+-- ─────────────────────────────────────────────
 -- Phase 0: User workload (generates pg_stat_statements)
-DO $$ BEGIN RAISE NOTICE '[1/9] %', 'User workload (generates pg_stat_statements)'; END $$;
+DO $$
+BEGIN
+    RAISE NOTICE '[1/9] Baseline user workload — ~3,450 queries across orders, customers, products, users and order_items';
+    RAISE NOTICE 'the same shapes a real app runs (value filters, date ranges, LIMIT pages). Fills pg_stat_statements: the raw material the missing-index detector ranks on.';
+END $$;
 
 -- 0a: orders workload — shipping_method (NO INDEX, SARGable)
 DO $$
@@ -164,7 +179,11 @@ END $$;
 
 -- ─────────────────────────────────────────────
 -- Phase 1: Client workload (order search)
-DO $$ BEGIN RAISE NOTICE '[2/9] %', 'Search by client'; END $$;
+DO $$
+BEGIN
+    RAISE NOTICE '[2/9] Client order search — 5,000 per-customer lookups (last 90 days, newest first)';
+    RAISE NOTICE 'the "my orders" page. Gives the indexed columns (customer_id, order_date) real scan counts.';
+END $$;
 
 DO $$
 DECLARE
@@ -181,7 +200,11 @@ END $$;
 
 -- ─────────────────────────────────────────────
 -- Phase 2: Catalog workload (product search)
-DO $$ BEGIN RAISE NOTICE '[3/9] %', 'Product search'; END $$;
+DO $$
+BEGIN
+    RAISE NOTICE '[3/9] Catalog browsing — 16 product searches (8 categories × 2 query shapes)';
+    RAISE NOTICE 'storefront filters (category + price cap, price range + stock). Exercises idx_products_category / _price / _stock.';
+END $$;
 
 DO $$
 DECLARE
@@ -206,7 +229,11 @@ END $$;
 
 -- ─────────────────────────────────────────────
 -- Phase 3: Admin workload (reports)
-DO $$ BEGIN RAISE NOTICE '[4/9] %', 'Admin reports'; END $$;
+DO $$
+BEGIN
+    RAISE NOTICE '[4/9] Admin reports — 30 days × 2 aggregation queries (orders + revenue per day, status breakdown)';
+    RAISE NOTICE 'the dashboard pattern: per-day GROUP BY on orders — typical management-report traffic.';
+END $$;
 
 DO $$
 DECLARE
@@ -229,7 +256,11 @@ END $$;
 
 -- ─────────────────────────────────────────────
 -- Phase 4: order_items workload
-DO $$ BEGIN RAISE NOTICE '[5/9] %', 'Order items'; END $$;
+DO $$
+BEGIN
+    RAISE NOTICE '[5/9] Order line items — 100 "view order" listings (order_items joined to products, quantity-ordered)';
+    RAISE NOTICE 'exercises idx_items_order and idx_items_product via the product join.';
+END $$;
 
 DO $$
 DECLARE
@@ -246,7 +277,11 @@ END $$;
 
 -- ─────────────────────────────────────────────
 -- Phase 5: Users workload
-DO $$ BEGIN RAISE NOTICE '[6/9] %', 'User management'; END $$;
+DO $$
+BEGIN
+    RAISE NOTICE '[6/9] User administration — active-admin / recent-login digest, then up to 20 username prefix searches (LIKE "abc%%")';
+    RAISE NOTICE 'the user-administration screen: role-based lists + the search box.';
+END $$;
 
 -- Digest: how many admins / recent logins (no row dump on screen)
 DO $$
@@ -278,7 +313,12 @@ END $$;
 
 -- ─────────────────────────────────────────────
 -- Phase 6: Realistic fragmentation generation
-DO $$ BEGIN RAISE NOTICE '[7/9] %', 'Realistic fragmentation'; END $$;
+DO $$
+BEGIN
+    RAISE NOTICE '[7/9] Fragmentation — deliberately churning orders and order_items';
+    RAISE NOTICE '~350k row deletes + 100k inserts + a mass status UPDATE, then VACUUM FULL: the fragmentation detector will now find measurable B-tree holes/density.';
+    RAISE NOTICE 'Also creates idx_orders_temp_status, an index the workload never touches — a clean unused-index target.';
+END $$;
 
 -- 6a: Massive row deletion (creates holes)
 DELETE FROM order_items WHERE order_id < 100000;
@@ -317,7 +357,12 @@ CREATE INDEX IF NOT EXISTS idx_orders_temp_status ON orders (status) WHERE statu
 
 -- ─────────────────────────────────────────────
 -- Phase 7: Repetitive SARGable workload (pg_stat_statements)
-DO $$ BEGIN RAISE NOTICE '[8/9] %', 'Repetitive SARGable workload'; END $$;
+DO $$
+BEGIN
+    RAISE NOTICE '[8/9] Missing-index targets — 17,000 repeated parameterized queries (EXECUTE ... USING)';
+    RAISE NOTICE 'SARGable columns hit 1,000+ times each: shipping_method (5k — NO index), total_amount (3k — NO index), plus status / category / role / country (indexed).';
+    RAISE NOTICE 'Repetition + SARGability with no index = exactly what the missing-index detector looks for.';
+END $$;
 -- Use EXECUTE ... USING so that pg_stat_statements groups the queries
 
 -- 7a: 5000 identical queries on shipping_method (NO INDEX, SARGable)
@@ -394,7 +439,12 @@ END $$;
 
 -- ─────────────────────────────────────────────
 -- Phase 8: GIN/GIST workload (jsonb / array / range)
-DO $$ BEGIN RAISE NOTICE '[9/9] %', 'GIN/GIST workload (jsonb / array / range)'; END $$;
+DO $$
+BEGIN
+    RAISE NOTICE '[9/9] GIN/GIST targets — 5,000 containment & overlap queries';
+    RAISE NOTICE 'events.payload @> (jsonb, 2k) and events.tags && (array, 1.5k) → GIN candidates; bookings.period @> (int4range, 1.5k) → GIST candidate.';
+    RAISE NOTICE 'These columns intentionally have NO index — the detector should propose one.';
+END $$;
 -- Triggers the GIN/GIST detector (detector #3, extended):
 --   events.payload @> {...}  → GIN (jsonb containment)
 --   events.tags   && ARRAY   → GIN (array overlap)
@@ -436,7 +486,7 @@ END $$;
 -- ─────────────────────────────────────────────
 -- End of workload
 -- ─────────────────────────────────────────────
-DO $$ BEGIN RAISE NOTICE 'Workload completed — reports follow'; END $$;
+DO $$ BEGIN RAISE NOTICE 'Workload done — ANALYZE refreshes the planner statistics, then 3 digests summarise what each detector will see.'; END $$;
 
 -- Force stats update
 ANALYZE;

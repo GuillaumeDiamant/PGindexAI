@@ -291,32 +291,61 @@ psql_stdin() {
     fi
 }
 
-# demo_psql "LABEL" SQL_FILE — runs a demo SQL file in digest mode:
-#   * `-q` → no welcome message, no command tags (CREATE TABLE,
-#            INSERT 0 N, DO, ANALYZE, …): only the curated NOTICE digest
-#            lines and server messages reach the screen;
-#   * the FULL raw output is teed to $DEMO_LOG — the digest on screen is
-#     a summary of it, so nothing is lost.
+# demo_psql "LABEL" SQL_FILE — runs a demo SQL file with a strict
+# screen/log split:
+#   * log    → the FULL raw psql output (every command tag — CREATE
+#              TABLE, INSERT 0 N, DO, … — and all server messages) is
+#              teed to $DEMO_LOG — strictly more detailed than the screen;
+#   * screen → only the curated NOTICE/WARNING/ERROR lines (per-step
+#              explanations + digests), the server prefix stripped.
+# The connection mirrors pg_psql (password vs. peer mode). `stdbuf -oL`
+# (coreutils, optional) keeps psql's stdout line-buffered so the raw log
+# interleaves with the server messages in execution order.
 # On failure, the tail of the raw output is shown for diagnosis.
 demo_psql() {
     local label="$1" file="$2" log_dir
+    local -a cmd
+    if command -v stdbuf >/dev/null 2>&1; then
+        if [[ -n "$PG_PASSWORD" ]]; then
+            cmd=(env PGPASSWORD="$PG_PASSWORD" stdbuf -oL psql -U "$POSTGRES_USER")
+        else
+            cmd=(sudo -u "$POSTGRES_USER" stdbuf -oL psql)
+        fi
+    else
+        if [[ -n "$PG_PASSWORD" ]]; then
+            cmd=(env PGPASSWORD="$PG_PASSWORD" psql -U "$POSTGRES_USER")
+        else
+            cmd=(sudo -u "$POSTGRES_USER" psql)
+        fi
+    fi
     if $DRY_RUN; then
-        echo -e "${CYAN}[dry-run]${NC} pg_psql -q -v ON_ERROR_STOP=1 -d $TARGET_DB < $file"
-        echo -e "${CYAN}[dry-run]${NC} full output -> $DEMO_LOG"
+        # Display only — the password value itself is never echoed.
+        if [[ -n "$PG_PASSWORD" ]]; then
+            echo -e "${CYAN}[dry-run]${NC} psql -U $POSTGRES_USER -v ON_ERROR_STOP=1 -d $TARGET_DB < $file   (password mode)"
+        else
+            echo -e "${CYAN}[dry-run]${NC} sudo -u $POSTGRES_USER psql -v ON_ERROR_STOP=1 -d $TARGET_DB < $file   (peer mode)"
+        fi
+        echo -e "${CYAN}[dry-run]${NC} screen: NOTICE/WARNING/ERROR lines only (explanations + digests)"
+        echo -e "${CYAN}[dry-run]${NC} log: full raw psql output -> $DEMO_LOG"
         return 0
     fi
+    # Screen filter: server messages only (the curated NOTICEs, warnings,
+    # errors), prefix stripped. `sed -n` always exits 0, so the pipeline
+    # status under `set -o pipefail` is psql's.
+    local -a filt=(sed -n -e 's/^NOTICE:[[:space:]]*//p' -e 's/^WARNING:[[:space:]]*//p' -e 's/^ERROR:[[:space:]]*//p')
     # If the log file's directory is missing or not writable (e.g. a
-    # read-only checkout), fall back to a plain run without capture.
+    # read-only checkout), fall back to a screen-only run without capture.
     log_dir="$(dirname "$DEMO_LOG")"
     if [[ ! -d "$log_dir" || ! -w "$log_dir" ]]; then
-        run pg_psql -q -v ON_ERROR_STOP=1 -d "$TARGET_DB" < "$file"
+        warn "demo log directory not writable — skipping demo_install.log capture"
+        "${cmd[@]}" -v ON_ERROR_STOP=1 -d "$TARGET_DB" < "$file" 2>&1 | "${filt[@]}"
         return $?
     fi
     printf '\n=== %s - %s ===\n' "$label" "$(date '+%Y-%m-%d %H:%M:%S')" >> "$DEMO_LOG"
-    if pg_psql -q -v ON_ERROR_STOP=1 -d "$TARGET_DB" < "$file" 2>&1 | tee -a "$DEMO_LOG"; then
+    if "${cmd[@]}" -v ON_ERROR_STOP=1 -d "$TARGET_DB" < "$file" 2>&1 | tee -a "$DEMO_LOG" | "${filt[@]}"; then
         return 0
     fi
-    # `set -o pipefail`: a non-zero pipeline status means pg_psql itself failed.
+    # `set -o pipefail`: a non-zero pipeline status means psql itself failed.
     warn "psql failed ($label) — last 20 lines of the raw output:"
     tail -n 20 "$DEMO_LOG"
     return 1
@@ -1640,7 +1669,7 @@ setup_demo() {
                 warn "Partial demo workload — the workload SQL failed (see psql output above)"
             fi
         fi
-        info "Full psql output: $DEMO_LOG"
+        info "Full raw psql output (more detail than the screen): $DEMO_LOG"
     else
         info "Demo schema already installed"
     fi
@@ -1672,7 +1701,7 @@ verify() {
     echo "  PG admin   : $pg_admin  (installer admin connection)"
     echo "  Logs       : /var/log/pgindexai/"
     if $INSTALL_DEMO; then
-        echo "  Demo log   : $DEMO_LOG  (full raw psql output of the demo install)"
+        echo "  Demo log   : $DEMO_LOG  (full raw psql output — strictly more detailed than the screen)"
     fi
     echo "  Service    : systemctl status $SERVICE_NAME"
     echo "  Laya       : systemctl status $LAYA_SERVICE_NAME  (decision engine — prerequisite, up before the DB steps)"

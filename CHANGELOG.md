@@ -115,6 +115,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   DML, fragmentation) is byte-for-byte untouched, so the three detectors
   see exactly the same conditions as before.
 
+- **`install.sh` + `sql/`: the demo run is now explained step by step on
+  screen, and `demo_install.log` is strictly more detailed than the
+  standard output.** Every demo step now carries a short explanation of
+  *what* it does and *which detector* it feeds (e.g. `[7/9] Fragmentation
+  — deliberately churning orders and order_items: ~350k deletes + 100k
+  inserts + mass UPDATE, then VACUUM FULL … a clean unused-index target`),
+  and `demo_schema.sql` narrates its 3 steps (extensions → tables +
+  indexes → data) before the digest. The screen/log split is now
+  asymmetric by design: `demo_psql` runs psql **without** `-q`, tees the
+  **full raw output** (every `CREATE TABLE` / `INSERT 0 N` / `DO` command
+  tag, all server messages) to `demo_install.log`, and
+  shows **only** the curated `NOTICE`/`WARNING`/`ERROR` lines on screen —
+  the log is a strict superset of what you see. `stdbuf -oL` (optional,
+  coreutils) keeps the raw log interleaved in execution order. The
+  workload (queries, DML, counts) is unchanged — only the narration and
+  the screen/log split changed.
+
 ### Fixed
 
 - **`install.sh`: a missing `pg_stat_statements` is now announced loudly

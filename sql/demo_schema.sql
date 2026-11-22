@@ -11,6 +11,13 @@ WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = 'pgindexai_demo')
 
 \c pgindexai_demo
 
+-- Narration (screen output — see demo_psql in install.sh)
+DO $$
+BEGIN
+    RAISE NOTICE 'Demo schema: 3 steps (extensions → tables + indexes → data). The full raw psql output of this run is kept in demo_install.log.';
+    RAISE NOTICE '[1/3] Extensions — pg_stat_statements (query stats → missing-index detector) and pgstattuple (physical density → fragmentation detector)';
+END $$;
+
 -- ── Extension: pg_stat_statements (required by the SARGable detector) ────
 -- Prerequisite: pg_stat_statements in shared_preload_libraries + a PostgreSQL
 -- restart (install.sh does this automatically). No-op if already present.
@@ -28,6 +35,8 @@ CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
 CREATE EXTENSION IF NOT EXISTS pgstattuple;
 
 -- ── Table: customers ─────────────────────────────────────────────────────
+DO $$ BEGIN RAISE NOTICE '[2/3] Tables & indexes — 7 tables, 25 indexes: orders / order_items / customers / products / users, plus events (jsonb + tags) and bookings (int4range) left WITHOUT GIN/GIST indexes on purpose'; END $$;
+
 DROP TABLE IF EXISTS orders, products, order_items, users CASCADE;
 
 CREATE TABLE customers (
@@ -134,6 +143,8 @@ CREATE TABLE bookings (
 -- Intentionally NO index on period (GIST candidate).
 
 -- ── Data: customers ──────────────────────────────────────────────────────
+DO $$ BEGIN RAISE NOTICE '[3/3] Data — 10,000 customers, 5,000 products, 200,000 orders, 500,000 line items, 2,000 users, 30,000 events, 20,000 bookings, then ANALYZE'; END $$;
+
 INSERT INTO customers (email, first_name, last_name, country, city)
 SELECT
     'user' || g || '@example.com',
@@ -223,9 +234,10 @@ ANALYZE events;
 ANALYZE bookings;
 
 -- ── Summary (compact digest) ─────────────────────────────────────────────
--- One line, no per-object listing: the installer prints only these digest
--- NOTICEs on screen (psql -q) and keeps the full raw psql output in
--- demo_install.log (in the directory containing install.sh) — nothing is lost.
+-- One line, no per-object listing. The installer shows only the NOTICE lines
+-- on screen and keeps the FULL raw psql output (command tags, server
+-- messages, everything) in demo_install.log next to install.sh — the log
+-- is strictly more detailed than the screen.
 DO $$
 DECLARE
     n_tables   INT;
