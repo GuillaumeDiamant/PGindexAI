@@ -68,22 +68,34 @@ one explicit purpose:
 | `CREATE ON SCHEMA public` | `CREATE/DROP INDEX` (no longer granted by default on PG 15+) | everything |
 | ownership of the target tables/indexes | DDL on those objects | everything |
 | membership in the predefined role **`pg_stat_scan_tables`** | right to call `pgstatindex()` — since **pgstattuple 1.5** this (full index scan) is restricted to superusers or members of this role | the physical bloat criterion only (`use_index_bloat: true`) |
+| membership in the predefined role **`pg_read_all_stats`** | right to READ the query text (and queryid) of statements executed by **another role** — `pg_stat_statements` hides them otherwise (literal `<insufficient privilege>` placeholder; PG16 `pg_stat_statements.c`: `is_allowed_role = has_privs_of_role(userid, ROLE_PG_READ_ALL_STATS)`) | the SARGable detector only — without it, a workload run by any other role is invisible to the daemon → **0 index proposals** |
 
-The last line is a **least-privilege** choice: instead of promoting
-`pgindexai` to `SUPERUSER`, the daemon is granted the narrowest predefined
-role that unlocks the physical criterion. Without it, the daemon degrades
-gracefully — the legacy catalog heuristic still applies, one `WARN` per
-cycle, no failure — so a missing grant never blocks detection or DDL.
+These are **least-privilege** choices: instead of promoting `pgindexai` to
+`SUPERUSER`, the daemon is granted the narrowest predefined roles that unlock
+each criterion. Without `pg_stat_scan_tables`, the daemon degrades gracefully
+— the legacy catalog heuristic still applies, one `WARN` per cycle, no
+failure. Without `pg_read_all_stats`, the daemon stays up but **blind to
+workloads it does not own** (placeholder rows are filtered as noise) — which
+is why the installer grants it.
 
 ```sql
 -- One-time, as superuser (idempotent). Role membership is cluster-wide;
 -- it grants EXECUTE on pgstatindex() in every database where the
--- pgstattuple extension is installed.
+-- pgstattuple extension is installed, and read access to the pg_stat_*
+-- views (query text of every role) in every database.
 sudo -u postgres psql -d pgindexai_demo -c "GRANT pg_stat_scan_tables TO pgindexai;"
+sudo -u postgres psql -d pgindexai_demo -c "GRANT pg_read_all_stats TO pgindexai;"
 
 -- Verify (expect: t)
 psql -U pgindexai -d pgindexai_demo -tAc \
   "SELECT has_function_privilege('pgindexai', 'pgstatindex(regclass)', 'EXECUTE');"
+
+-- Verify the grant (expect: pgindexai listed as member)
+psql -U postgres -tAc \
+  "SELECT r.rolname FROM pg_auth_members m JOIN pg_roles r ON r.oid = m.roleid
+   JOIN pg_roles g ON g.oid = m.member
+   WHERE r.rolname IN ('pg_read_all_stats', 'pg_stat_scan_tables')
+     AND g.rolname = 'pgindexai';"
 ```
 
 ## 2. Starting the Laya server

@@ -78,6 +78,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The daemon can now read the `pg_stat_statements` query text of OTHER
+  roles — the root cause of "0 proposals" on fresh installs.**
+  `pg_stat_statements` itself hides the query text (and queryid) of
+  statements executed by ANOTHER role when the viewer is not a superuser and
+  not a member of `pg_read_all_stats` (PG16 `pg_stat_statements.c`:
+  `is_allowed_role = has_privs_of_role(userid, ROLE_PG_READ_ALL_STATS)`);
+  those rows then show the literal `<insufficient privilege>` placeholder
+  while their call counters stay visible. On a fresh install the workload is
+  run as `postgres`, so the `pgindexai` daemon saw **only** placeholders —
+  every SARGable candidate row was filtered as noise and the detector
+  produced 0 proposals per cycle. `setup_role()` now grants the read-only
+  predefined role (`GRANT pg_read_all_stats TO pgindexai;` — idempotent,
+  **not** superuser), so the daemon sees the full workload regardless of
+  which role runs it (demo mode AND custom mode). Verified live on PG16:
+  before the grant, 449 of 449 `postgres`-owned rows were placeholders
+  (0 readable); after the grant, 451 of 451 are readable. The
+  `<insufficient privilege>` exclusion filter stays as a safety net on
+  misconfigured clusters, and its comments now document the real mechanism
+  instead of the earlier "tool noise" misdiagnosis. Existing installs:
+  `sudo -u postgres psql -d <db> -c "GRANT pg_read_all_stats TO pgindexai;"`
+  (takes effect on the daemon's next cycle — no restart needed).
+
+- **`install.sh`: the audit-log directory is no longer left root-owned when
+  the installer runs as a regular user.** `/var/log/pgindexai` is created
+  via `sudo mkdir` (→ `root:root`), but the `chown` to the service user was
+  gated on the installer ITSELF being root (`id -u -eq 0`) — so a
+  regular-user `./install.sh` left the directory root-owned and the daemon
+  (systemd `User=<you>`) failed to open
+  `/var/log/pgindexai/index_operations.log` with EACCES ("Permission denied
+  (os error 13)" → "FILE LOGGING DISABLED until fixed"). The chown is now
+  unconditional (via `sudo`) and re-attributes any pre-existing root-owned
+  log file inside the directory.
+
 - **`install.sh`: fresh-install failures (reported from a real clean VM
   install) and re-run state bugs in the official Laya install:**
   - The model subdirectories (`encoder/`, `tokenizer/`) are now created

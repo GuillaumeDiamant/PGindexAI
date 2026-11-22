@@ -549,6 +549,17 @@ setup_role() {
     # superuser. Idempotent; without it the daemon degrades gracefully
     # (legacy bloat heuristic + a WARN per cycle, no DDL impact).
     run pg_psql -d "$TARGET_DB" -qc "GRANT pg_stat_scan_tables TO pgindexai"
+    # Full visibility of the workload in pg_stat_statements: the extension
+    # itself HIDES the query text (and queryid) of statements executed by
+    # ANOTHER role unless the viewer is a superuser or a member of the
+    # predefined role pg_read_all_stats (PG16 pg_stat_statements.c:
+    # is_allowed_role = has_privs_of_role(userid, ROLE_PG_READ_ALL_STATS)) —
+    # those rows then show up as the literal '<insufficient privilege>'
+    # placeholder. Without this grant, a workload run by any other role
+    # (e.g. postgres) is invisible to the daemon → 0 index proposals.
+    # pg_read_all_stats is a read-only predefined role (pg_stat_* views):
+    # the least privilege that gives full query-text visibility.
+    run pg_psql -d "$TARGET_DB" -qc "GRANT pg_read_all_stats TO pgindexai"
 
     # Ownership transfer (tables + indexes) to pgindexai — DEMO MODE ONLY:
     # the demo schema is created BY postgres and must be re-attributed so the
@@ -792,9 +803,17 @@ build_and_install() {
     step "Creating directories..."
     run mkdir -p "$PGINDEXAI_DIR" "$CONFIG_DIR"
     run sudo mkdir -p /var/log/pgindexai
-    if [[ "$(id -u)" -eq 0 ]]; then
-        run chown "$TARGET_USER" "$PGINDEXAI_DIR" "$CONFIG_DIR" /var/log/pgindexai
-    fi
+    # The log directory is created via sudo → it ends up root:root. The
+    # daemon runs as $TARGET_USER (systemd User=) and must write its audit
+    # log there — so the chown is UNCONDITIONAL. (The previous gate on the
+    # installer being root was silently skipped when the installer ran as a
+    # regular user with sudo, leaving the directory root-owned and the daemon
+    # failing with EACCES: "Permission denied (os error 13)" →
+    # "FILE LOGGING DISABLED until fixed".)
+    run sudo chown "$TARGET_USER" "$PGINDEXAI_DIR" "$CONFIG_DIR" /var/log/pgindexai
+    # Any pre-existing root-owned log file inside (e.g. left by a root run)
+    # is re-attributed too, otherwise the daemon cannot open it for writing.
+    run sudo find /var/log/pgindexai -maxdepth 1 -user root -exec chown "$TARGET_USER" {} +
     info "Directories ready"
 }
 

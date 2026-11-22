@@ -19,7 +19,7 @@ PGindexAI continuously monitors your PostgreSQL databases, detects unused and fr
 
 **Security hardening (audit)**:
 
-11. **Validated TLS** (rustls) on the PostgreSQL connection — chain + hostname **always** validated, optional `ssl_root_cert` (PEM), dedicated non-superuser role (`pgindexai`) with **peer** authentication (no password), **least-privilege grants** (no `SUPERUSER` — the physical bloat criterion uses the narrow `pg_stat_scan_tables` role, see 06-deployment)
+11. **Validated TLS** (rustls) on the PostgreSQL connection — chain + hostname **always** validated, optional `ssl_root_cert` (PEM), dedicated non-superuser role (`pgindexai`) with **peer** authentication (no password), **least-privilege grants** (no `SUPERUSER` — the physical bloat criterion uses the narrow `pg_stat_scan_tables` role and full `pg_stat_statements` query-text visibility the read-only `pg_read_all_stats` role, see 06-deployment)
 12. **Hardened installer** `install.sh` (no `eval`, targeted pg_hba (peer), `shared_preload_libraries` merge, 0600 config with no secret by default, hardened systemd unit) + **`--dry-run`** mode + idempotent **`uninstall.sh`** (`--purge`, `--clean-legacy`)
 13. **Proposal cap** per cycle (`max_proposals_per_cycle`), audit log rotation (0640, loud failures), config validation with unknown-key warnings, **CI** (fmt / clippy `-D warnings` / test / shellcheck)
 
@@ -142,6 +142,15 @@ but does not degrade).
 > `sudo -u postgres psql -d pgindexai_demo -c "GRANT pg_stat_scan_tables TO pgindexai;"`
 > (see 06-deployment). Without it, the probe fails per cycle (`WARN` +
 > fallback to criterion A) — detection and DDL keep working.
+>
+> **Permission (workload visibility):** `pg_stat_statements` itself HIDES the
+> query text (and queryid) of statements executed by ANOTHER role unless the
+> viewer is a superuser or a member of the read-only predefined role
+> `pg_read_all_stats` — those rows then show the literal
+> `<insufficient privilege>` placeholder. Without that grant, a workload run
+> by any other role (e.g. `postgres`) is invisible to the daemon → **0 index
+> proposals**. The installer grants it; manually:
+> `sudo -u postgres psql -d pgindexai_demo -c "GRANT pg_read_all_stats TO pgindexai;"`
 
 **Trigger threshold:** `score ≥ thresholds.fragmentation_pct` (default 70 %)
 
@@ -157,6 +166,9 @@ Filters:
   - !~ ^(CREATE|ALTER|DROP|DELETE|INSERT|UPDATE|BEGIN|COMMIT|...)
   - !~ ^(SELECT|WITH)[\s\S]*\y(pg_|information_schema\.)
      (PostgreSQL ARE: `\y` is the word boundary, `\b` a literal backspace)
+  - query <> '<insufficient privilege>'
+     (pg_stat_statements hides the text of another user's statements from
+     viewers without pg_read_all_stats — see 06-deployment)
   - multi-schema scope (analysis.schemas, new)
 
 Detected SARGable patterns (AST) — the operator AND the column's real
@@ -401,6 +413,12 @@ sudo -u postgres psql -c "CREATE ROLE pgindexai LOGIN;"
 # Least privilege for the physical bloat criterion (pgstattuple >= 1.5):
 # pgstatindex() needs the predefined pg_stat_scan_tables role — NOT superuser
 sudo -u postgres psql -d pgindexai_demo -c "GRANT pg_stat_scan_tables TO pgindexai;"
+# Full visibility of the workload in pg_stat_statements: the extension hides
+# the query TEXT of statements executed by another role unless the viewer is
+# a superuser or a member of pg_read_all_stats (they show up as the literal
+# '<insufficient privilege>' placeholder). Without it, a workload run by
+# another role is invisible to the daemon → 0 index proposals. Read-only role.
+sudo -u postgres psql -d pgindexai_demo -c "GRANT pg_read_all_stats TO pgindexai;"
 # pg_ident.conf — map the daemon OS user to the PG role:
 #   pgindexai_map  <your-user>  pgindexai
 # pg_hba.conf — TARGETED line (prepend): local  all  pgindexai  peer  map=pgindexai_map
