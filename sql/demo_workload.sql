@@ -35,16 +35,14 @@ SET pg_stat_statements.track = 'all';
 -- ─────────────────────────────────────────────
 DO $$
 BEGIN
-    RAISE NOTICE 'Demo workload: 9 steps simulating real application traffic, so the 3 detectors (unused indexes, fragmented indexes, missing / GIN-GIST indexes) have actual evidence to act on.';
-    RAISE NOTICE 'Screen: one explanation per step + final digests. demo_install.log: the full raw psql output of this run.';
+    RAISE NOTICE 'PGindexAI demo — phase 2 of 2: 9 steps of realistic traffic, creating the evidence the 3 detectors will rank on.';
 END $$;
 
 -- ─────────────────────────────────────────────
 -- Phase 0: User workload (generates pg_stat_statements)
 DO $$
 BEGIN
-    RAISE NOTICE '[1/9] Baseline user workload — ~3,450 queries across orders, customers, products, users and order_items';
-    RAISE NOTICE 'the same shapes a real app runs (value filters, date ranges, LIMIT pages). Fills pg_stat_statements: the raw material the missing-index detector ranks on.';
+    RAISE NOTICE '[1/9] Everyday app traffic: ~3,450 queries on orders, customers, products, users, line items (filters, date ranges, paging)';
 END $$;
 
 -- 0a: orders workload — shipping_method (NO INDEX, SARGable)
@@ -184,8 +182,7 @@ END $$;
 -- Phase 1: Client workload (order search)
 DO $$
 BEGIN
-    RAISE NOTICE '[2/9] Client order search — 5,000 per-customer lookups (last 90 days, newest first)';
-    RAISE NOTICE 'the "my orders" page. Gives the indexed columns (customer_id, order_date) real scan counts.';
+    RAISE NOTICE '[2/9] "My orders" page: 5,000 per-customer lookups (last 90 days) — real scan counts for the indexed columns';
 END $$;
 
 DO $$
@@ -205,8 +202,7 @@ END $$;
 -- Phase 2: Catalog workload (product search)
 DO $$
 BEGIN
-    RAISE NOTICE '[3/9] Catalog browsing — 16 product searches (8 categories × 2 query shapes)';
-    RAISE NOTICE 'storefront filters (category + price cap, price range + stock). Exercises idx_products_category / _price / _stock.';
+    RAISE NOTICE '[3/9] Storefront: 16 product searches (category + price cap, price range + stock filters)';
 END $$;
 
 DO $$
@@ -234,8 +230,7 @@ END $$;
 -- Phase 3: Admin workload (reports)
 DO $$
 BEGIN
-    RAISE NOTICE '[4/9] Admin reports — 30 days × 2 aggregation queries (orders + revenue per day, status breakdown)';
-    RAISE NOTICE 'the dashboard pattern: per-day GROUP BY on orders — typical management-report traffic.';
+    RAISE NOTICE '[4/9] Dashboards: 30 days of daily aggregates (order count, revenue, status breakdown)';
 END $$;
 
 DO $$
@@ -261,8 +256,7 @@ END $$;
 -- Phase 4: order_items workload
 DO $$
 BEGIN
-    RAISE NOTICE '[5/9] Order line items — 100 "view order" listings (order_items joined to products, quantity-ordered)';
-    RAISE NOTICE 'exercises idx_items_order and idx_items_product via the product join.';
+    RAISE NOTICE '[5/9] Order details: 100 "view order" listings (line items joined to products)';
 END $$;
 
 DO $$
@@ -282,8 +276,7 @@ END $$;
 -- Phase 5: Users workload
 DO $$
 BEGIN
-    RAISE NOTICE '[6/9] User administration — active-admin / recent-login digest, then up to 20 username prefix searches (LIKE "abc%%")';
-    RAISE NOTICE 'the user-administration screen: role-based lists + the search box.';
+    RAISE NOTICE '[6/9] Admin screens: active admins + recent logins, then ~20 username prefix searches';
 END $$;
 
 -- Digest: how many admins / recent logins (no row dump on screen)
@@ -318,9 +311,8 @@ END $$;
 -- Phase 6: Realistic fragmentation generation
 DO $$
 BEGIN
-    RAISE NOTICE '[7/9] Fragmentation — deliberately churning orders and order_items';
-    RAISE NOTICE '~350k row deletes + 100k inserts + a mass status UPDATE, then VACUUM FULL: the fragmentation detector will now find measurable B-tree holes/density.';
-    RAISE NOTICE 'Also creates idx_orders_temp_status, an index the workload never touches — a clean unused-index target.';
+    RAISE NOTICE '[7/9] Churn: ~350k deletes + 100k inserts + a mass UPDATE on orders/order_items, then VACUUM FULL — measurable fragmentation';
+    RAISE NOTICE 'plus idx_orders_temp_status, an index the workload never touches — a clean unused-index target';
 END $$;
 
 -- 6a: Massive row deletion (creates holes)
@@ -362,9 +354,7 @@ CREATE INDEX IF NOT EXISTS idx_orders_temp_status ON orders (status) WHERE statu
 -- Phase 7: Repetitive SARGable workload (pg_stat_statements)
 DO $$
 BEGIN
-    RAISE NOTICE '[8/9] Missing-index targets — 17,000 repeated parameterized queries (EXECUTE ... USING)';
-    RAISE NOTICE 'SARGable columns hit 1,000+ times each: shipping_method (5k — NO index), total_amount (3k — NO index), plus status / category / role / country (indexed).';
-    RAISE NOTICE 'Repetition + SARGability with no index = exactly what the missing-index detector looks for.';
+    RAISE NOTICE '[8/9] Hot paths: 17,000 repeated parameterized queries, several on columns WITHOUT an index — the missing-index targets';
 END $$;
 -- Use EXECUTE ... USING so that pg_stat_statements groups the queries
 
@@ -444,9 +434,7 @@ END $$;
 -- Phase 8: GIN/GIST workload (jsonb / array / range)
 DO $$
 BEGIN
-    RAISE NOTICE '[9/9] GIN/GIST targets — 5,000 containment & overlap queries';
-    RAISE NOTICE 'events.payload @> (jsonb, 2k) and events.tags && (array, 1.5k) → GIN candidates; bookings.period @> (int4range, 1.5k) → GIST candidate.';
-    RAISE NOTICE 'These columns intentionally have NO index — the detector should propose one.';
+    RAISE NOTICE '[9/9] Advanced types: 5,000 JSONB containment, array-overlap and date-range queries on events + bookings (deliberately unindexed) — the GIN/GIST targets';
 END $$;
 -- Triggers the GIN/GIST detector (detector #3, extended):
 --   events.payload @> {...}  → GIN (jsonb containment)
@@ -489,7 +477,7 @@ END $$;
 -- ─────────────────────────────────────────────
 -- End of workload
 -- ─────────────────────────────────────────────
-DO $$ BEGIN RAISE NOTICE 'Workload done — ANALYZE refreshes the planner statistics, then 3 digests summarise what each detector will see.'; END $$;
+DO $$ BEGIN RAISE NOTICE 'Phase 2 done — statistics refreshed (ANALYZE). What the daemon will now find:'; END $$;
 
 -- Force stats update
 ANALYZE;
@@ -522,7 +510,7 @@ BEGIN
     FROM pg_stat_user_indexes
     WHERE idx_scan = 0;
 
-    RAISE NOTICE 'Index usage: % of % indexes never scanned (% unused per detector #1), % reclaimable — largest: %',
+    RAISE NOTICE '   (1) unused     → % of % indexes never scanned (% drop candidates), % reclaimable — largest: %',
         n_zero, n_total, n_unused, pg_size_pretty(zero_bytes), top_names;
 END $$;
 
@@ -555,7 +543,7 @@ BEGIN
     ORDER BY c2.relpages DESC
     LIMIT 1;
 
-    RAISE NOTICE 'Fragmentation: % indexes on orders/order_items — largest: % (% rows/page)',
+    RAISE NOTICE '   (2) fragmented → % indexes on orders/order_items — largest: % (% rows/page)',
         n_frag, top_name, top_rpp;
 END $$;
 
@@ -586,7 +574,7 @@ BEGIN
         LIMIT 3
     ) s;
 
-    RAISE NOTICE 'SARGable: % tracked queries (>100 calls) — slowest: %',
+    RAISE NOTICE '   (3) missing    → % hot queries (>100 calls) ranked for missing indexes — slowest: %',
         n_tracked, top;
 END $$;
 

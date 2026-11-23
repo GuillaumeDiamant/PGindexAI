@@ -47,6 +47,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`install.sh` + `sql/`: the demo install narration is now plain
+  language — one short line per step, with the 3-detector legend up
+  front.** `demo_schema.sql` opens by naming the 3 problems the daemon
+  hunts for and what it does about each (`(1) unused indexes → DROP
+  them`, `(2) fragmented indexes → REBUILD them`, `(3) missing indexes
+  → CREATE them`); `demo_workload.sql` replaces its dense 2–3 line jargon
+  blocks (SARGable, B-tree holes, "detector #1") with one self-explanatory
+  line per phase (e.g. `[2/9] "My orders" page: 5,000 per-customer
+  lookups (last 90 days) — real scan counts for the indexed columns`). The
+  closing digests are re-labelled to map one-to-one to the legend —
+  `(1) unused →`, `(2) fragmented →`, `(3) missing →` — and the installer
+  step now reads `Installing the demo (schema + workload)`. One quietness
+  fix with the same goal: the idempotent drop of the 4 core tables is now
+  gated on the tables existing, so a fresh install no longer shows the
+  four `table "…" does not exist, skipping` notices — a real reinstall
+  still drops them. No digest computation or detector logic changed —
+  the daemon sees exactly the same conditions as before.
+
 - **`install.sh`: Laya is now a hard prerequisite, set up BEFORE the target
   database.** The installer now configures the Laya decision engine (binary
   + model + hardened `laya.service`) before creating the demo database or

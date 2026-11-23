@@ -1761,7 +1761,7 @@ start_daemon() {
 # Step 6: Demo (schema + workload)
 # ─────────────────────────────────────────────
 setup_demo() {
-    step "Installing the demo schema..."
+    step "Installing the demo (schema + workload)..."
     local repo_dir
     repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 

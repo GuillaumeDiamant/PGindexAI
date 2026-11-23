@@ -11,11 +11,17 @@ WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = 'pgindexai_demo')
 
 \c pgindexai_demo
 
--- Narration (screen output — see demo_psql in install.sh)
+-- Narration (screen output — see demo_psql in install.sh). One line per
+-- step, plain language: the 3-detector legend up front; the jargon stays
+-- in demo_install.log (raw output + comments).
 DO $$
 BEGIN
-    RAISE NOTICE 'Demo schema: 3 steps (extensions → tables + indexes → data). The full raw psql output of this run is kept in demo_install.log.';
-    RAISE NOTICE '[1/3] Extensions — pg_stat_statements (query stats → missing-index detector) and pgstattuple (physical density → fragmentation detector)';
+    RAISE NOTICE 'PGindexAI demo — phase 1 of 2: build the demo database (pgindexai_demo) from scratch.';
+    RAISE NOTICE 'The daemon hunts for 3 kinds of index problems; phase 2 will create the evidence for each:';
+    RAISE NOTICE '   (1) unused indexes     → DROP them (dead weight, slows writes)';
+    RAISE NOTICE '   (2) fragmented indexes → REBUILD them (bloated by churn)';
+    RAISE NOTICE '   (3) missing indexes    → CREATE them (hot queries, no index to help)';
+    RAISE NOTICE '[1/3] Extensions: pg_stat_statements (query statistics) + pgstattuple (page density) — the evidence sources for the detectors';
 END $$;
 
 -- ── Extension: pg_stat_statements (required by the SARGable detector) ────
@@ -35,9 +41,18 @@ CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
 CREATE EXTENSION IF NOT EXISTS pgstattuple;
 
 -- ── Table: customers ─────────────────────────────────────────────────────
-DO $$ BEGIN RAISE NOTICE '[2/3] Tables & indexes — 7 tables, 25 indexes: orders / order_items / customers / products / users, plus events (jsonb + tags) and bookings (int4range) left WITHOUT GIN/GIST indexes on purpose'; END $$;
+DO $$ BEGIN RAISE NOTICE '[2/3] Tables & indexes: 7 tables, 25 indexes — orders, customers, products, order_items, users, plus events (JSONB) and bookings (date ranges)'; END $$;
 
-DROP TABLE IF EXISTS orders, products, order_items, users CASCADE;
+-- Drop only when present: on a fresh database the unconditional
+-- `DROP TABLE IF EXISTS` would emit four "does not exist, skipping"
+-- notices on screen (noise); gating on existence keeps that path silent
+-- while a real reinstall still drops the old tables.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_tables WHERE tablename IN ('orders','products','order_items','users')) THEN
+        EXECUTE 'DROP TABLE IF EXISTS orders, products, order_items, users CASCADE';
+    END IF;
+END $$;
 
 CREATE TABLE customers (
     id          SERIAL       PRIMARY KEY,
@@ -143,7 +158,7 @@ CREATE TABLE bookings (
 -- Intentionally NO index on period (GIST candidate).
 
 -- ── Data: customers ──────────────────────────────────────────────────────
-DO $$ BEGIN RAISE NOTICE '[3/3] Data — 10,000 customers, 5,000 products, 200,000 orders, 500,000 line items, 2,000 users, 30,000 events, 20,000 bookings, then ANALYZE'; END $$;
+DO $$ BEGIN RAISE NOTICE '[3/3] Data: ~800,000 rows across the 7 tables (per-table counts in the log), then a statistics refresh (ANALYZE)'; END $$;
 
 INSERT INTO customers (email, first_name, last_name, country, city)
 SELECT
@@ -255,6 +270,6 @@ BEGIN
       INTO n_indexes, idx_bytes
       FROM pg_stat_user_indexes;
 
-    RAISE NOTICE 'Schema: % tables, % rows, % indexes, %',
+    RAISE NOTICE 'Phase 1 done: % tables, % rows, % indexes, %',
         n_tables, total_rows, n_indexes, pg_size_pretty(idx_bytes);
 END $$;
