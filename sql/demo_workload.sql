@@ -14,8 +14,8 @@
                  messages) in demo_install.log, next to install.sh —
                  strictly more detailed than the screen;
       * spinner → while psql is silent (e.g. the long [8/9] phase), an
-                  ASCII activity spinner (|/-\ + elapsed time) ticks on
-                  screen — TTY only, never written to the log.
+                  ASCII activity spinner (|/-\ + a braced {mm:ss} badge)
+                  ticks on screen — TTY only, never written to the log.
    ============================================================================ */
 
 -- ─────────────────────────────────────────────

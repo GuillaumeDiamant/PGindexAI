@@ -308,9 +308,9 @@ psql_stdin() {
 #   * screen → only the curated NOTICE/WARNING/ERROR lines (per-step
 #              explanations + digests), the server prefix stripped; while
 #              psql is silent (e.g. the long [8/9] phase) an ASCII activity
-#              spinner (|/-\ + elapsed time) keeps ticking so the run
-#              visibly works — it never reaches the log, and only shows
-#              when stdout is a terminal.
+#              spinner (|/-\ + a braced {mm:ss} badge on its own tabstop)
+#              keeps ticking so the run visibly works — it never reaches
+#              the log, and only shows when stdout is a terminal.
 # The connection mirrors pg_psql (password vs. peer mode). `stdbuf -oL`
 # (coreutils, optional) keeps psql's stdout line-buffered so the raw log
 # interleaves with the server messages in execution order.
@@ -378,9 +378,10 @@ demo_psql() {
 
     # ── Terminal: the pipeline runs in the background; its filtered output
     # flows through a FIFO that this foreground process consumes line by
-    # line, drawing the activity spinner (|/-\ + elapsed time) in the gaps.
-    # One process owns the screen, so the spinner never interleaves with the
-    # output lines — and it never reaches demo_install.log.
+    # line, drawing the activity spinner (|/-\ + a braced {mm:ss} badge)
+    # in the gaps. One process owns the screen, so the spinner never
+    # interleaves with the output lines — and it never reaches
+    # demo_install.log.
     local tmpd fifo rcfile pipe_pid
     tmpd="$(mktemp -d "${TMPDIR:-/tmp}/pgindexai.XXXXXX")"
     fifo="$tmpd/screen"
@@ -424,10 +425,19 @@ demo_psql() {
             break
         fi
         idx=$(( (idx + 1) % 4 ))
-        printf '\r\033[K  %s %s... %s elapsed' "${frames:idx:1}" "$label" "$(_demo_mmss $(( $(date +%s) - t0 )))"
+        # The elapsed badge sits on its own tabstop, wrapped in braces, so
+        # the in-place re-draw never visually merges the counter with the
+        # step label or with the next output line (narrow terminals,
+        # incomplete erase-to-end-of-line support).
+        printf '\r\033[K  %s %s...\t{ %s }' "${frames:idx:1}" "$label" "$(_demo_mmss $(( $(date +%s) - t0 )))"
         printed=1
     done
-    # Writer is done: drain whatever is left in the FIFO.
+    # Writer is done: drain whatever is left in the FIFO. Clear the
+    # spinner first so a leftover line can never land on top of it.
+    if (( printed )); then
+        printf '\r\033[K'
+        printed=0
+    fi
     while IFS= read -r line <&3; do
         printf '%s\n' "$line"
     done

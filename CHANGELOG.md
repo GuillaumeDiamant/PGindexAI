@@ -47,6 +47,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`install.sh`: the demo spinner's elapsed time no longer blends with
+  the step label.** The TTY-only activity spinner now renders the
+  duration as a braced `{ mm:ss }` badge on its own tabstop (instead of
+  a trailing `mm:ss elapsed` glued to the label), and the FIFO drain now
+  clears the spinner before printing any remaining line — so the counter
+  stays visually isolated, even in narrow terminals or with incomplete
+  erase-to-end-of-line support.
+
 - **`install.sh`: every step that needs sudo now explains why, before the
   first privileged call.** A new `sudo_note()` helper prints a one-line
   `[sudo]` reason at the top of each sudo-using step, so a password prompt

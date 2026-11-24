@@ -253,8 +253,8 @@ ANALYZE bookings;
 -- on screen and keeps the FULL raw psql output (command tags, server
 -- messages, everything) in demo_install.log next to install.sh — the log
 -- is strictly more detailed than the screen. While psql is silent, an
--- ASCII activity spinner (|/-\ + elapsed time) ticks on screen — TTY
--- only, never written to the log.
+-- ASCII activity spinner (|/-\ + a braced {mm:ss} badge) ticks on
+-- screen — TTY only, never written to the log.
 DO $$
 DECLARE
     n_tables   INT;
