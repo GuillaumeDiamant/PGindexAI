@@ -11,8 +11,10 @@
     Output split (driven by install.sh `demo_psql`):
       * screen → only the explanatory NOTICE lines (progress + digests);
       * log    → the FULL raw psql output (every command tag, all server
-                 messages) in demo_install.log, next to install.sh —
-                 strictly more detailed than the screen;
+                 messages) plus a `▸` annotation line before each statement,
+                 per-section timing trailers and a closing run summary, in
+                 demo_install.log next to install.sh — strictly more
+                 detailed than the screen;
       * spinner → while psql is silent (e.g. the long [8/9] phase), an
                   ASCII activity spinner (|/-\ + a braced {mm:ss} badge)
                   ticks on screen — TTY only, never written to the log.
@@ -28,6 +30,7 @@
 -- detector would see nothing. `track = all` records them too. Requires
 -- superuser (this demo runs as the `postgres` superuser). Without it,
 -- detector #3 is blind to the workload.
+\echo ▸ session: pg_stat_statements.track = 'all' (record inner queries too — superuser only)
 SET pg_stat_statements.track = 'all';
 
 -- ─────────────────────────────────────────────
@@ -46,6 +49,7 @@ BEGIN
 END $$;
 
 -- 1a: orders workload — shipping_method (NO INDEX, SARGable)
+\echo ▸ [1a] 200 queries: orders by shipping_method — NO index (SARGable, detector #3)
 DO $$
 DECLARE
     methods TEXT[] := ARRAY['standard','express','overnight','pickup'];
@@ -64,6 +68,7 @@ BEGIN
 END $$;
 
 -- 1b: orders workload — total_amount (NO INDEX, SARGable)
+\echo ▸ [1b] 500 queries: orders by total_amount — NO index (SARGable, detector #3)
 DO $$
 DECLARE
     i INT;
@@ -78,6 +83,7 @@ BEGIN
 END $$;
 
 -- 1c: orders workload — order_date direct filter (NO INDEX)
+\echo ▸ [1c] 500 queries: orders by order_date range — NO index
 DO $$
 DECLARE
     i INT;
@@ -92,6 +98,7 @@ BEGIN
 END $$;
 
 -- 1d: customers workload — country (INDEX exists)
+\echo ▸ [1d] 300 queries: customers by country (indexed)
 DO $$
 DECLARE
     countries TEXT[] := ARRAY['France','Germany','Spain','Italy','Netherlands','Belgium'];
@@ -110,6 +117,7 @@ BEGIN
 END $$;
 
 -- 1e: products workload — category (INDEX exists)
+\echo ▸ [1e] 800 queries: products by category + price cap (indexed)
 DO $$
 DECLARE
     cats TEXT[] := ARRAY['Electronics','Clothing','Food','Books','Sports','Home','Toys','Beauty'];
@@ -129,6 +137,7 @@ BEGIN
 END $$;
 
 -- 1f: users workload — role (INDEX exists)
+\echo ▸ [1f] 300 queries: active users by role (indexed)
 DO $$
 DECLARE
     roles TEXT[] := ARRAY['admin','user','moderator'];
@@ -148,6 +157,7 @@ BEGIN
 END $$;
 
 -- 1g: order_items workload — product_id (INDEX exists)
+\echo ▸ [1g] 500 queries: order_items by product_id (indexed)
 DO $$
 DECLARE
     i INT;
@@ -161,6 +171,7 @@ BEGIN
 END $$;
 
 -- 1h: orders workload — status (INDEX exists)
+\echo ▸ [1h] 250 queries: orders by status (indexed)
 DO $$
 DECLARE
     statuses TEXT[] := ARRAY['pending','confirmed','shipped','delivered','cancelled'];
@@ -185,6 +196,7 @@ BEGIN
     RAISE NOTICE '[2/9] "My orders" page: 5,000 per-customer lookups (last 90 days) — real scan counts for the indexed columns';
 END $$;
 
+\echo ▸ [2/9] 5,000 queries: per-customer 'my orders' (last 90 days, customer_id indexed)
 DO $$
 DECLARE
     c INT;
@@ -205,6 +217,7 @@ BEGIN
     RAISE NOTICE '[3/9] Storefront: 16 product searches (category + price cap, price range + stock filters)';
 END $$;
 
+\echo ▸ [3/9] 16 queries: product searches (category + price cap, price range + stock)
 DO $$
 DECLARE
     cat TEXT;
@@ -233,6 +246,7 @@ BEGIN
     RAISE NOTICE '[4/9] Dashboards: 30 days of daily aggregates (order count, revenue, status breakdown)';
 END $$;
 
+\echo ▸ [4/9] 60 queries: 30 days × 2 aggregates (count + revenue, status breakdown)
 DO $$
 DECLARE
     d DATE;
@@ -259,6 +273,7 @@ BEGIN
     RAISE NOTICE '[5/9] Order details: 100 "view order" listings (line items joined to products)';
 END $$;
 
+\echo ▸ [5/9] 100 queries: order line items joined to products
 DO $$
 DECLARE
     oid INT;
@@ -295,6 +310,7 @@ BEGIN
         n_admin, n_recent;
 END $$;
 
+\echo ▸ [6/9] 20 queries: username prefix searches (LIKE 'xxx%')
 DO $$
 DECLARE
     prefix TEXT;
@@ -316,10 +332,13 @@ BEGIN
 END $$;
 
 -- 7a: Massive row deletion (creates holes)
+\echo ▸ [7/9] churn: DELETE ~300k order_items (holes → fragmentation)
 DELETE FROM order_items WHERE order_id < 100000;
+\echo ▸ [7/9] churn: DELETE ~100k orders
 DELETE FROM orders WHERE id < 100000;
 
 -- 7b: Massive insertion (low fill factor → fragmentation)
+\echo ▸ [7/9] churn: INSERT 50,000 orders (low fill factor → bloat)
 INSERT INTO orders (customer_id, order_date, status, total_amount, shipping_method)
 SELECT
     1 + (g % 10000),
@@ -330,6 +349,7 @@ SELECT
 FROM generate_series(1, 50000) g;
 
 -- 7c : INSERT order_items
+\echo ▸ [7/9] churn: INSERT 50,000 order_items
 INSERT INTO order_items (order_id, product_id, quantity, unit_price, discount)
 SELECT
     100000 + g,
@@ -340,14 +360,18 @@ SELECT
 FROM generate_series(1, 50000) g;
 
 -- 7d: Massive UPDATE (modifies indexes in place → fragmentation)
+\echo ▸ [7/9] churn: mass UPDATE on orders.status (in-place index churn)
 UPDATE orders SET status = 'delivered'
 WHERE status = 'pending' AND order_date < NOW() - interval '30 days';
 
 -- 7e: VACUUM FULL to measure density afterwards (default fill factor = 100)
+\echo ▸ [7/9] VACUUM FULL orders (repack → measurable leaf density)
 VACUUM FULL orders;
+\echo ▸ [7/9] VACUUM FULL order_items
 VACUUM FULL order_items;
 
 -- 7f: Create an index that will be unused (DROP target)
+\echo ▸ [7/9] index idx_orders_temp_status (partial, status='pending') — detector #1 target: never scanned
 CREATE INDEX IF NOT EXISTS idx_orders_temp_status ON orders (status) WHERE status = 'pending';
 
 -- ─────────────────────────────────────────────
@@ -360,6 +384,7 @@ END $$;
 
 -- 8a: 5000 identical queries on shipping_method (NO INDEX, SARGable)
 --     → PRIMARY TARGET: must reach >5000 calls
+\echo ▸ [8a] 5,000 identical queries: orders by shipping_method — NO index (PRIMARY missing-index target)
 DO $$
 DECLARE
     j INT;
@@ -372,6 +397,7 @@ END $$;
 
 -- 8b: 3000 identical queries on status (INDEX exists but we force the scan)
 --     → must reach >3000 calls
+\echo ▸ [8b] 3,000 identical queries: orders by status (index forced to scan)
 DO $$
 DECLARE
     j INT;
@@ -384,6 +410,7 @@ END $$;
 
 -- 8c: 3000 identical queries on category (INDEX exists)
 --     → must reach >3000 calls
+\echo ▸ [8c] 3,000 identical queries: products by category (indexed)
 DO $$
 DECLARE
     j INT;
@@ -396,6 +423,7 @@ END $$;
 
 -- 8d: 2000 identical queries on role (INDEX exists)
 --     → must reach >2000 calls
+\echo ▸ [8d] 2,000 identical queries: users by role (indexed)
 DO $$
 DECLARE
     j INT;
@@ -408,6 +436,7 @@ END $$;
 
 -- 8e: 3000 identical queries on total_amount (NO INDEX, SARGable)
 --     → SECONDARY TARGET: must reach >3000 calls
+\echo ▸ [8e] 3,000 identical queries: orders by total_amount — NO index (SECONDARY target)
 DO $$
 DECLARE
     j INT;
@@ -420,6 +449,7 @@ END $$;
 
 -- 8f: 1000 identical queries on country (INDEX exists)
 --     → must reach >1000 calls
+\echo ▸ [8f] 1,000 identical queries: customers by country (indexed)
 DO $$
 DECLARE
     j INT;
@@ -442,6 +472,7 @@ END $$;
 --   bookings.period @> range → GIST (range containment)
 
 -- 9a: 2000 jsonb containment queries (GIN target — events.payload, NO INDEX)
+\echo ▸ [9a] 2,000 queries: events payload @> (JSONB — GIN target, no index)
 DO $$
 DECLARE
     j INT;
@@ -453,6 +484,7 @@ BEGIN
 END $$;
 
 -- 9b: 1500 array overlap queries (GIN target — events.tags, NO INDEX)
+\echo ▸ [9b] 1,500 queries: events tags && (array — GIN target, no index)
 DO $$
 DECLARE
     j INT;
@@ -464,6 +496,7 @@ BEGIN
 END $$;
 
 -- 9c: 1500 range containment queries (GIST target — bookings.period, NO INDEX)
+\echo ▸ [9c] 1,500 queries: bookings period @> (range — GIST target, no index)
 DO $$
 DECLARE
     j INT;
@@ -480,11 +513,13 @@ END $$;
 DO $$ BEGIN RAISE NOTICE 'Phase 2 done — statistics refreshed (ANALYZE). What the daemon will now find:'; END $$;
 
 -- Force stats update
+\echo ▸ statistics: ANALYZE (refresh counters after the churn)
 ANALYZE;
 
 -- ─────────────────────────────────────────────
 -- Report: index usage (unused = DROP target) — digest
 -- ─────────────────────────────────────────────
+\echo ▸ report #1: unused-index digest (screen only)
 DO $$
 DECLARE
     n_total   INT;
@@ -517,6 +552,7 @@ END $$;
 -- ─────────────────────────────────────────────
 -- Report: fragmentation (actual density via pg_class) — digest
 -- ─────────────────────────────────────────────
+\echo ▸ report #2: fragmentation digest (screen only)
 DO $$
 DECLARE
     n_frag   INT;
@@ -550,6 +586,7 @@ END $$;
 -- ─────────────────────────────────────────────
 -- Report: SARGable queries (pg_stat_statements) — digest
 -- ─────────────────────────────────────────────
+\echo ▸ report #3: missing-index digest (screen only)
 DO $$
 DECLARE
     n_tracked INT;

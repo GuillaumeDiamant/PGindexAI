@@ -108,6 +108,10 @@ CONFIG_FILE="$CONFIG_DIR/PGindexAI.yaml"
 BIN_PATH="/usr/local/bin/pgindexai"
 SERVICE_NAME="pgindexai"
 DEMO_LOG="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/demo_install.log"  # full raw psql output of the demo install — in the directory containing install.sh
+# Bookend state for demo_install.log (see demo_psql / _demo_run_summary):
+DEMO_SECTION_STATS=()  # "label|mm:ss|exit" per demo section — feeds the run summary
+DEMO_RUN_T0=""         # epoch of the first demo section (set by demo_psql)
+DEMO_RUN_T0_STR=""     # same, human-readable, captured once at the start
 LAYA_SERVICE_NAME="laya"   # Laya decision engine (REQUIRED — must be up before the database steps)
 LAYA_PORT=8080
 LAYA_BACKEND="${LAYA_BACKEND:-}"   # optional override: 'cuda12' | 'vulkan' (default: auto-detect)
@@ -339,8 +343,16 @@ demo_psql() {
             echo -e "${CYAN}[dry-run]${NC} sudo -u $POSTGRES_USER psql -v ON_ERROR_STOP=1 -d $TARGET_DB < $file   (peer mode)"
         fi
         echo -e "${CYAN}[dry-run]${NC} screen: NOTICE/WARNING/ERROR lines only (explanations + digests)"
-        echo -e "${CYAN}[dry-run]${NC} log: full raw psql output -> $DEMO_LOG"
+        echo -e "${CYAN}[dry-run]${NC} log: full raw psql output + per-section timing + run summary -> $DEMO_LOG"
         return 0
+    fi
+    # Section clock (for the log trailer) — and, on the first section, the
+    # run clock for the final summary.
+    local t_start
+    t_start="$(date +%s)"
+    if [[ -z "${DEMO_RUN_T0:-}" ]]; then
+        DEMO_RUN_T0="$t_start"
+        DEMO_RUN_T0_STR="$(date '+%Y-%m-%d %H:%M:%S')"
     fi
     # Screen filter: server messages only (the curated NOTICEs, warnings,
     # errors), prefix stripped — see _demo_filter. It always exits 0, so
@@ -360,14 +372,15 @@ demo_psql() {
 
     # ── No terminal: plain streaming (a spinner would corrupt piped output) ──
     if [[ ! -t 1 ]]; then
+        local rc=0
         if [[ $use_tee -eq 1 ]]; then
-            if "${cmd[@]}" -v ON_ERROR_STOP=1 -d "$TARGET_DB" < "$file" 2>&1 | tee -a "$DEMO_LOG" | "${filt[@]}"; then
-                return 0
-            fi
+            "${cmd[@]}" -v ON_ERROR_STOP=1 -d "$TARGET_DB" < "$file" 2>&1 | tee -a "$DEMO_LOG" | "${filt[@]}" || rc=$?
         else
-            if "${cmd[@]}" -v ON_ERROR_STOP=1 -d "$TARGET_DB" < "$file" 2>&1 | "${filt[@]}"; then
-                return 0
-            fi
+            "${cmd[@]}" -v ON_ERROR_STOP=1 -d "$TARGET_DB" < "$file" 2>&1 | "${filt[@]}" || rc=$?
+        fi
+        _demo_section_close "$label" "$(_demo_mmss $(( $(date +%s) - t_start )))" "$rc" "$use_tee"
+        if [[ "$rc" -eq 0 ]]; then
+            return 0
         fi
         warn "psql failed ($label) — last 20 lines of the raw output:"
         if [[ $use_tee -eq 1 ]]; then
@@ -409,8 +422,10 @@ demo_psql() {
     exec 3< "$fifo"
 
     local frames='|/-\' idx=0 printed=0 line
+    # One clock for the badge and the section trailer: the spinner's
+    # elapsed time IS the section's elapsed time.
     local t0
-    t0="$(date +%s)"
+    t0="$t_start"
     while :; do
         if IFS= read -r -t 0.5 line <&3; then
             if (( printed )); then
@@ -450,6 +465,7 @@ demo_psql() {
     rc="$(cat "$rcfile" 2>/dev/null || echo 1)"
     rm -rf "$tmpd"
     trap - EXIT
+    _demo_section_close "$label" "$(_demo_mmss $(( $(date +%s) - t_start )))" "$rc" "$use_tee"
     if [[ "$rc" == "0" ]]; then
         return 0
     fi
@@ -484,6 +500,62 @@ _demo_filter() {
 # _demo_mmss SECONDS — format a duration as M:SS (activity spinner).
 _demo_mmss() {
     printf '%d:%02d' $(( $1 / 60 )) $(( $1 % 60 ))
+}
+
+# _demo_section_close LABEL DUR MMSS RC USE_TEE — close a demo section in
+# demo_install.log: one trailer line (finished/FAILED + duration + exit),
+# then record the stats for the final run summary. The trailer is LOG-ONLY
+# (the screen already has the info/warn lines); when capture is disabled
+# (USE_TEE=0), only the stats are recorded.
+_demo_section_close() {
+    local label="$1" dur="$2" rc="$3" use_tee="$4"
+    if [[ "$use_tee" -eq 1 ]]; then
+        if [[ "$rc" -eq 0 ]]; then
+            printf '\n--- %s — finished in %s (exit 0) ---\n' "$label" "$dur" >> "$DEMO_LOG"
+        else
+            printf '\n--- %s — FAILED after %s (exit %s) ---\n' "$label" "$dur" "$rc" >> "$DEMO_LOG"
+        fi
+    fi
+    DEMO_SECTION_STATS+=("$label|$dur|$rc")
+    return 0
+}
+
+# _demo_run_summary — append the end-of-run summary block to demo_install.log
+# (start/finish, per-section durations, overall status). Log-only, like the
+# section trailers. No-op when no section ran (dry-run, or the demo was
+# skipped because the schema was already installed) or the log directory is
+# not writable.
+_demo_run_summary() {
+    if [[ ${#DEMO_SECTION_STATS[@]} -eq 0 ]]; then
+        return 0
+    fi
+    local log_dir
+    log_dir="$(dirname "$DEMO_LOG")"
+    if [[ ! -d "$log_dir" || ! -w "$log_dir" ]]; then
+        return 0
+    fi
+    local now now_str dur label rc status="OK"
+    now="$(date +%s)"
+    now_str="$(date '+%Y-%m-%d %H:%M:%S')"
+    for entry in "${DEMO_SECTION_STATS[@]}"; do
+        rc="${entry##*|}"
+        if [[ "$rc" != "0" ]]; then
+            status="FAILED (${entry%%|*}, exit ${rc})"
+        fi
+    done
+    {
+        printf '\n=== PGindexAI demo install — run summary ===\n'
+        printf '  started : %s\n' "${DEMO_RUN_T0_STR}"
+        printf '  finished: %s   (total %s)\n' "$now_str" "$(_demo_mmss $(( now - DEMO_RUN_T0 )))"
+        for entry in "${DEMO_SECTION_STATS[@]}"; do
+            label="${entry%%|*}"
+            rc="${entry##*|}"
+            dur="${entry#*|}"; dur="${dur%%|*}"
+            printf '  %-8s: %-5s (exit %s)\n' "$label" "$dur" "$rc"
+        done
+        printf '  status  : %s\n' "$status"
+    } >> "$DEMO_LOG"
+    return 0
 }
 
 # ask "question" [default Y|N] — reads /dev/tty (works even via curl | bash),
@@ -1834,7 +1906,10 @@ setup_demo() {
                 warn "Partial demo workload — the workload SQL failed (see psql output above)"
             fi
         fi
-        info "Full raw psql output (more detail than the screen): $DEMO_LOG"
+        # Close the log with the run summary (start/finish, per-section
+        # durations, overall status) — log-only, like the section trailers.
+        _demo_run_summary
+        info "Full raw psql output + per-section timing + run summary (more detail than the screen): $DEMO_LOG"
     else
         info "Demo schema already installed"
     fi

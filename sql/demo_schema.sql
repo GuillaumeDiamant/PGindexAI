@@ -13,7 +13,9 @@ WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = 'pgindexai_demo')
 
 -- Narration (screen output — see demo_psql in install.sh). One line per
 -- step, plain language: the 3-detector legend up front; the jargon stays
--- in demo_install.log (raw output + comments).
+-- in demo_install.log: the full raw psql output, a `▸` annotation line
+-- before every statement (log-only), per-section timing trailers and a
+-- closing run summary — strictly more detailed than the screen.
 DO $$
 BEGIN
     RAISE NOTICE 'PGindexAI demo — phase 1 of 2: build the demo database (pgindexai_demo) from scratch.';
@@ -28,6 +30,7 @@ END $$;
 -- Prerequisite: pg_stat_statements in shared_preload_libraries + a PostgreSQL
 -- restart (install.sh does this automatically). No-op if already present.
 -- Without it, the daemon runs in DEGRADED mode (missing-index detection off).
+\echo ▸ extension pg_stat_statements — query statistics, evidence source for detector #3
 CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
 
 -- ── Extension: pgstattuple (optional, used by the fragmentation detector) ─
@@ -38,6 +41,7 @@ CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
 -- fragmentation detector").
 -- Note: since pgstattuple 1.5, calling pgstatindex() requires SUPERUSER or
 -- membership in pg_stat_scan_tables (the test config connects as postgres).
+\echo ▸ extension pgstattuple — B-tree leaf density, evidence source for detector #2
 CREATE EXTENSION IF NOT EXISTS pgstattuple;
 
 -- ── Table: customers ─────────────────────────────────────────────────────
@@ -47,6 +51,7 @@ DO $$ BEGIN RAISE NOTICE '[2/3] Tables & indexes: 7 tables, 25 indexes — order
 -- `DROP TABLE IF EXISTS` would emit four "does not exist, skipping"
 -- notices on screen (noise); gating on existence keeps that path silent
 -- while a real reinstall still drops the old tables.
+\echo ▸ cleanup: drop the demo tables if a previous demo run left them (silent on a fresh DB)
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_tables WHERE tablename IN ('orders','products','order_items','users')) THEN
@@ -54,6 +59,7 @@ BEGIN
     END IF;
 END $$;
 
+\echo ▸ table customers (8 cols)
 CREATE TABLE customers (
     id          SERIAL       PRIMARY KEY,
     email       VARCHAR(255) NOT NULL UNIQUE,
@@ -65,11 +71,15 @@ CREATE TABLE customers (
     updated_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 
+\echo ▸ index idx_customers_country (customers.country)
 CREATE INDEX idx_customers_country ON customers(country);
+\echo ▸ index idx_customers_city (customers.city)
 CREATE INDEX idx_customers_city    ON customers(city);
+\echo ▸ index idx_customers_email (customers.email)
 CREATE INDEX idx_customers_email   ON customers(email);
 
 -- ── Table: products ──────────────────────────────────────────────────────
+\echo ▸ table products (9 cols)
 CREATE TABLE products (
     id          SERIAL       PRIMARY KEY,
     sku         VARCHAR(50)  NOT NULL UNIQUE,
@@ -82,12 +92,17 @@ CREATE TABLE products (
     created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 
+\echo ▸ index idx_products_category (products.category)
 CREATE INDEX idx_products_category ON products(category);
+\echo ▸ index idx_products_sku (products.sku)
 CREATE INDEX idx_products_sku       ON products(sku);
+\echo ▸ index idx_products_price (products.price)
 CREATE INDEX idx_products_price     ON products(price);
+\echo ▸ index idx_products_stock (products.stock_qty)
 CREATE INDEX idx_products_stock     ON products(stock_qty);
 
 -- ── Table: orders ────────────────────────────────────────────────────────
+\echo ▸ table orders (8 cols)
 CREATE TABLE orders (
     id              SERIAL       PRIMARY KEY,
     customer_id     INT          NOT NULL REFERENCES customers(id),
@@ -100,13 +115,17 @@ CREATE TABLE orders (
 );
 
 -- Index that will become unused
+\echo ▸ index idx_orders_status (orders.status) — detector #1 target: will go unused
 CREATE INDEX idx_orders_status ON orders(status);
 
 -- Fragmented index (will be rebuilt by the daemon)
+\echo ▸ index idx_orders_date (orders.order_date) — detector #2 target: will get fragmented
 CREATE INDEX idx_orders_date   ON orders(order_date);
+\echo ▸ index idx_orders_customer (orders.customer_id)
 CREATE INDEX idx_orders_customer ON orders(customer_id);
 
 -- ── Table: order_items ───────────────────────────────────────────────────
+\echo ▸ table order_items (7 cols)
 CREATE TABLE order_items (
     id          SERIAL       PRIMARY KEY,
     order_id    INT          NOT NULL REFERENCES orders(id),
@@ -117,11 +136,15 @@ CREATE TABLE order_items (
     created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 
+\echo ▸ index idx_items_order (order_items.order_id)
 CREATE INDEX idx_items_order   ON order_items(order_id);
+\echo ▸ index idx_items_product (order_items.product_id)
 CREATE INDEX idx_items_product ON order_items(product_id);
+\echo ▸ index idx_items_date (order_items.created_at)
 CREATE INDEX idx_items_date    ON order_items(created_at);
 
 -- ── Table: users (to simulate sessions) ──────────────────────────────────
+\echo ▸ table users (6 cols)
 CREATE TABLE users (
     id          SERIAL       PRIMARY KEY,
     username    VARCHAR(80)  NOT NULL UNIQUE,
@@ -131,12 +154,15 @@ CREATE TABLE users (
     created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 
+\echo ▸ index idx_users_role (users.role)
 CREATE INDEX idx_users_role ON users(role);
+\echo ▸ index idx_users_login (users.last_login)
 CREATE INDEX idx_users_login ON users(last_login);
 
 -- ── Table: events (GIN target — jsonb payload + text[] tags) ─────────────
 -- NO index on payload / tags: the SARGable detector should propose a GIN
 -- index when the workload filters with `@>` (containment) / `&&` (overlap).
+\echo ▸ table events (5 cols) — no GIN index on payload/tags (deliberate: detector #3 candidate)
 CREATE TABLE events (
     id          SERIAL       PRIMARY KEY,
     type        VARCHAR(40)  NOT NULL DEFAULT 'generic',
@@ -149,6 +175,7 @@ CREATE TABLE events (
 -- ── Table: bookings (GIST target — int4range period) ─────────────────────
 -- NO index on period: the detector should propose a GIST index when the
 -- workload filters with `period @> <range>` (range containment).
+\echo ▸ table bookings (4 cols) — no GIST index on period (deliberate: detector #3 candidate)
 CREATE TABLE bookings (
     id          SERIAL       PRIMARY KEY,
     room        VARCHAR(40)  NOT NULL DEFAULT 'A1',
@@ -160,6 +187,7 @@ CREATE TABLE bookings (
 -- ── Data: customers ──────────────────────────────────────────────────────
 DO $$ BEGIN RAISE NOTICE '[3/3] Data: ~800,000 rows across the 7 tables (per-table counts in the log), then a statistics refresh (ANALYZE)'; END $$;
 
+\echo ▸ data: customers — 10,000 rows
 INSERT INTO customers (email, first_name, last_name, country, city)
 SELECT
     'user' || g || '@example.com',
@@ -170,6 +198,7 @@ SELECT
 FROM generate_series(1, 10000) g;
 
 -- ── Data: products ───────────────────────────────────────────────────────
+\echo ▸ data: products — 5,000 rows
 INSERT INTO products (sku, name, category, price, cost, stock_qty, is_active)
 SELECT
     'SKU-' || LPAD(g::text, 6, '0'),
@@ -182,6 +211,7 @@ SELECT
 FROM generate_series(1, 5000) g;
 
 -- ── Data: orders ─────────────────────────────────────────────────────────
+\echo ▸ data: orders — 200,000 rows
 INSERT INTO orders (customer_id, order_date, status, total_amount, shipping_method)
 SELECT
     1 + (g % 10000),
@@ -192,6 +222,7 @@ SELECT
 FROM generate_series(1, 200000) g;
 
 -- ── Data: order_items ────────────────────────────────────────────────────
+\echo ▸ data: order_items — 500,000 rows
 INSERT INTO order_items (order_id, product_id, quantity, unit_price, discount)
 SELECT
     1 + (g % 200000),
@@ -202,6 +233,7 @@ SELECT
 FROM generate_series(1, 500000) g;
 
 -- ── Data: users ──────────────────────────────────────────────────────────
+\echo ▸ data: users — 2,000 rows
 INSERT INTO users (username, role, last_login, is_active)
 SELECT
     'user' || g,
@@ -211,6 +243,7 @@ SELECT
 FROM generate_series(1, 2000) g;
 
 -- ── Data: events (jsonb + array payload) ─────────────────────────────────
+\echo ▸ data: events — 30,000 rows (JSONB payload + text[] tags)
 INSERT INTO events (type, payload, tags, occurred_at)
 SELECT
     (ARRAY['login','logout','click','purchase','error','signup'])[1 + (g % 6)],
@@ -232,6 +265,7 @@ SELECT
 FROM generate_series(1, 30000) g;
 
 -- ── Data: bookings (int4range periods) ───────────────────────────────────
+\echo ▸ data: bookings — 20,000 rows (int4range periods)
 INSERT INTO bookings (room, period, created_at)
 SELECT
     (ARRAY['A1','A2','B1','B2','C1'])[1 + (g % 5)],
@@ -240,6 +274,7 @@ SELECT
 FROM generate_series(1, 20000) g;
 
 -- ── Statistics ───────────────────────────────────────────────────────────
+\echo ▸ statistics: ANALYZE × 7 (one per table — refreshes the counters the daemon reads)
 ANALYZE customers;
 ANALYZE products;
 ANALYZE orders;

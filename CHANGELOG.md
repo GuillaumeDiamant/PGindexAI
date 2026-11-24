@@ -47,6 +47,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hold on a database it does not own). `--db` values are validated as
   unquoted PostgreSQL identifiers (no injection into the generated SQL).
 
+- **`demo_install.log` is now self-explanatory.** Every statement in the demo
+  SQL files carries a `▸` annotation line (`psql \echo` — log-only, so the
+  screen flow is unchanged), naming the table, index or query being executed;
+  each section then closes with a trailer (`finished in M:SS (exit 0)` /
+  `FAILED after M:SS (exit N)`) and the log ends with a run summary
+  (start/finish, per-section durations, overall status). The spinner badge
+  and the section trailers share one clock, so the two never disagree.
+
 ### Changed
 
 - **`install.sh`: the demo spinner's elapsed time no longer blends with
