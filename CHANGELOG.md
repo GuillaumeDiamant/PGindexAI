@@ -47,6 +47,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`install.sh`: every step that needs sudo now explains why, before the
+  first privileged call.** A new `sudo_note()` helper prints a one-line
+  `[sudo]` reason at the top of each sudo-using step, so a password prompt
+  never appears out of the blue: the `sudo` check summarizes the whole
+  privileged surface (PostgreSQL config files, the `laya` / `pgindexai`
+  systemd services, `/usr/local/bin`, and — in peer mode — running queries
+  as the `postgres` role); the `pg_ident.conf` / `pg_hba.conf` /
+  `postgresql.conf` steps name the root-owned file they edit and the
+  reload/restart that follows; the role step, the demo step and
+  `transfer_ownership` explain the `sudo -u postgres psql` peer connection
+  (these notes are **conditional** — in `PG_PASSWORD` mode psql does not go
+  through sudo, so the notes are hidden); the binary/directory steps explain
+  the `/usr/local/bin` copy and the `/var/log/pgindexai` chown; the systemd
+  steps (unit write, daemon start) explain that systemd is root-owned.
+  Root-only branches (rustup, `cargo test` / `build`, Laya sanity check)
+  explain their `sudo -u <user>` runs. The last step of the install —
+  `transfer_ownership`, previously completely silent — now gets a proper
+  `Transferring ownership of '<db>' objects to 'pgindexai'...` step line
+  plus the reason (the demo objects belong to the `postgres` superuser;
+  re-attributing them to `pgindexai` needs superuser rights).
+
 - **`install.sh` + `sql/`: the demo install narration is now plain
   language — one short line per step, with the 3-detector legend up
   front.** `demo_schema.sql` opens by naming the 3 problems the daemon

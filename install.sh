@@ -63,6 +63,15 @@ warn()  { echo -e "${YELLOW}[!]${NC} $*" >&2; }
 error() { echo -e "${RED}[✗]${NC} $*" >&2; }
 step()  { echo -e "${CYAN}→${NC} $*"; }
 
+# sudo_note "reason" — explains WHY a step needs sudo, in plain language
+# (which system file is written, which service is touched, why the admin
+# connection goes through 'sudo -u postgres'). Printed BEFORE the sudo
+# call, so the user sees the reason — not just a password prompt.
+# Goes to stdout like step()/info(): it is part of the install narrative.
+# Only print it when sudo is actually involved — in PG_PASSWORD mode the
+# psql calls do NOT go through sudo, so peer-mode notes are conditional.
+sudo_note() { echo -e "  ${YELLOW}[sudo]${NC} $*"; }
+
 # ─────────────────────────────────────────────
 # Global variables
 # ─────────────────────────────────────────────
@@ -493,6 +502,7 @@ pg_show() {
 # ─────────────────────────────────────────────
 check_sudo() {
     step "Checking sudo access..."
+    sudo_note "sudo will be used to write the PostgreSQL config files, manage the 'laya' and 'pgindexai' systemd services, install the binary to /usr/local/bin — and (peer mode) to run admin queries as the 'postgres' role"
     if sudo -n true 2>/dev/null; then
         info "sudo available (without password)"
     else
@@ -502,6 +512,9 @@ check_sudo() {
 
 check_postgres() {
     step "Checking PostgreSQL..."
+    if [[ -z "$PG_PASSWORD" ]]; then
+        sudo_note "admin queries run as 'sudo -u $POSTGRES_USER psql' (peer auth — the 'postgres' OS user is allowed the '$POSTGRES_USER' role, no password)"
+    fi
     if ! command -v psql &>/dev/null; then
         error "psql not found — install PostgreSQL 16+"
         exit 1
@@ -577,6 +590,7 @@ check_rust() {
         # Install FOR the target user (not root): the daemon runs under this account.
         # NB: the « -s » flag no longer exists in recent rustup-init → « -y » suffices.
         if [[ "$(id -u)" -eq 0 ]]; then
+            sudo_note "running as root — rustup is installed for '$TARGET_USER' via 'sudo -u $TARGET_USER' (the daemon runs under that account)"
             run sudo -u "$TARGET_USER" sh "$rustup_script" -y --default-toolchain stable
         else
             run sh "$rustup_script" -y --default-toolchain stable
@@ -628,6 +642,10 @@ ensure_target_db() {
 # the whole transfer (without this exclusion, the transfer failed as soon as a
 # table had a TOAST column: text/varchar/jsonb…).
 transfer_ownership() {
+    step "Transferring ownership of '$TARGET_DB' objects to 'pgindexai'..."
+    if [[ -z "$PG_PASSWORD" ]]; then
+        sudo_note "the demo objects are owned by the '$POSTGRES_USER' superuser — re-attributing them to 'pgindexai' needs superuser rights, hence 'sudo -u $POSTGRES_USER psql' (peer auth)"
+    fi
     local sql
     sql="
 DO \$\$
@@ -673,6 +691,9 @@ END
 
 setup_role() {
     step "Configuring the dedicated 'pgindexai' role (non-superuser, peer auth)..."
+    if [[ -z "$PG_PASSWORD" ]]; then
+        sudo_note "the role is created and granted via 'sudo -u $POSTGRES_USER psql' (peer auth — creating roles and granting system roles needs a superuser)"
+    fi
 
     local role_exists
     role_exists="$(pg_show "SELECT 1 FROM pg_roles WHERE rolname = 'pgindexai'")"
@@ -697,6 +718,7 @@ setup_role() {
         if $DRY_RUN; then
             echo -e "  ${CYAN}(dry-run)${NC} verify peer auth as '$TARGET_USER' + ALTER ROLE pgindexai PASSWORD NULL"
         else
+            sudo_note "verifying the daemon's own login first: 'sudo -u $TARGET_USER psql' as role 'pgindexai' — the legacy password is removed only if this peer connection works"
             local peer_check
             peer_check="$(sudo -u "$TARGET_USER" psql -U pgindexai -d "$TARGET_DB" -tAc "SELECT 1" 2>&1 || true)"
             if [[ "$peer_check" == "1" ]]; then
@@ -751,6 +773,7 @@ setup_role() {
 
 ensure_hba() {
     step "pg_hba.conf: targeted line for pgindexai (peer)..."
+    sudo_note "pg_hba.conf is a root-owned system file — it is read/edited with sudo, then PostgreSQL is reloaded with sudo"
     local hba="${PG_HBA:-/etc/postgresql/16/main/pg_hba.conf}"
     # pg_hba.conf: TYPE  DATABASE  USER  METHOD — the daemon connects to its
     # target database '$TARGET_DB' (not a database « pgindexai ») → DATABASE = « all ».
@@ -819,6 +842,7 @@ EOF
 
 ensure_pg_ident() {
     step "pg_ident.conf: peer map for pgindexai (${PG_IDENT_MAP}: ${TARGET_USER} → pgindexai)..."
+    sudo_note "pg_ident.conf is a root-owned system file — it is read/edited with sudo, then PostgreSQL is reloaded with sudo"
     local ident="${PG_IDENT:-/etc/postgresql/16/main/pg_ident.conf}"
     # pg_ident.conf: MAPNAME   SYSTEM-USERNAME   PG-USERNAME
     local line="$PG_IDENT_MAP   $TARGET_USER   pgindexai"
@@ -855,6 +879,7 @@ ensure_pg_ident() {
 
 ensure_pg_stat_statements() {
     step "Enabling pg_stat_statements..."
+    sudo_note "if the extension is not loaded yet: shared_preload_libraries is merged into postgresql.conf (sudo) and PostgreSQL is restarted (sudo)"
     local lib="pg_stat_statements"
 
     # The extension is PER-DATABASE: check (and create) it in the daemon's
@@ -968,6 +993,7 @@ build_and_install() {
         step "Running the test suite (cargo test --all-targets)..."
         local tests_ok=true
         if [[ "$(id -u)" -eq 0 ]]; then
+            sudo_note "running as root — the test suite runs as '$TARGET_USER' via 'sudo -u $TARGET_USER' (cargo and target/ live under that account)"
             ( cd "$repo_dir" && run sudo -u "$TARGET_USER" "$cargo_exe" test --all-targets ) || tests_ok=false
         else
             ( cd "$repo_dir" && run cargo test --all-targets ) || tests_ok=false
@@ -983,6 +1009,7 @@ build_and_install() {
 
     step "Compiling pgindexai..."
     if [[ "$(id -u)" -eq 0 ]]; then
+        sudo_note "running as root — compiling as '$TARGET_USER' via 'sudo -u $TARGET_USER' (cargo and target/ live under that account)"
         ( cd "$repo_dir" && run sudo -u "$TARGET_USER" "$cargo_exe" build --release )
     else
         ( cd "$repo_dir" && run cargo build --release )
@@ -990,11 +1017,13 @@ build_and_install() {
     info "Compilation finished"
 
     step "Installing the binary → $BIN_PATH"
+    sudo_note "the binary goes to a system path (/usr/local/bin) — copying and chmodding it needs sudo"
     run sudo cp "$repo_dir/target/release/pgindexai" "$BIN_PATH"
     run sudo chmod 755 "$BIN_PATH"
 
     step "Creating directories..."
     run mkdir -p "$PGINDEXAI_DIR" "$CONFIG_DIR"
+    sudo_note "/var/log/pgindexai is a system directory — created with sudo, then chowned to '$TARGET_USER' so the daemon can write its audit log there"
     run sudo mkdir -p /var/log/pgindexai
     # The log directory is created via sudo → it ends up root:root. The
     # daemon runs as $TARGET_USER (systemd User=) and must write its audit
@@ -1167,6 +1196,8 @@ setup_systemd() {
         return
     fi
 
+    sudo_note "the unit file goes to /etc/systemd/system (root-owned) — written, reloaded and enabled with sudo"
+
     local tmp
     tmp="$(mktemp)"
     cat > "$tmp" <<SERVICE
@@ -1320,6 +1351,8 @@ setup_laya_service() {
         echo -e "${CYAN}[dry-run]${NC} sudo systemctl enable --now $LAYA_SERVICE_NAME"
         return 0
     fi
+
+    sudo_note "the 'laya' systemd unit is written to /etc/systemd/system and managed with sudo (systemd units are root-owned)"
 
     # Orphan instance (manual start, nohup...): if it holds the port,
     # the systemd unit would crash-loop. Stop it first.
@@ -1681,6 +1714,7 @@ laya_install_official() {
         local server_log
         server_log="$(mktemp)"
         if [[ "$(id -u)" -eq 0 ]]; then
+            sudo_note "running as root — the sanity-check server runs as '$TARGET_USER' via 'sudo -u $TARGET_USER', its log written with 'sudo tee'"
             # Root branch: redirect through `sudo tee` so the log is written
             # in the target user's context (a bare `>file` after `sudo` would
             # create a root-owned file — SC2024).
@@ -1738,6 +1772,7 @@ laya_install_official() {
 # ─────────────────────────────────────────────
 start_daemon() {
     step "Starting the daemon..."
+    sudo_note "systemd services are root-owned — the daemon is (re)started and polled with 'sudo systemctl'"
     if $DRY_RUN; then
         echo -e "${CYAN}[dry-run]${NC} sudo systemctl restart $SERVICE_NAME"
         return
@@ -1762,6 +1797,9 @@ start_daemon() {
 # ─────────────────────────────────────────────
 setup_demo() {
     step "Installing the demo (schema + workload)..."
+    if [[ -z "$PG_PASSWORD" ]]; then
+        sudo_note "the demo SQL is run as 'sudo -u $POSTGRES_USER psql' (peer auth — no password)"
+    fi
     local repo_dir
     repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
