@@ -39,13 +39,13 @@ BEGIN
 END $$;
 
 -- ─────────────────────────────────────────────
--- Phase 0: User workload (generates pg_stat_statements)
+-- Phase 1: User workload (generates pg_stat_statements)
 DO $$
 BEGIN
     RAISE NOTICE '[1/9] Everyday app traffic: ~3,450 queries on orders, customers, products, users, line items (filters, date ranges, paging)';
 END $$;
 
--- 0a: orders workload — shipping_method (NO INDEX, SARGable)
+-- 1a: orders workload — shipping_method (NO INDEX, SARGable)
 DO $$
 DECLARE
     methods TEXT[] := ARRAY['standard','express','overnight','pickup'];
@@ -63,7 +63,7 @@ BEGIN
     END LOOP;
 END $$;
 
--- 0b: orders workload — total_amount (NO INDEX, SARGable)
+-- 1b: orders workload — total_amount (NO INDEX, SARGable)
 DO $$
 DECLARE
     i INT;
@@ -77,7 +77,7 @@ BEGIN
     END LOOP;
 END $$;
 
--- 0c: orders workload — order_date direct filter (NO INDEX)
+-- 1c: orders workload — order_date direct filter (NO INDEX)
 DO $$
 DECLARE
     i INT;
@@ -91,7 +91,7 @@ BEGIN
     END LOOP;
 END $$;
 
--- 0d: customers workload — country (INDEX exists)
+-- 1d: customers workload — country (INDEX exists)
 DO $$
 DECLARE
     countries TEXT[] := ARRAY['France','Germany','Spain','Italy','Netherlands','Belgium'];
@@ -109,7 +109,7 @@ BEGIN
     END LOOP;
 END $$;
 
--- 0e: products workload — category (INDEX exists)
+-- 1e: products workload — category (INDEX exists)
 DO $$
 DECLARE
     cats TEXT[] := ARRAY['Electronics','Clothing','Food','Books','Sports','Home','Toys','Beauty'];
@@ -128,7 +128,7 @@ BEGIN
     END LOOP;
 END $$;
 
--- 0f: users workload — role (INDEX exists)
+-- 1f: users workload — role (INDEX exists)
 DO $$
 DECLARE
     roles TEXT[] := ARRAY['admin','user','moderator'];
@@ -147,7 +147,7 @@ BEGIN
     END LOOP;
 END $$;
 
--- 0g: order_items workload — product_id (INDEX exists)
+-- 1g: order_items workload — product_id (INDEX exists)
 DO $$
 DECLARE
     i INT;
@@ -160,7 +160,7 @@ BEGIN
     END LOOP;
 END $$;
 
--- 0h: orders workload — status (INDEX exists)
+-- 1h: orders workload — status (INDEX exists)
 DO $$
 DECLARE
     statuses TEXT[] := ARRAY['pending','confirmed','shipped','delivered','cancelled'];
@@ -179,7 +179,7 @@ BEGIN
 END $$;
 
 -- ─────────────────────────────────────────────
--- Phase 1: Client workload (order search)
+-- Phase 2: Client workload (order search)
 DO $$
 BEGIN
     RAISE NOTICE '[2/9] "My orders" page: 5,000 per-customer lookups (last 90 days) — real scan counts for the indexed columns';
@@ -199,7 +199,7 @@ BEGIN
 END $$;
 
 -- ─────────────────────────────────────────────
--- Phase 2: Catalog workload (product search)
+-- Phase 3: Catalog workload (product search)
 DO $$
 BEGIN
     RAISE NOTICE '[3/9] Storefront: 16 product searches (category + price cap, price range + stock filters)';
@@ -227,7 +227,7 @@ BEGIN
 END $$;
 
 -- ─────────────────────────────────────────────
--- Phase 3: Admin workload (reports)
+-- Phase 4: Admin workload (reports)
 DO $$
 BEGIN
     RAISE NOTICE '[4/9] Dashboards: 30 days of daily aggregates (order count, revenue, status breakdown)';
@@ -253,7 +253,7 @@ BEGIN
 END $$;
 
 -- ─────────────────────────────────────────────
--- Phase 4: order_items workload
+-- Phase 5: order_items workload
 DO $$
 BEGIN
     RAISE NOTICE '[5/9] Order details: 100 "view order" listings (line items joined to products)';
@@ -273,7 +273,7 @@ BEGIN
 END $$;
 
 -- ─────────────────────────────────────────────
--- Phase 5: Users workload
+-- Phase 6: Users workload
 DO $$
 BEGIN
     RAISE NOTICE '[6/9] Admin screens: active admins + recent logins, then ~20 username prefix searches';
@@ -308,18 +308,18 @@ BEGIN
 END $$;
 
 -- ─────────────────────────────────────────────
--- Phase 6: Realistic fragmentation generation
+-- Phase 7: Realistic fragmentation generation
 DO $$
 BEGIN
     RAISE NOTICE '[7/9] Churn: ~350k deletes + 100k inserts + a mass UPDATE on orders/order_items, then VACUUM FULL — measurable fragmentation';
     RAISE NOTICE 'plus idx_orders_temp_status, an index the workload never touches — a clean unused-index target';
 END $$;
 
--- 6a: Massive row deletion (creates holes)
+-- 7a: Massive row deletion (creates holes)
 DELETE FROM order_items WHERE order_id < 100000;
 DELETE FROM orders WHERE id < 100000;
 
--- 6b: Massive insertion (low fill factor → fragmentation)
+-- 7b: Massive insertion (low fill factor → fragmentation)
 INSERT INTO orders (customer_id, order_date, status, total_amount, shipping_method)
 SELECT
     1 + (g % 10000),
@@ -329,7 +329,7 @@ SELECT
     (ARRAY['standard','express'])[1 + (g % 2)]
 FROM generate_series(1, 50000) g;
 
--- 6c : INSERT order_items
+-- 7c : INSERT order_items
 INSERT INTO order_items (order_id, product_id, quantity, unit_price, discount)
 SELECT
     100000 + g,
@@ -339,26 +339,26 @@ SELECT
     (random() * 0.3)::numeric
 FROM generate_series(1, 50000) g;
 
--- 6d: Massive UPDATE (modifies indexes in place → fragmentation)
+-- 7d: Massive UPDATE (modifies indexes in place → fragmentation)
 UPDATE orders SET status = 'delivered'
 WHERE status = 'pending' AND order_date < NOW() - interval '30 days';
 
--- 6e: VACUUM FULL to measure density afterwards (default fill factor = 100)
+-- 7e: VACUUM FULL to measure density afterwards (default fill factor = 100)
 VACUUM FULL orders;
 VACUUM FULL order_items;
 
--- 6f: Create an index that will be unused (DROP target)
+-- 7f: Create an index that will be unused (DROP target)
 CREATE INDEX IF NOT EXISTS idx_orders_temp_status ON orders (status) WHERE status = 'pending';
 
 -- ─────────────────────────────────────────────
--- Phase 7: Repetitive SARGable workload (pg_stat_statements)
+-- Phase 8: Repetitive SARGable workload (pg_stat_statements)
 DO $$
 BEGIN
     RAISE NOTICE '[8/9] Hot paths: 17,000 repeated parameterized queries, several on columns WITHOUT an index — the missing-index targets';
 END $$;
 -- Use EXECUTE ... USING so that pg_stat_statements groups the queries
 
--- 7a: 5000 identical queries on shipping_method (NO INDEX, SARGable)
+-- 8a: 5000 identical queries on shipping_method (NO INDEX, SARGable)
 --     → PRIMARY TARGET: must reach >5000 calls
 DO $$
 DECLARE
@@ -370,7 +370,7 @@ BEGIN
     END LOOP;
 END $$;
 
--- 7b: 3000 identical queries on status (INDEX exists but we force the scan)
+-- 8b: 3000 identical queries on status (INDEX exists but we force the scan)
 --     → must reach >3000 calls
 DO $$
 DECLARE
@@ -382,7 +382,7 @@ BEGIN
     END LOOP;
 END $$;
 
--- 7c: 3000 identical queries on category (INDEX exists)
+-- 8c: 3000 identical queries on category (INDEX exists)
 --     → must reach >3000 calls
 DO $$
 DECLARE
@@ -394,7 +394,7 @@ BEGIN
     END LOOP;
 END $$;
 
--- 7d: 2000 identical queries on role (INDEX exists)
+-- 8d: 2000 identical queries on role (INDEX exists)
 --     → must reach >2000 calls
 DO $$
 DECLARE
@@ -406,7 +406,7 @@ BEGIN
     END LOOP;
 END $$;
 
--- 7e: 3000 identical queries on total_amount (NO INDEX, SARGable)
+-- 8e: 3000 identical queries on total_amount (NO INDEX, SARGable)
 --     → SECONDARY TARGET: must reach >3000 calls
 DO $$
 DECLARE
@@ -418,7 +418,7 @@ BEGIN
     END LOOP;
 END $$;
 
--- 7f: 1000 identical queries on country (INDEX exists)
+-- 8f: 1000 identical queries on country (INDEX exists)
 --     → must reach >1000 calls
 DO $$
 DECLARE
@@ -431,7 +431,7 @@ BEGIN
 END $$;
 
 -- ─────────────────────────────────────────────
--- Phase 8: GIN/GIST workload (jsonb / array / range)
+-- Phase 9: GIN/GIST workload (jsonb / array / range)
 DO $$
 BEGIN
     RAISE NOTICE '[9/9] Advanced types: 5,000 JSONB containment, array-overlap and date-range queries on events + bookings (deliberately unindexed) — the GIN/GIST targets';
@@ -441,7 +441,7 @@ END $$;
 --   events.tags   && ARRAY   → GIN (array overlap)
 --   bookings.period @> range → GIST (range containment)
 
--- 8a: 2000 jsonb containment queries (GIN target — events.payload, NO INDEX)
+-- 9a: 2000 jsonb containment queries (GIN target — events.payload, NO INDEX)
 DO $$
 DECLARE
     j INT;
@@ -452,7 +452,7 @@ BEGIN
     END LOOP;
 END $$;
 
--- 8b: 1500 array overlap queries (GIN target — events.tags, NO INDEX)
+-- 9b: 1500 array overlap queries (GIN target — events.tags, NO INDEX)
 DO $$
 DECLARE
     j INT;
@@ -463,7 +463,7 @@ BEGIN
     END LOOP;
 END $$;
 
--- 8c: 1500 range containment queries (GIST target — bookings.period, NO INDEX)
+-- 9c: 1500 range containment queries (GIST target — bookings.period, NO INDEX)
 DO $$
 DECLARE
     j INT;
