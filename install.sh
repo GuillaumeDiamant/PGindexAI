@@ -1001,6 +1001,7 @@ build_and_install() {
     # verifiable without executing it).
     if $RUN_TESTS; then
         step "Running the test suite (cargo test --all-targets)..."
+        echo "  Heads-up: the full suite can take about ten minutes — please wait."
         local tests_ok=true
         if [[ "$(id -u)" -eq 0 ]]; then
             sudo_note "running as root — the test suite runs as '$TARGET_USER' via 'sudo -u $TARGET_USER' (cargo and target/ live under that account)"

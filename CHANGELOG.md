@@ -35,7 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   load the demo schema + workload, attach the daemon), `--no-demo` (skip the
   demo and attach the daemon to a database of yours), `--db NAME` (target
   database, implies `--no-demo`), `--test` (run `cargo test --all-targets`
-  before installing — a failing test aborts the installation; OFF by default).
+  before installing — a failing test aborts the installation; OFF by
+  default). Before starting it, the installer announces that the full
+  suite can take about ten minutes.
   With no flag and a terminal, the installer asks which mode to use (demo is
   the default answer). In custom mode the installer grants `pgindexai`
   `CONNECT` + `CREATE ON SCHEMA public` + `pg_stat_scan_tables` on the
