@@ -65,6 +65,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stays visually isolated, even in narrow terminals or with incomplete
   erase-to-end-of-line support.
 
+- **`install.sh`: the spinner badge now shows a live, calibrated ETA next
+  to the elapsed time.** The TTY-only badge reads `{ mm:ss / ≈M:SS }`: the
+  estimate starts from a per-section reference table (`DEMO_ETA_REF`,
+  measured on a reference machine — schema ≈13 s, workload ≈231 s) and
+  re-anchors on **this** machine's measured pace every time a `[N/M]`
+  phase marker arrives (observed ÷ reference scales the remaining
+  reference work), so a slower machine sees the ETA grow and a faster one
+  see it shrink. The displayed total is clamped to at least the elapsed
+  time, and the `≈` marks it as an estimate, not a promise; a section
+  without a reference entry keeps the plain `{ mm:ss }` badge.
+  Screen-only by construction — `demo_install.log` gains no bytes, and
+  dry-run and non-TTY output are unchanged. Re-measure the table whenever
+  the demo SQL changes (recipe in the `DEMO_ETA_REF` comment).
+
 - **`install.sh`: every step that needs sudo now explains why, before the
   first privileged call.** A new `sudo_note()` helper prints a one-line
   `[sudo]` reason at the top of each sudo-using step, so a password prompt

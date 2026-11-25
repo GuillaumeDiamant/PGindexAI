@@ -112,6 +112,32 @@ DEMO_LOG="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/demo_install.log"  # ful
 DEMO_SECTION_STATS=()  # "label|mm:ss|exit" per demo section — feeds the run summary
 DEMO_RUN_T0=""         # epoch of the first demo section (set by demo_psql)
 DEMO_RUN_T0_STR=""     # same, human-readable, captured once at the start
+# ETA reference table for the TTY spinner's badge (screen-only, shown as ≈):
+# "section|marker=cumulative reference seconds". marker is the [N/M] line
+# that opens a phase (the spinner sees it, prefix stripped) or `done` for
+# the section total; the value is when that line is expected to arrive,
+# measured on the reference machine (Xeon Gold 6138, local PG16, 2026-11-25:
+# schema 12.5s, workload 230.9s). The spinner re-anchors the prediction on
+# this machine's measured pace every time a marker actually arrives.
+# RE-MEASURE whenever the demo SQL changes: run each file through
+#   psql ... 2>&1 | while IFS= read -r l; do printf '%s\t%s\n' "$(date +%s.%N)" "$l"; done
+# and read off the cumulative seconds at each [N/M] line + the total.
+DEMO_ETA_REF=(
+    "schema|[1/3]=0"
+    "schema|[2/3]=0"
+    "schema|[3/3]=0"
+    "schema|done=13"
+    "workload|[1/9]=0"
+    "workload|[2/9]=20"
+    "workload|[3/9]=20"
+    "workload|[4/9]=20"
+    "workload|[5/9]=22"
+    "workload|[6/9]=22"
+    "workload|[7/9]=22"
+    "workload|[8/9]=26"
+    "workload|[9/9]=203"
+    "workload|done=231"
+)
 LAYA_SERVICE_NAME="laya"   # Laya decision engine (REQUIRED — must be up before the database steps)
 LAYA_PORT=8080
 LAYA_BACKEND="${LAYA_BACKEND:-}"   # optional override: 'cuda12' | 'vulkan' (default: auto-detect)
@@ -312,7 +338,7 @@ psql_stdin() {
 #   * screen → only the curated NOTICE/WARNING/ERROR lines (per-step
 #              explanations + digests), the server prefix stripped; while
 #              psql is silent (e.g. the long [8/9] phase) an ASCII activity
-#              spinner (|/-\ + a braced {mm:ss} badge on its own tabstop)
+#              spinner (|/-\ + a braced {mm:ss / ≈eta} badge on its own tabstop)
 #              keeps ticking so the run visibly works — it never reaches
 #              the log, and only shows when stdout is a terminal.
 # The connection mirrors pg_psql (password vs. peer mode). `stdbuf -oL`
@@ -391,7 +417,7 @@ demo_psql() {
 
     # ── Terminal: the pipeline runs in the background; its filtered output
     # flows through a FIFO that this foreground process consumes line by
-    # line, drawing the activity spinner (|/-\ + a braced {mm:ss} badge)
+    # line, drawing the activity spinner (|/-\ + a braced {mm:ss / ≈eta} badge)
     # in the gaps. One process owns the screen, so the spinner never
     # interleaves with the output lines — and it never reaches
     # demo_install.log.
@@ -426,6 +452,22 @@ demo_psql() {
     # elapsed time IS the section's elapsed time.
     local t0
     t0="$t_start"
+    # ETA (screen-only; shown as ≈ because it is an estimate, not a
+    # promise): start from the section's reference total; every time a
+    # [N/M] marker line actually arrives, re-anchor the prediction on
+    # THIS machine's measured pace — observed/reference scales the
+    # remaining reference work. The badge then reads { elapsed / ≈total }.
+    local eta_total=0
+    for ref in "${DEMO_ETA_REF[@]}"; do
+        if [[ "${ref%%=*}" == "$label|done" ]]; then
+            eta_total="${ref#*=}"
+            break
+        fi
+    done
+    local eta_ref_total="$eta_total"
+    # The capture group must include the brackets: the reference table is
+    # keyed on the full marker ([N/M], e.g. "workload|[5/9]=22").
+    local marker_re='^[[:space:]]*(\[[0-9]+/[0-9]+\])'
     while :; do
         if IFS= read -r -t 0.5 line <&3; then
             if (( printed )); then
@@ -433,6 +475,26 @@ demo_psql() {
                 printed=0
             fi
             printf '%s\n' "$line"
+            # A phase marker arrived — re-anchor the ETA on this machine's
+            # measured pace (observed / reference at this marker).
+            if (( eta_ref_total > 0 )) && [[ "$line" =~ $marker_re ]]; then
+                local m="${BASH_REMATCH[1]}" refsec=""
+                for ref in "${DEMO_ETA_REF[@]}"; do
+                    if [[ "${ref%%=*}" == "$label|$m" ]]; then
+                        refsec="${ref#*=}"
+                        break
+                    fi
+                done
+                if [[ -n "$refsec" ]]; then
+                    local obs
+                    obs=$(( $(date +%s) - t0 ))
+                    # refsec 0: the marker opened the section, so the pace
+                    # is unmeasured — keep the reference prediction.
+                    if [[ "$refsec" -ge 1 ]]; then
+                        eta_total=$(( obs + (eta_ref_total - refsec) * obs / refsec ))
+                    fi
+                fi
+            fi
             continue
         fi
         # No line in the last 0.5s — pipeline finished, or just silent?
@@ -440,11 +502,23 @@ demo_psql() {
             break
         fi
         idx=$(( (idx + 1) % 4 ))
-        # The elapsed badge sits on its own tabstop, wrapped in braces, so
-        # the in-place re-draw never visually merges the counter with the
-        # step label or with the next output line (narrow terminals,
-        # incomplete erase-to-end-of-line support).
-        printf '\r\033[K  %s %s...\t{ %s }' "${frames:idx:1}" "$label" "$(_demo_mmss $(( $(date +%s) - t0 )))"
+        local elapsed badge
+        elapsed=$(( $(date +%s) - t0 ))
+        badge="$(_demo_mmss "$elapsed")"
+        if (( eta_total > 0 )); then
+            # The prediction may lag behind a slow machine — never show a
+            # total below the time already spent.
+            local eta_disp="$eta_total"
+            if (( eta_disp < elapsed )); then
+                eta_disp="$elapsed"
+            fi
+            badge="$badge / ≈$(_demo_mmss "$eta_disp")"
+        fi
+        # The badge sits on its own tabstop, wrapped in braces, so the
+        # in-place re-draw never visually merges the counter with the step
+        # label or with the next output line (narrow terminals, incomplete
+        # erase-to-end-of-line support).
+        printf '\r\033[K  %s %s...\t{ %s }' "${frames:idx:1}" "$label" "$badge"
         printed=1
     done
     # Writer is done: drain whatever is left in the FIFO. Clear the
