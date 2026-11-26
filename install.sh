@@ -2098,6 +2098,12 @@ main() {
     echo "  PGindexAI Installer (secure)"
     echo "============================================"
     echo ""
+    echo "  Prerequisites: PostgreSQL 16+, cargo (Rust), sudo — and"
+    echo "  Laya, the decision engine: a REQUIRED prerequisite of"
+    echo "  PGindexAI (the daemon's index decisions come from Laya)."
+    echo "  It is checked BEFORE any database step; if missing, the"
+    echo "  installer offers to install it in place."
+    echo ""
 
     check_sudo
     check_postgres
