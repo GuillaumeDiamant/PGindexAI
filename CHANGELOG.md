@@ -7,18 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-
-- **`install.sh`: the sudo password is asked at most once per run.** When a
-  password is required, the installer now asks for it up front (via `sudo -v`)
-  and keeps the credential ticket alive for the duration of the run (bounded
-  background refresh every 15 s, stopped with the script — on exit, error,
-  Ctrl-C or kill). The long `cargo build` / `cargo test` step can no longer
-  let the default 5-minute ticket expire and trigger a second prompt
-  mid-install. The password is read only by sudo itself, from the terminal —
-  it never enters the installer's memory. With no controlling terminal
-  (tty-less `curl | bash`) the previous behavior is kept.
-
 ## [0.3.1] - 2026-11-26
 
 ### Added
@@ -223,6 +211,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   coreutils) keeps the raw log interleaved in execution order. The
   workload (queries, DML, counts) is unchanged — only the narration and
   the screen/log split changed.
+
+- **`install.sh`: the sudo password is asked at most once per run.** When a
+  password is required, the installer now asks for it up front (via `sudo -v`)
+  and keeps the credential ticket alive for the duration of the run (bounded
+  background refresh every 15 s, stopped with the script — on exit, error,
+  Ctrl-C or kill). The long `cargo build` / `cargo test` step can no longer
+  let the default 5-minute ticket expire and trigger a second prompt
+  mid-install. The password is read only by sudo itself, from the terminal —
+  it never enters the installer's memory. With no controlling terminal
+  (tty-less `curl | bash`) the previous behavior is kept.
 
 ### Fixed
 
