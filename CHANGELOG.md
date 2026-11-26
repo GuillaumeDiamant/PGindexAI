@@ -7,14 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-
-- **`install.sh`: the start banner now states the prerequisites up front —
-  and makes explicit that Laya, the decision engine the daemon relies on for
-  its index decisions, is a REQUIRED prerequisite of PGindexAI.** It is
-  checked BEFORE any database step; when missing, the installer offers to
-  install the official Laya release in place.
-
 ## [0.3.1] - 2026-11-26
 
 ### Added
@@ -229,6 +221,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mid-install. The password is read only by sudo itself, from the terminal —
   it never enters the installer's memory. With no controlling terminal
   (tty-less `curl | bash`) the previous behavior is kept.
+
+- **`install.sh`: the start banner now states the prerequisites up front —
+  and makes explicit that Laya, the decision engine the daemon relies on for
+  its index decisions, is a REQUIRED prerequisite of PGindexAI.** It is
+  checked BEFORE any database step; when missing, the installer offers to
+  install the official Laya release in place.
 
 ### Fixed
 
