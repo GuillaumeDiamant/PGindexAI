@@ -7,7 +7,8 @@
 #   - Rust toolchain (cargo)
 #   - sudo access (default admin connection: 'sudo -u postgres psql' peer auth
 #     — or --pg-password PASS / PG_PASSWORD env var when the 'postgres' role
-#     has a password and pg_hba.conf allows it)
+#     has a password and pg_hba.conf allows it; the sudo password is asked
+#     at most once per run — the credential ticket is kept alive)
 #   - Laya decision engine (REQUIRED — configured BEFORE the target
 #     database; when missing, install.sh offers to download the official
 #     laya.cpp binary + Hugging Face model and deploys the hardened 'laya'
@@ -72,6 +73,36 @@ step()  { echo -e "${CYAN}→${NC} $*"; }
 # psql calls do NOT go through sudo, so peer-mode notes are conditional.
 sudo_note() { echo -e "  ${YELLOW}[sudo]${NC} $*"; }
 
+# sudo_warmer — keeps sudo's credential ticket alive for the whole run.
+# sudo's ticket expires after 'timestamp_timeout' (default 5 min); the long
+# cargo build/test step used to let it expire mid-install, so the user was
+# prompted a SECOND time. Refreshing every 15 s ('sudo -n -v': silent while
+# the ticket is valid, fails silently when it is not) keeps it alive.
+# If the admin set timestamp_timeout=0 no ticket survives — the behavior
+# degrades to the previous one (an extra prompt), never to a broken install.
+# Bounded to 240 iterations (~1 h) so a stray loop can never outlive the
+# install even if the stop trap were skipped.
+sudo_warmer() {
+    local n=0
+    while [ "$n" -lt 240 ]; do
+        sleep 15
+        command sudo -n -v >/dev/null 2>&1 || true
+        n=$((n + 1))
+    done
+}
+
+# _sudo_warmer_stop — kill the refresher on EVERY exit path (normal exit,
+# error, Ctrl+C, kill) so no background loop is ever left behind.
+_sudo_warmer_stop() {
+    if [[ -n "${SUDO_WARMER_PID:-}" ]]; then
+        kill "$SUDO_WARMER_PID" 2>/dev/null || true
+        SUDO_WARMER_PID=""
+    fi
+}
+trap _sudo_warmer_stop EXIT
+trap '_sudo_warmer_stop; exit 130' INT
+trap '_sudo_warmer_stop; exit 143' TERM
+
 # ─────────────────────────────────────────────
 # Global variables
 # ─────────────────────────────────────────────
@@ -84,6 +115,7 @@ POSTGRES_USER="${POSTGRES_USER:-postgres}"
 PG_PASSWORD="${PG_PASSWORD:-}"   # optional — password for the postgres role
                                  # (used instead of 'sudo -u postgres' peer
                                  # connections; prefer the PG_PASSWORD env var)
+SUDO_WARMER_PID=""               # PID of the sudo ticket refresher (check_sudo)
 
 # Target user: the one owning the daemon, the config and the repo.
 # - script as non-root → the current user
@@ -661,8 +693,29 @@ check_sudo() {
     sudo_note "sudo will be used to write the PostgreSQL config files, manage the 'laya' and 'pgindexai' systemd services, install the binary to /usr/local/bin — and (peer mode) to run admin queries as the 'postgres' role"
     if sudo -n true 2>/dev/null; then
         info "sudo available (without password)"
+        return 0
+    fi
+    # Password required. Ask ONCE, here — then keep the ticket alive for the
+    # rest of the run (sudo_warmer), so the long cargo build/test step can't
+    # let the default 5-minute ticket expire and prompt the user a second
+    # time. sudo itself reads the password from the terminal: it never
+    # enters this script's memory.
+    if ! ( : </dev/tty ) 2>/dev/null; then
+        # No controlling terminal (e.g. 'curl | bash' over tty-less SSH):
+        # sudo cannot prompt at all — keep the previous behavior and let the
+        # first real sudo call fail with its own clear error.
+        warn "sudo required — no terminal available to enter the password"
+        return 0
+    fi
+    if command sudo -v; then
+        info "sudo password asked once — it stays valid for the whole run (you will not be asked again)"
+        sudo_warmer &
+        SUDO_WARMER_PID=$!
+        info "background task: sudo ticket refresh (every 15 s, stops with the script)"
     else
-        warn "sudo required — the script will ask you for your password"
+        error "sudo is required, and the password was not accepted (or this user is not in sudoers)."
+        error "Check: 'sudo -v' works on this machine."
+        exit 1
     fi
 }
 
