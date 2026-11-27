@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-11-27
+
+### Fixed
+
+- **CWE-441 (Confused Deputy) — unqualified table names in SARGable
+  detection no longer default to `public`.** `parse_query_for_sargable()`
+  now resolves every unqualified (1-part) table name against the catalog:
+  a name is attributed to a schema ONLY when it exists in exactly one
+  non-system, in-scope schema — the scan covers ALL namespaces (temp
+  schemas included, so a session temp table with the same name makes the
+  name ambiguous and drops it). Unknown, ambiguous, or system-schema
+  (`pg_*` / `information_schema`) names are dropped instead of being
+  defaulted to `public`. Previously a user querying a same-named table in
+  another schema could steer the daemon into indexing `public.<name>` with
+  the daemon's own privileges (the daemon connects as `pgindexai`, which is
+  trusted by operators and granted DDL).
+
+- **CWE-426 (Untrusted Search Path) — extension objects are now fully
+  qualified and can no longer be shadowed via the session `search_path`.**
+  The daemon connects as `pgindexai` with the default `search_path =
+  "$user", public`, so any role with CREATE privilege on the database
+  could shadow extension objects with its own in a schema placed before
+  `public` (the default vector: a schema named after the daemon role), and
+  the daemon would then resolve the unqualified reference to the shadow —
+  executing attacker code with the daemon's privileges. Every extension
+  reference is now qualified against the extension's ACTUAL installation
+  schema, resolved at runtime from `pg_catalog.pg_extension` +
+  `pg_namespace` (a catalog that PostgreSQL always searches first, so the
+  resolver itself cannot be shadowed) and validated with
+  `naming::is_simple_identifier` before interpolation:
+  - the `pgstattuple` bloat probe: `pgstatindex($1::regclass)` →
+    `<schema>.pgstatindex($1::regclass)` (a shadowed function would have
+    run attacker SQL with the daemon's privileges);
+  - the `pg_stat_statements` workload read: `FROM pg_stat_statements` →
+    `FROM <schema>.pg_stat_statements` (a shadowed view would have fed
+    the daemon fabricated workload rows, steering it to index whatever
+    tables the fake rows point at);
+  - the startup privilege check in `main.rs`: the function name argument
+    of `has_function_privilege()` is resolved via the session
+    `search_path` when unqualified — it is now qualified with the same
+    catalog-resolved schema.
+  Graceful degradation is preserved: `pgstattuple` absent → the physical
+  bloat criterion is silently skipped (as before); `pg_stat_statements`
+  absent → the detector errors out and the daemon runs DEGRADED (as
+  before). No behavioral change for a normally installed setup — the
+  schema simply becomes explicit.
+
 ## [0.3.1] - 2026-11-26
 
 ### Added
