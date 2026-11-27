@@ -274,6 +274,55 @@ pub fn legacy_frag_score(dead_ratio: f64, mod_ratio: f64, idx_scan: i64, relpage
     score
 }
 
+/// CWE-426 (Untrusted Search Path) guard — resolve the schema an extension
+/// is ACTUALLY installed in, from `pg_extension` + `pg_namespace`.
+///
+/// Both are `pg_catalog` tables: `pg_catalog` is always searched first,
+/// regardless of the session `search_path`, so this lookup cannot itself be
+/// shadowed. The returned name is validated with `naming::is_simple_identifier`
+/// before it may be interpolated into SQL (a catalog name is normally
+/// simple, but an exotic quoted name must never be inlined).
+///
+/// Used to fully qualify references to extension objects (functions and
+/// views). An UNQUALIFIED reference (e.g. `pgstatindex(...)` or
+/// `FROM pg_stat_statements`) is resolved via the session `search_path` —
+/// `"$user", public` for the daemon role — so a role with CREATE privilege
+/// on the database could shadow it with its own object in a schema placed
+/// BEFORE `public` (the default vector: a schema named after the daemon
+/// role), and that object would then be executed / trusted with the daemon's
+/// own privileges. Qualifying against the actual installation schema removes
+/// the shadowing vector entirely, whatever the session `search_path` is.
+///
+/// Returns `None` when the extension is not installed in this database.
+pub async fn extension_schema(
+    client: &deadpool_postgres::Object,
+    extname: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error + Sync + Send>> {
+    let row = client
+        .query_opt(
+            "SELECT n.nspname \
+             FROM pg_catalog.pg_extension e \
+             JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace \
+             WHERE e.extname = $1",
+            &[&extname],
+        )
+        .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let nspname: String = row.get("nspname");
+    if !crate::naming::is_simple_identifier(&nspname) {
+        return Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "extension '{extname}': schema name '{nspname}' is not a simple \
+                 identifier — refusing to qualify a reference with it"
+            ),
+        )));
+    }
+    Ok(Some(nspname))
+}
+
 /// Fetch the fragmented B-tree indexes
 ///
 /// Two criteria are combined, final score = `max` of the two:
@@ -352,6 +401,16 @@ pub async fn get_fragmented_indexes(
     // stop probing for the rest of the cycle: warn once, do not spam.
     let mut bloat_probe_disabled = false;
 
+    // CWE-426: `pgstatindex` is an EXTENSION function (pgstattuple), not a
+    // pg_catalog builtin. Called unqualified, it would be resolved via the
+    // session search_path ("$user", public), where an attacker with CREATE
+    // privilege could shadow it — its code would then execute with the
+    // daemon's privileges. Resolve the extension's actual schema from the
+    // catalog and fully qualify the call. Extension absent → the physical
+    // criterion is simply skipped (same graceful degradation as a failed
+    // probe; the startup check in main.rs reports the absence).
+    let pgstattuple_schema = extension_schema(&client, "pgstattuple").await?;
+
     for row in &rows {
         let relpages: i64 = row.get("relpages");
         let index_oid: u32 = row.get("index_oid"); // pg_stat_user_indexes.indexrelid (oid)
@@ -391,37 +450,35 @@ pub async fn get_fragmented_indexes(
         // passed to the `pgstatindex(regclass)` overload — an untyped $1
         // would resolve to the `pgstatindex(text)` overload and the driver
         // would reject the integer.
-        let leaf_density: Option<f64> = if use_index_bloat
-            && !bloat_probe_disabled
-            && relpages > 100
-        {
-            let params = [(&index_oid as &(dyn ToSql + Sync), Type::OID)];
-            match client
-                .query_typed_opt(
-                    "SELECT (pgstatindex($1::regclass)).avg_leaf_density",
-                    &params,
-                )
-                .await
-            {
-                Ok(r) => r
-                    .and_then(|r| r.get::<_, Option<f64>>(0))
-                    // pgstattuple returns a PERCENT (0..100); normalize to 0..1
-                    .map(|d| d / 100.0)
-                    .filter(|d| d.is_finite()),
-                Err(e) => {
-                    warn!(
+        let mut leaf_density: Option<f64> = None;
+        if use_index_bloat && !bloat_probe_disabled && relpages > 100 {
+            if let Some(schema) = pgstattuple_schema.as_ref() {
+                // CWE-426: fully qualified with the catalog-resolved schema
+                // (see `extension_schema`) — never via the session search_path.
+                let sql = format!(
+                    "SELECT ({}.pgstatindex($1::regclass)).avg_leaf_density",
+                    schema
+                );
+                let params = [(&index_oid as &(dyn ToSql + Sync), Type::OID)];
+                leaf_density = match client.query_typed_opt(&sql, &params).await {
+                    Ok(r) => r
+                        .and_then(|r| r.get::<_, Option<f64>>(0))
+                        // pgstattuple returns a PERCENT (0..100); normalize to 0..1
+                        .map(|d| d / 100.0)
+                        .filter(|d| d.is_finite()),
+                    Err(e) => {
+                        warn!(
                             "pgstattuple probe failed for {}.{}: {e} — physical bloat \
                              detection disabled for this cycle (falling back to the legacy heuristic)",
                             row.get::<_, String>("schemaname"),
                             row.get::<_, String>("indexname"),
                         );
-                    bloat_probe_disabled = true;
-                    None
-                }
+                        bloat_probe_disabled = true;
+                        None
+                    }
+                };
             }
-        } else {
-            None
-        };
+        }
 
         // Final score: the strongest signal wins (no regression possible —
         // the legacy score alone is the fallback when pgstattuple is absent).
@@ -546,25 +603,50 @@ pub async fn get_missing_sargable_indexes(
 ) -> Result<Vec<MissingSargableIndex>, Box<dyn std::error::Error + Sync + Send>> {
     let client = pool.get().await?;
 
+    // CWE-426: the `pg_stat_statements` view is an EXTENSION object, not a
+    // pg_catalog builtin. Referenced unqualified, it would be resolved via
+    // the session search_path ("$user", public), where an attacker could
+    // replace it with a fabricated view — the daemon would then trust
+    // attacker-controlled rows as its workload data and index whatever
+    // tables the fake rows point at. Resolve the extension's actual schema
+    // from the catalog and fully qualify the reference.
+    //
+    // Extension absent → error (same semantics as before, when PostgreSQL
+    // itself rejected the unknown relation): the daemon should be in
+    // DEGRADED mode (main.rs sets that at startup), which skips this
+    // detector entirely.
+    let pss_schema = extension_schema(&client, "pg_stat_statements")
+        .await?
+        .ok_or_else(|| {
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "pg_stat_statements extension not found (pg_extension) — \
+                 missing-index detection requires it; the daemon should be \
+                 in DEGRADED mode",
+            ))
+        })?;
+
     let rows = client
         .query(
-            r#"
-            SELECT
-                s.queryid,
-                s.query,
-                s.calls,
-                s.mean_exec_time,
-                s.min_exec_time,
-                s.max_exec_time,
-                s.rows
-            FROM pg_stat_statements s
-            WHERE s.calls >= $3
-              AND s.query !~* $1
-              AND s.query !~* $2
-              AND s.query <> $5
-            ORDER BY (s.calls * GREATEST(s.mean_exec_time, 0.1)) DESC
-            LIMIT $4
-            "#,
+            &format!(
+                r#"
+                SELECT
+                    s.queryid,
+                    s.query,
+                    s.calls,
+                    s.mean_exec_time,
+                    s.min_exec_time,
+                    s.max_exec_time,
+                    s.rows
+                FROM {pss_schema}.pg_stat_statements s
+                WHERE s.calls >= $3
+                  AND s.query !~* $1
+                  AND s.query !~* $2
+                  AND s.query <> $5
+                ORDER BY (s.calls * GREATEST(s.mean_exec_time, 0.1)) DESC
+                LIMIT $4
+                "#
+            ),
             &[
                 &r"^(CREATE|ALTER|DROP|DELETE|INSERT|UPDATE|BEGIN|COMMIT|ROLLBACK|EXPLAIN|ANALYZE|VACUUM|GRANT|REVOKE|SET|SHOW)".to_string(),
                 &SARGABLE_SYSTEM_QUERY_FILTER.to_string(),
@@ -2207,5 +2289,73 @@ mod tests {
         // Broken statistics (NaN) → block rather than guess.
         assert_eq!(null_predicate_plan("IS NULL", f64::NAN), None);
         assert_eq!(null_predicate_plan("IS NOT NULL", f64::NAN), None);
+    }
+
+    #[test]
+    fn test_extension_schema_resolution_cwe426() {
+        // CWE-426 regression: extension_schema() must report the schema an
+        // extension is ACTUALLY installed in (read from pg_extension, a
+        // catalog immune to search_path shadowing) — and None for an absent
+        // extension (never a guessed / defaulted schema).
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let pool = rt.block_on(async {
+            let mut c = deadpool_postgres::Config::new();
+            c.host = Some("/var/run/postgresql".to_string());
+            c.port = Some(5432);
+            c.user = Some("postgres".to_string());
+            c.dbname = Some("pgindexai_demo".to_string());
+            c.create_pool(
+                Some(deadpool_postgres::Runtime::Tokio1),
+                tokio_postgres::NoTls,
+            )
+            .ok()
+        });
+        let Some(pool) = pool else {
+            eprintln!("SKIP test_extension_schema_resolution_cwe426: no local PostgreSQL");
+            return;
+        };
+        // create_pool() is lazy (no I/O): probe and skip cleanly instead of
+        // panicking (CI runners have no PostgreSQL).
+        if rt.block_on(pool.get()).is_err() {
+            eprintln!("SKIP test_extension_schema_resolution_cwe426: PostgreSQL not reachable");
+            return;
+        }
+
+        rt.block_on(async {
+            let client = pool.get().await?;
+
+            // Absent extension → None (the CWE-426 invariant: the resolver
+            // must never fall back to a guessed schema such as `public`).
+            let absent = extension_schema(&client, "pgindexai_absent_probe").await?;
+            assert_eq!(absent, None, "absent extension must resolve to None");
+
+            // Every installed extension must resolve to its EXACT catalog
+            // schema (cross-checked row by row against pg_extension).
+            let installed: Vec<(String, String)> = client
+                .query(
+                    "SELECT e.extname, n.nspname \
+                     FROM pg_catalog.pg_extension e \
+                     JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace",
+                    &[],
+                )
+                .await?
+                .into_iter()
+                .map(|r| (r.get(0), r.get(1)))
+                .collect();
+            assert!(
+                !installed.is_empty(),
+                "expected at least one installed extension (plpgsql)"
+            );
+            for (ext, nspname) in &installed {
+                let resolved = extension_schema(&client, ext).await?;
+                assert_eq!(
+                    resolved.as_deref(),
+                    Some(nspname.as_str()),
+                    "extension '{ext}' must resolve to its catalog schema '{nspname}'"
+                );
+            }
+            Ok::<_, Box<dyn std::error::Error + Sync + Send>>(())
+        })
+        .expect("extension_schema resolution failed");
     }
 }

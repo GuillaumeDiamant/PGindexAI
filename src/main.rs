@@ -263,44 +263,59 @@ async fn check_pgstattuple(pool: &deadpool_postgres::Pool) {
     };
     let Ok(row) = client
         .query_opt(
-            "SELECT 1 FROM pg_extension WHERE extname = 'pgstattuple'",
+            "SELECT n.nspname \
+             FROM pg_catalog.pg_extension e \
+             JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace \
+             WHERE e.extname = 'pgstattuple'",
             &[],
         )
         .await
     else {
         return;
     };
-    if row.is_none() {
+    let Some(schema) = row.and_then(|r| r.get::<_, Option<String>>(0)) else {
         warn!("pgstattuple is NOT installed: PHYSICAL BLOAT detection is DISABLED.");
         warn!("The fragmentation detector falls back to the legacy heuristic, which is");
         warn!("blind to bloat left behind by VACUUM/ANALYZE (dead-tuple counters are reset).");
         warn!("To enable:  CREATE EXTENSION pgstattuple;");
         warn!("(since pgstattuple 1.5, the connection user must be a SUPERUSER");
         warn!("or a member of pg_stat_scan_tables to call pgstatindex()).");
+        return;
+    };
+    // CWE-426 (Untrusted Search Path): the function name in
+    // has_function_privilege() is resolved via the session search_path when
+    // unqualified — a shadow function in a schema placed before `public`
+    // could fake the privilege answer. Qualify it with the extension's
+    // actual schema (from the catalog), and refuse exotic names outright.
+    if !crate::naming::is_simple_identifier(&schema) {
+        warn!("pgstattuple is installed in schema '{schema}' (not a simple identifier) —");
+        warn!("privilege check skipped, PHYSICAL BLOAT detection is DISABLED.");
+        return;
+    }
+    // Extension present — also verify the CALL privilege. Since
+    // pgstattuple 1.5, pgstatindex() (full index scan) is restricted to
+    // SUPERUSER or members of pg_stat_scan_tables; a missing grant would
+    // otherwise surface as a per-cycle WARN. Report it ONCE at startup,
+    // with the least-privilege fix (no superuser needed).
+    let has_priv = client
+        .query_opt(
+            &format!(
+                "SELECT has_function_privilege(current_user, '{schema}.pgstatindex(regclass)', 'EXECUTE')"
+            ),
+            &[],
+        )
+        .await
+        .ok()
+        .flatten()
+        .and_then(|r| r.get::<_, Option<bool>>(0))
+        .unwrap_or(false);
+    if has_priv {
+        info!("pgstattuple is active (physical bloat detection enabled)");
     } else {
-        // Extension present — also verify the CALL privilege. Since
-        // pgstattuple 1.5, pgstatindex() (full index scan) is restricted to
-        // SUPERUSER or members of pg_stat_scan_tables; a missing grant would
-        // otherwise surface as a per-cycle WARN. Report it ONCE at startup,
-        // with the least-privilege fix (no superuser needed).
-        let has_priv = client
-            .query_opt(
-                "SELECT has_function_privilege(current_user, 'pgstatindex(regclass)', 'EXECUTE')",
-                &[],
-            )
-            .await
-            .ok()
-            .flatten()
-            .and_then(|r| r.get::<_, Option<bool>>(0))
-            .unwrap_or(false);
-        if has_priv {
-            info!("pgstattuple is active (physical bloat detection enabled)");
-        } else {
-            warn!("pgstattuple is installed, but the connection role CANNOT call pgstatindex()");
-            warn!("(permission denied — since pgstattuple 1.5 it requires SUPERUSER or pg_stat_scan_tables).");
-            warn!("PHYSICAL BLOAT detection degrades to the legacy heuristic (a WARN repeats every cycle).");
-            warn!("Least-privilege fix (no superuser needed):");
-            warn!("  sudo -u postgres psql -d <db> -c \"GRANT pg_stat_scan_tables TO <role>;\"");
-        }
+        warn!("pgstattuple is installed, but the connection role CANNOT call pgstatindex()");
+        warn!("(permission denied — since pgstattuple 1.5 it requires SUPERUSER or pg_stat_scan_tables).");
+        warn!("PHYSICAL BLOAT detection degrades to the legacy heuristic (a WARN repeats every cycle).");
+        warn!("Least-privilege fix (no superuser needed):");
+        warn!("  sudo -u postgres psql -d <db> -c \"GRANT pg_stat_scan_tables TO <role>;\"");
     }
 }
