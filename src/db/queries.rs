@@ -583,12 +583,59 @@ pub async fn get_missing_sargable_indexes(
         schemas.is_empty() || schemas.iter().any(|s| s == schemaname)
     };
 
+    // Unqualified-name resolver (CWE-441 fix): a name is mapped to a schema
+    // ONLY when it exists in exactly one non-system, in-scope schema. Names
+    // that are unknown, that exist in two or more schemas (including a session
+    // temp schema such as `pg_temp_5`), or whose unique schema is a system
+    // schema (`pg_*` / `information_schema`) are left out on purpose: they
+    // must NOT be attributed to `public` (otherwise a user querying a
+    // same-named table in another schema or a temp table could steer the
+    // daemon to index `public.<name>` with the daemon's own privileges).
+    //
+    // The catalog is scanned over ALL namespaces (temp included): the rows of
+    // OTHER sessions' temp tables are visible here (verified on PG16), so a
+    // temp collision correctly makes the name ambiguous. `relkind` is limited
+    // to the kinds resolvable in a FROM clause (indexes/TOAST excluded).
+    // Reuses the already-checked-out `client` (no extra pool connection).
+    let name_resolver: HashMap<String, String> = {
+        let is_system = |nsp: &str| nsp.starts_with("pg_") || nsp == "information_schema";
+        let catalog: HashMap<String, std::collections::HashSet<String>> = client
+            .query(
+                "SELECT c.relname, n.nspname \
+                 FROM pg_catalog.pg_class c \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE c.relkind IN ('r','v','m','p','f','S','c')",
+                &[],
+            )
+            .await?
+            .into_iter()
+            .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+            .fold(HashMap::new(), |mut m, (name, nsp)| {
+                m.entry(name).or_default().insert(nsp);
+                m
+            });
+        catalog
+            .into_iter()
+            .filter_map(|(name, nspnames)| {
+                if nspnames.len() != 1 {
+                    return None; // unknown (0) or ambiguous (>=2) → drop
+                }
+                let nsp = nspnames.into_iter().next().unwrap();
+                if is_system(&nsp) || !in_scope(&nsp) {
+                    return None; // system schema or out of scope → drop
+                }
+                Some((name, nsp))
+            })
+            .collect()
+    };
+    let resolve_unqualified = |name: &str| -> Option<String> { name_resolver.get(name).cloned() };
+
     let mut by_table: HashMap<(String, String), MissingSargableIndex> = HashMap::new();
     let mut column_queries: Vec<(String, String, String)> = Vec::new(); // (schema, table, column)
 
     for row in &rows {
         let query: String = row.get("query");
-        let Some(attributed) = parse_query_for_sargable(&query) else {
+        let Some(attributed) = parse_query_for_sargable(&query, &resolve_unqualified) else {
             continue;
         };
 
@@ -815,7 +862,20 @@ type AttributedColumns = Vec<(String, String, String, String)>;
 /// (its indexable side is the right operand, not the left column).
 /// The resolved (schema, table, column, operator) tuples let the analyzer
 /// pick the index method (B-tree / GIN / GIST) from the column type.
-fn parse_query_for_sargable(query: &str) -> Option<AttributedColumns> {
+///
+/// `resolve_unqualified` maps an UNQUALIFIED table name (a single identifier
+/// in the FROM list) to the schema it actually resolves to. A name that
+/// cannot be resolved — unknown, ambiguous across two or more schemas
+/// (including session temp schemas such as `pg_temp_5`), or whose unique
+/// schema is a system schema / out of scope — resolves to `None` and its
+/// columns are DROPPED: they must never fall back to `public`
+/// (CWE-441 "confused deputy" — a user querying a same-named table in
+/// another schema or a temp schema must not be able to steer the daemon
+/// into indexing `public.<name>`).
+fn parse_query_for_sargable(
+    query: &str,
+    resolve_unqualified: &dyn Fn(&str) -> Option<String>,
+) -> Option<AttributedColumns> {
     let dialect = sqlparser::dialect::PostgreSqlDialect {};
     let dialect_ref: &dyn sqlparser::dialect::Dialect = &dialect;
 
@@ -843,25 +903,28 @@ fn parse_query_for_sargable(query: &str) -> Option<AttributedColumns> {
                 continue;
             }
             if let Some(select) = query_ast.body.as_select() {
-                // Collect the tables (alias, schema, table) — first table AND JOINed tables
-                let mut tables: Vec<(Option<String>, String, String)> = Vec::new();
-                let push_table =
-                    |relation: &sqlparser::ast::TableFactor,
-                     tables: &mut Vec<(Option<String>, String, String)>| {
-                        if let sqlparser::ast::TableFactor::Table { name, alias, .. } = relation {
-                            let parts: Vec<String> =
-                                name.0.iter().map(|p| p.value.clone()).collect();
-                            if let Some((schema, table)) = match parts.len() {
-                                1 => Some(("public".to_string(), parts[0].clone())),
-                                2 => Some((parts[0].clone(), parts[1].clone())),
-                                3 => Some((parts[1].clone(), parts[2].clone())),
-                                _ => None,
-                            } {
-                                let alias = alias.as_ref().map(|a| a.name.value.clone());
-                                tables.push((alias, schema, table));
-                            }
-                        }
-                    };
+                // Collect the tables (alias, schema, table) — first table AND JOINed
+                // tables. `schema` is None for an UNQUALIFIED table name (a single
+                // identifier): it is resolved later against the catalog via
+                // `resolve_unqualified`, never defaulted to `public` (CWE-441).
+                let mut tables: Vec<(Option<String>, Option<String>, String)> = Vec::new();
+                let push_table = |relation: &sqlparser::ast::TableFactor,
+                                  tables: &mut Vec<(Option<String>, Option<String>, String)>| {
+                    if let sqlparser::ast::TableFactor::Table { name, alias, .. } = relation {
+                        let parts: Vec<String> =
+                            name.0.iter().map(|p| p.value.clone()).collect();
+                        // 1 part → unqualified (schema resolved later); 2 → schema.table;
+                        // 3 → catalog.schema.table; 0 or 4+ → not a valid table reference
+                        let (schema, table) = match parts.len() {
+                            1 => (None, parts[0].clone()),
+                            2 => (Some(parts[0].clone()), parts[1].clone()),
+                            3 => (Some(parts[1].clone()), parts[2].clone()),
+                            _ => return,
+                        };
+                        let alias = alias.as_ref().map(|a| a.name.value.clone());
+                        tables.push((alias, schema, table));
+                    }
+                };
                 for from in &select.from {
                     push_table(&from.relation, &mut tables);
                     for join in &from.joins {
@@ -883,24 +946,34 @@ fn parse_query_for_sargable(query: &str) -> Option<AttributedColumns> {
                                 alias.as_deref() == Some(q.as_str()) || t == q
                             }),
                             // Bare column: safe only if the query references ONE table
-                            // (otherwise the attribution would be a false positive)
+                            // (the check counts ALL tables, unresolvable ones included,
+                            // so a second table can never be masked)
                             None => tables.first().filter(|_| tables.len() == 1),
                         };
-                        if let Some((_, s, t)) = resolved {
-                            let (s, t) = (s.clone(), t.clone());
-                            match out
-                                .iter_mut()
-                                .find(|(s2, t2, c2, _)| s2 == &s && t2 == &t && c2 == &col)
-                            {
-                                Some(entry) => {
-                                    // Same column matched by a scalar AND a
-                                    // GIN/GIST predicate: the GIN/GIST operator
-                                    // wins (it is the appropriate access method).
-                                    if entry.3 == "btree" && op != "btree" {
-                                        entry.3 = op;
+                        if let Some((_, schema, table)) = resolved {
+                            // An UNQUALIFIED table name is resolved against the catalog.
+                            // It resolves to None when the name is unknown, ambiguous
+                            // (two or more schemas, including a session temp schema), or
+                            // its unique schema is a system schema / out of scope — the
+                            // column is then DROPPED, never defaulted to `public`
+                            // (CWE-441).
+                            let schema = schema.clone().or_else(|| resolve_unqualified(table));
+                            if let Some(s) = schema {
+                                let t = table.clone();
+                                match out
+                                    .iter_mut()
+                                    .find(|(s2, t2, c2, _)| s2 == &s && t2 == &t && c2 == &col)
+                                {
+                                    Some(entry) => {
+                                        // Same column matched by a scalar AND a
+                                        // GIN/GIST predicate: the GIN/GIST operator
+                                        // wins (it is the appropriate access method).
+                                        if entry.3 == "btree" && op != "btree" {
+                                            entry.3 = op;
+                                        }
                                     }
+                                    None => out.push((s, t, col, op)),
                                 }
-                                None => out.push((s, t, col, op)),
                             }
                         }
                         // Unresolved (subquery, function, unknown alias) → ignored
@@ -1371,9 +1444,16 @@ fn truncate_query(query: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Test resolver: every unqualified name resolves to `public`. This
+    /// preserves the pre-fix behavior for the parsing-focused tests below
+    /// (which assert on the parsing/attribution logic, not on resolution).
+    fn to_public(_name: &str) -> Option<String> {
+        Some("public".to_string())
+    }
+
     /// Returns the attributed (schema, table, column, operator) list
     fn cols(query: &str) -> Vec<(String, String, String, String)> {
-        parse_query_for_sargable(query).unwrap_or_default()
+        parse_query_for_sargable(query, &to_public).unwrap_or_default()
     }
 
     fn colset(query: &str) -> std::collections::HashSet<(String, String, String)> {
@@ -1398,8 +1478,8 @@ mod tests {
         // qualifier). This is the text the daemon actually parses — it must
         // still extract the BETWEEN predicate on the qualified column.
         let q = "SELECT o.id, o.customer_id, o.status, o.total_amount FROM orders o WHERE o.order_date BETWEEN now() - interval $1 AND now() ORDER BY o.order_date DESC";
-        let cols =
-            parse_query_for_sargable(q).expect("normalized form with `interval $1` must parse");
+        let cols = parse_query_for_sargable(q, &to_public)
+            .expect("normalized form with `interval $1` must parse");
         assert!(cols.contains(&(
             "public".to_string(),
             "orders".to_string(),
@@ -1476,7 +1556,7 @@ mod tests {
 
     #[test]
     fn test_invalid_sql_returns_none() {
-        assert!(parse_query_for_sargable("SELECT FROM WHERE").is_none());
+        assert!(parse_query_for_sargable("SELECT FROM WHERE", &to_public).is_none());
     }
 
     #[test]
@@ -1531,7 +1611,8 @@ mod tests {
         // proposal on `public.cte` (a phantom, regenerated every cycle).
         // Conservative behavior: CTE queries are skipped entirely.
         assert!(parse_query_for_sargable(
-            "WITH cte AS (SELECT id, status FROM orders) SELECT * FROM cte WHERE status = 'open'"
+            "WITH cte AS (SELECT id, status FROM orders) SELECT * FROM cte WHERE status = 'open'",
+            &to_public
         )
         .is_none());
         assert!(cols(
@@ -1539,6 +1620,103 @@ mod tests {
              SELECT * FROM c, d WHERE c.status = 'open'"
         )
         .is_empty());
+    }
+
+    // ── CWE-441: an unqualified name must NEVER default to `public` ──
+
+    /// Resolver that cannot resolve any name — simulates the catalog showing
+    /// the name is AMBIGUOUS (present in `public` AND in another/temp schema)
+    /// or unknown. Such names must be DROPPED, never attributed to `public`.
+    fn resolves_to_nothing(_name: &str) -> Option<String> {
+        None
+    }
+
+    fn colset_of(
+        query: &str,
+        resolve: &dyn Fn(&str) -> Option<String>,
+    ) -> std::collections::HashSet<(String, String, String)> {
+        parse_query_for_sargable(query, resolve)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(s, t, c, _op)| (s, t, c))
+            .collect()
+    }
+
+    #[test]
+    fn test_cwe441_unresolvable_unqualified_name_is_dropped_not_public() {
+        // The CVE scenario: the caller's session resolves `orders` to a table
+        // in another schema (or a temp table), not to `public.orders`. The
+        // catalog shows `orders` in >= 2 schemas → the resolver returns None.
+        // The column must NOT be attributed to `public.orders`.
+        let set = colset_of(
+            "SELECT * FROM orders WHERE status = 'open'",
+            &resolves_to_nothing,
+        );
+        assert!(
+            set.is_empty(),
+            "unresolvable name must not be attributed to `public`: {set:?}"
+        );
+    }
+
+    #[test]
+    fn test_cwe441_unique_schema_is_resolved_not_public() {
+        // The catalog shows `orders` exists ONLY in `billing`. The unqualified
+        // name must resolve to `billing.orders`, never default to `public`.
+        let resolve_billing =
+            |name: &str| -> Option<String> { (name == "orders").then(|| "billing".to_string()) };
+        let set = colset_of(
+            "SELECT * FROM orders WHERE status = 'open'",
+            &resolve_billing,
+        );
+        assert!(
+            set.contains(&(
+                "billing".to_string(),
+                "orders".to_string(),
+                "status".to_string()
+            )),
+            "the unique schema must be resolved: {set:?}"
+        );
+        assert!(
+            !set.contains(&(
+                "public".to_string(),
+                "orders".to_string(),
+                "status".to_string()
+            )),
+            "must not fall back to `public`: {set:?}"
+        );
+    }
+
+    #[test]
+    fn test_cwe441_qualified_column_on_unresolvable_table_is_dropped() {
+        // Even a QUALIFIED column (`orders.status`) must be dropped when the
+        // table's schema cannot be resolved.
+        let set = colset_of(
+            "SELECT * FROM orders WHERE orders.status = 'open'",
+            &resolves_to_nothing,
+        );
+        assert!(
+            set.is_empty(),
+            "qualified col on unresolvable table: {set:?}"
+        );
+    }
+
+    #[test]
+    fn test_cwe441_bare_column_two_tables_one_unresolvable_is_dropped() {
+        // Two tables (`t1` resolvable, `t2` NOT): the single-table rule counts
+        // ALL tables (unresolvable included), so a bare column is dropped — we
+        // must not silently drop `t2` from the count and mis-attribute.
+        let resolve_partial = |name: &str| -> Option<String> {
+            (name == "t1").then(|| "public".to_string())
+            // `t2` → None (unresolvable)
+        };
+        let set = colset_of(
+            "SELECT * FROM t1 x JOIN t2 y ON x.k = y.k WHERE status = 'open'",
+            &resolve_partial,
+        );
+        assert!(
+            set.is_empty(),
+            "bare col with 2 tables (one unresolvable): {set:?}"
+        );
     }
 
     // ── GIN/GIST operator detection ────────────────────────────────
