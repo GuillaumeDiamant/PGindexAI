@@ -81,7 +81,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
     check_pgstattuple(&pool).await;
 
     // Create the Laya client
-    let laya = laya::LayaClient::new(&cfg.laya.url, cfg.laya.timeout_seconds);
+    //
+    // CWE-306 (v0.3.3): the channel to Laya is authenticated with a bearer
+    // token (`laya.api_key` here, `LAYA_API_KEY` on the Laya service — the
+    // installer generates both from the same random value). A 401 from Laya
+    // blocks ALL decisions (fail-closed). A missing key keeps pre-v0.3.3
+    // deployments working but leaves the channel unauthenticated — warned,
+    // never silent.
+    if cfg.laya.api_key.is_none() {
+        warn!(
+            "laya.api_key is NOT set — the channel to Laya is UNAUTHENTICATED. \
+             Set `LAYA_API_KEY` on the Laya service and the same value in \
+             `laya.api_key` here (install.sh generates both)."
+        );
+    }
+    let laya = laya::LayaClient::new(
+        &cfg.laya.url,
+        cfg.laya.timeout_seconds,
+        cfg.laya.api_key.clone(),
+    );
 
     // DEEP health check: an actual test payload, not just GET /health
     match laya.deep_health().await {

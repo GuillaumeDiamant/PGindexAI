@@ -92,6 +92,15 @@ impl Config {
         if !(1..=600).contains(&self.laya.timeout_seconds) {
             errs.push("laya.timeout_seconds must be in [1, 600]".to_string());
         }
+        if let Some(key) = &self.laya.api_key {
+            if key.trim().is_empty() {
+                errs.push(
+                    "laya.api_key is set but empty — use `api_key: null` to explicitly \
+                     disable channel authentication"
+                        .to_string(),
+                );
+            }
+        }
 
         let ssl = self.postgresql.ssl_mode.to_ascii_lowercase();
         if !matches!(
@@ -215,6 +224,15 @@ pub struct LayaConfig {
     pub url: String,
     #[serde(default = "default_timeout")]
     pub timeout_seconds: u64,
+    /// Bearer token for the Laya HTTP channel (CWE-306 fix, v0.3.3): must
+    /// match the `LAYA_API_KEY` environment of the Laya service — install.sh
+    /// generates both from the same 256-bit random value (`/etc/laya/laya.env`,
+    /// 0600). The daemon sends it as `Authorization: Bearer <key>` on every
+    /// `/v1/systemone` call; a 401 from Laya blocks ALL decisions (fail-closed).
+    /// When absent (`null`), the channel is UNAUTHENTICATED — the daemon warns
+    /// at startup. `null` (not an empty string) is the explicit opt-out.
+    #[serde(default)]
+    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -519,7 +537,7 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
             "ssl_root_cert",
         ],
     ),
-    ("laya", &["url", "timeout_seconds"]),
+    ("laya", &["url", "timeout_seconds", "api_key"]),
     (
         "actions",
         &["create_index", "drop_unused", "rebuild_fragmented"],
@@ -706,6 +724,7 @@ postgresql:
 laya:
   url: http://127.0.0.1:8080
   timeout_seconds: 30
+  api_key: 4f0c9a2e7b1d3e5f6a8c0d2e4f6a8c0e1a2b3c4d5e6f708192a3b4c5d6e7f809
 actions:
   create_index: true
   drop_unused: true
@@ -933,6 +952,82 @@ thresholds:
         assert!(
             err.to_string().contains("unused_minutes must be <= 525600"),
             "got: {err}"
+        );
+    }
+
+    /// CWE-306 fix (v0.3.3): `laya.api_key` is the bearer token for the Laya
+    /// HTTP channel. Absent / `null` → `None` (unauthenticated channel, the
+    /// daemon warns at startup — backward compatible with pre-v0.3.3 configs).
+    /// Present → validated non-empty (an empty string is a misconfiguration,
+    /// not an explicit opt-out — `null` is that).
+    #[test]
+    fn test_laya_api_key_parsing_and_validation() {
+        let config_with = |api_key_yaml: &str| -> Config {
+            let yaml = format!(
+                r#"
+postgresql:
+  host: localhost
+  port: 5432
+  user: pgindexai
+  database: pgindexai_demo
+  ssl_mode: disable
+laya:
+  url: http://127.0.0.1:8080
+  api_key: {api_key_yaml}
+actions:
+  create_index: true
+  drop_unused: true
+  rebuild_fragmented: true
+thresholds:
+  cycle_seconds: 60
+"#
+            );
+            let value: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+            serde_yaml::from_value(value).unwrap()
+        };
+
+        // A real key is parsed and accepted
+        let cfg = config_with("\"4f0c9a2e7b1d3e5f\"");
+        assert_eq!(
+            cfg.laya.api_key.as_deref(),
+            Some("4f0c9a2e7b1d3e5f"),
+            "the key must be parsed"
+        );
+        assert!(cfg.validate().is_ok(), "a non-empty key must validate");
+
+        // `null` = explicit opt-out → None, still valid (pre-v0.3.3 behavior)
+        let cfg = config_with("null");
+        assert!(cfg.laya.api_key.is_none(), "`null` must parse to None");
+        assert!(cfg.validate().is_ok());
+
+        // Absent → None (backward compatibility)
+        let yaml = r#"
+postgresql:
+  host: localhost
+  port: 5432
+  user: pgindexai
+  database: pgindexai_demo
+  ssl_mode: disable
+laya:
+  url: http://127.0.0.1:8080
+actions:
+  create_index: true
+  drop_unused: true
+  rebuild_fragmented: true
+thresholds:
+  cycle_seconds: 60
+"#;
+        let value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let cfg: Config = serde_yaml::from_value(value).unwrap();
+        assert!(cfg.laya.api_key.is_none(), "absent key must be None");
+        assert!(cfg.validate().is_ok());
+
+        // Empty string = misconfiguration → rejected (fail fast, not silent)
+        let cfg = config_with("\"\"");
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("laya.api_key is set but empty"),
+            "an empty key must be rejected, got: {err}"
         );
     }
 }

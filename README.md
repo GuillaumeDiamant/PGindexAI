@@ -22,6 +22,7 @@ PGindexAI continuously monitors your PostgreSQL databases, detects unused and fr
 11. **Validated TLS** (rustls) on the PostgreSQL connection — chain + hostname **always** validated, optional `ssl_root_cert` (PEM), dedicated non-superuser role (`pgindexai`) with **peer** authentication (no password), **least-privilege grants** (no `SUPERUSER` — the physical bloat criterion uses the narrow `pg_stat_scan_tables` role and full `pg_stat_statements` query-text visibility the read-only `pg_read_all_stats` role, see 06-deployment)
 12. **Hardened installer** `install.sh` (no `eval`, targeted pg_hba (peer), `shared_preload_libraries` merge, 0600 config with no secret by default, hardened systemd unit) + **`--dry-run`** mode + idempotent **`uninstall.sh`** (`--purge`, `--clean-legacy`)
 13. **Proposal cap** per cycle (`max_proposals_per_cycle`), audit log rotation (0640, loud failures), config validation with unknown-key warnings, **CI** (fmt / clippy `-D warnings` / test / shellcheck)
+14. **Authenticated decision channel** (CWE-306, v0.3.3) — a bearer token (`LAYA_API_KEY`) is sent on every `/v1/systemone` call; a `401` **fails closed** (proposal rejected, no DDL); `api_key: null` = explicit opt-out (unauthenticated channel, loud startup warning). The key is generated once at install (`openssl rand -hex 32`) into `/etc/laya/laya.env` (0640 `root:<user>`)
 
 ---
 
@@ -266,6 +267,9 @@ postgresql:
 laya:
   url: "http://127.0.0.1:8080"
   timeout_seconds: 30
+  api_key: null             # Bearer token for the decision channel (CWE-306) — must equal
+                            # LAYA_API_KEY of the Laya service (/etc/laya/laya.env). null =
+                            # unauthenticated channel (the daemon warns at startup)
 
 # DDL action control
 actions:
@@ -361,8 +365,9 @@ PGHOST=127.0.0.1 PGPORT=5432 PG_PASSWORD='…' ./install.sh
 ```bash
 # By default: service + binary + config + data + logs
 # (KEEPS the pgindexai_demo database, the pgindexai role and the pg_hba line)
-# The Laya 'laya.service' unit is removed too — but the Laya binary and
-# models are PRESERVED (external component, possibly used by other tools)
+# The Laya 'laya.service' unit AND the channel key (/etc/laya/laya.env) are
+# removed — but the Laya binary and models are PRESERVED (external
+# component, possibly used by other tools)
 sudo ./uninstall.sh
 
 # Full simulation (no modification)
@@ -472,6 +477,41 @@ hf download convaiinnovations/laya-typed-decisions \
 > At runtime the "no fallback" policy still applies: until Laya is active
 > and valid, the daemon stays in **observation mode** (proposals only, no
 > DDL), so it never decides on its own.
+
+#### Channel security (v0.3.3 — CWE-306)
+
+The decision channel (`127.0.0.1:8080`) is a **plaintext HTTP endpoint on
+localhost** — laya.cpp has no TLS and no Unix socket. Before v0.3.3 it was
+also **unauthenticated**: any local user could occupy port 8080 before Laya
+started (or simply answer on it) and impersonate the engine, approving
+DROP/CREATE proposals that the daemon then executes with its PostgreSQL
+privileges.
+
+v0.3.3 closes this with the **native laya.cpp bearer token**
+(`LAYA_API_KEY`, verified by laya.cpp on `/v1/systemone`, `/predict`,
+`/v1/models`; `/health` stays open by design):
+
+- **One 256-bit key** (`openssl rand -hex 32`) generated at install, stored
+  in `/etc/laya/laya.env` — `0640 root:<service user>` (the service user
+  must read it; other local users must not) — and loaded by the Laya unit
+  via `EnvironmentFile=-/etc/laya/laya.env`.
+- **Same key in the daemon config** (`laya.api_key`); every decision call
+  carries `Authorization: Bearer <key>`.
+- **401 ⇒ fail-closed**: the proposal is rejected (no DDL) and the daemon
+  logs a loud warning — the channel degrades to *observation only*, never
+  to "execute anyway".
+- **Explicit opt-out**: `api_key: null` (or absent) keeps the
+  unauthenticated channel for pre-v0.3.3 deployments — the daemon warns at
+  startup. An **empty string** is rejected by config validation.
+
+> **Residual risk (documented, by choice).** The token authenticates the
+> *channel*, not the *process*: a local user who can bind port 8080 before
+> Laya starts can still run a fake responder — the token does not stop it
+> from accepting any token, and the daemon cannot tell a fake 200 from a
+> real one. The hardening path is TLS (a `stunnel`/reverse-proxy in front
+> of Laya with the daemon pinning the certificate) — deliberately **not**
+> in scope for v0.3.3, where the threat model is "unauthenticated local
+> HTTP", not "malicious local user who controls the port".
 
 ### 3. PGindexAI
 

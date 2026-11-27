@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-11-27
+
+### Fixed
+
+- **CWE-306 (Missing Authentication for Critical Function) — the Laya
+  decision channel is now authenticated end-to-end.** Before this release
+  every call to the Laya engine (`POST http://127.0.0.1:8080/v1/systemone`)
+  was unauthenticated: any local user who occupied port 8080 before Laya
+  started (or answered on it) could impersonate the engine and approve
+  DROP/CREATE proposals, which the daemon then executes with its PostgreSQL
+  privileges. The fix uses the **native laya.cpp bearer token**
+  (`LAYA_API_KEY`, verified by laya.cpp on `/v1/systemone`, `/predict`,
+  `/v1/models`; `/health` stays open by design):
+  - **Daemon** (`src/config.rs`, `src/laya/mod.rs`, `src/main.rs`):
+    new `laya.api_key` option (`null`/absent = explicit opt-out, kept for
+    pre-v0.3.3 deployments — the daemon warns at startup; an **empty
+    string is rejected** by validation). Every decision call — including
+    `deep_health()` — now carries `Authorization: Bearer <key>`; an HTTP
+    `401` is surfaced as `LayaError::Unauthorized` and **fails closed**
+    (proposal rejected, no DDL, loud warning). 3 new transport tests
+    (bearer sent / 401 fail-closed / no token when unset).
+  - **Installer** (`install.sh`): the key is generated **once** at install
+    (`openssl rand -hex 32`) and persisted to `/etc/laya/laya.env`
+    (`0640 root:<service user>` — the service user must read it, other
+    local users must not), loaded by the `laya.service` unit via
+    `EnvironmentFile=-/etc/laya/laya.env`; the **same value** is written
+    to `laya.api_key` of the daemon config (existing configs are migrated:
+    `api_key:` is inserted after the `laya:` section's `url:` line,
+    `null` when no key exists, never an empty string). Re-runs **reuse**
+    the stored key. The installer's own deep-check probe sends the bearer
+    too, and a `401` is reported as a distinct **token-mismatch** warning
+    (rc 2) rather than a broken-pipeline one (rc 1).
+  - **Uninstaller** (`uninstall.sh`): removes `/etc/laya/laya.env` (and
+    the now-empty `/etc/laya/`) with the Laya service.
+  - **Docs**: README (config example, Laya "Channel security" section,
+    features list, uninstall) + `config/` reference templates updated.
+  - **Residual risk (documented in README):** the token authenticates the
+    *channel*, not the *process* — a local user who can bind port 8080
+    before Laya starts can still run a fake responder. The hardening path
+    is TLS (stunnel/reverse-proxy in front of Laya + certificate pinning
+    in the daemon) — deliberately not in scope for v0.3.3, whose threat
+    model is "unauthenticated local HTTP", not "malicious local user who
+    controls the port".
+
 ## [0.3.2] - 2026-11-27
 
 ### Fixed

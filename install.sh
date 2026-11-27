@@ -116,6 +116,12 @@ PG_PASSWORD="${PG_PASSWORD:-}"   # optional — password for the postgres role
                                  # (used instead of 'sudo -u postgres' peer
                                  # connections; prefer the PG_PASSWORD env var)
 SUDO_WARMER_PID=""               # PID of the sudo ticket refresher (check_sudo)
+LAYA_API_KEY=""                  # Laya channel bearer token (CWE-306, v0.3.3):
+                                 # loaded or generated in setup_laya_service,
+                                 # consumed by setup_config (laya.api_key).
+                                 # Empty = no key → 'api_key: null' in the
+                                 # daemon config (unauthenticated channel,
+                                 # the daemon warns at startup).
 
 # Target user: the one owning the daemon, the config and the repo.
 # - script as non-root → the current user
@@ -1269,6 +1275,42 @@ setup_config() {
                 run sed -i -E "s|^([[:space:]]*)password:.*|\1password: null   # peer auth (local socket) — set a value only for remote TCP with scram|" "$CONFIG_FILE"
                 info "Configuration migrated: 'password' → null (peer auth)"
             fi
+            # CWE-306 (v0.3.3): configs from before this fix have no
+            # laya.api_key — add it right after the 'url:' line of the
+            # laya: section so the daemon authenticates its decision
+            # calls. 'null' when there is no key (pre-existing Laya
+            # service without LAYA_API_KEY): explicit, and never an
+            # empty string (the daemon validation rejects that).
+            if grep -Eq "^[[:space:]]*api_key:" "$CONFIG_FILE"; then
+                info "Configuration kept (laya.api_key already present)"
+            elif ! grep -Eq "^[[:space:]]*url:" "$CONFIG_FILE"; then
+                warn "laya.api_key not added: no 'url:' line in $CONFIG_FILE —"
+                warn "add 'api_key: <token>' (or null) under the laya: section manually."
+            elif $DRY_RUN; then
+                echo -e "${CYAN}[dry-run]${NC} add laya.api_key to $CONFIG_FILE (after the 'url:' line of the laya: section)"
+            else
+                local cfg_tmp
+                cfg_tmp="$(mktemp)"
+                awk -v key="${LAYA_API_KEY:-}" '
+                    /^[[:space:]]*laya:[[:space:]]*$/ { in_laya = 1 }
+                    in_laya && /^[[:space:]]+url:/ {
+                        print
+                        if (key != "") {
+                            print "  api_key: \"" key "\"   # must equal LAYA_API_KEY of the Laya service (/etc/laya/laya.env)"
+                        } else {
+                            print "  api_key: null   # UNAUTHENTICATED channel — set LAYA_API_KEY on the Laya service, then the same value here"
+                        }
+                        in_laya = 0
+                        next
+                    }
+                    { print }
+                ' "$CONFIG_FILE" > "$cfg_tmp"
+                # Overwrite in place (NOT a rename): the file is 0600 and
+                # owned by the target user — the inode must survive.
+                cat "$cfg_tmp" > "$CONFIG_FILE"
+                rm -f "$cfg_tmp"
+                info "Configuration migrated: laya.api_key added"
+            fi
             return
         fi
         cp "$CONFIG_FILE" "${CONFIG_FILE}.bak"
@@ -1298,10 +1340,24 @@ setup_config() {
         warn "Custom mode: 'rebuild_fragmented' will be set to false (REINDEX requires table ownership)."
     fi
 
+    # Laya channel auth (CWE-306, v0.3.3): setup_laya_service generated or
+    # reused LAYA_API_KEY (persisted in /etc/laya/laya.env, loaded by the
+    # Laya unit via EnvironmentFile). The SAME value goes here, so every
+    # decision call carries 'Authorization: Bearer <key>'. No key
+    # (pre-existing Laya service without LAYA_API_KEY, or --dry-run):
+    # 'api_key: null' — an explicit opt-out, never an empty string (the
+    # daemon validation rejects that).
+    local laya_api_key_line
+    if [[ -n "${LAYA_API_KEY:-}" ]]; then
+        laya_api_key_line="api_key: \"${LAYA_API_KEY}\"   # must equal LAYA_API_KEY of the Laya service (/etc/laya/laya.env)"
+    else
+        laya_api_key_line="api_key: null   # UNAUTHENTICATED channel — set LAYA_API_KEY on the Laya service, then the same value here"
+    fi
+
     run mkdir -p "$CONFIG_DIR"
 
     if $DRY_RUN; then
-        echo -e "${CYAN}[dry-run]${NC} write $CONFIG_FILE (password: null — peer auth, ssl_mode: $ssl_mode)"
+        echo -e "${CYAN}[dry-run]${NC} write $CONFIG_FILE (password: null — peer auth, ssl_mode: $ssl_mode, laya.api_key: ${LAYA_API_KEY:+set}${LAYA_API_KEY:-null})"
     else
         cat > "$CONFIG_FILE" <<EOF
 # Configuration of the PGindexAI daemon
@@ -1319,6 +1375,7 @@ postgresql:
 laya:
   url: "http://127.0.0.1:8080"
   timeout_seconds: 30
+  ${laya_api_key_line}
 
 # Control of DDL actions — set to false to disable an action
 actions:
@@ -1539,6 +1596,26 @@ setup_laya_service() {
     info "Laya found — binary: $laya_bin"
     info "             model : $laya_model"
 
+    # ── Channel auth key (CWE-306, v0.3.3) ───────────────────────────
+    # One 256-bit random value shared by the Laya service (LAYA_API_KEY,
+    # loaded from /etc/laya/laya.env by its unit) and the daemon config
+    # (laya.api_key, written by setup_config). Generated once, persisted,
+    # REUSED on re-runs. Without a key the channel is unauthenticated —
+    # setup_config then emits 'api_key: null' and the daemon warns at
+    # startup (pre-v0.3.3 deployments keep working).
+    local key_file="/etc/laya/laya.env"
+    LAYA_API_KEY=""
+    if ! $DRY_RUN && [[ -f "$key_file" ]]; then
+        # '|| true': a file without the expected line must not abort the
+        # install under 'set -o pipefail' — it is regenerated below.
+        LAYA_API_KEY="$(sudo grep -m1 '^LAYA_API_KEY=' "$key_file" | cut -d= -f2- || true)"
+        if [[ -n "$LAYA_API_KEY" ]]; then
+            info "Laya channel key found → $key_file (reused)"
+        else
+            warn "$key_file has no LAYA_API_KEY line — a new key will be generated"
+        fi
+    fi
+
     local service_file="/etc/systemd/system/${LAYA_SERVICE_NAME}.service"
     if [[ -f "$service_file" ]]; then
         if ! ask "Existing Laya service → $service_file. Replace it? [Y/n]" Y; then
@@ -1552,12 +1629,37 @@ setup_laya_service() {
                 warn "Laya is not answering on 127.0.0.1:${LAYA_PORT} — the daemon will run in"
                 warn "OBSERVATION mode (no DDL) until the service is up."
             fi
+            # Channel auth state of the deployment we keep (CWE-306): the
+            # daemon config must match what this service enforces.
+            if [[ -n "$LAYA_API_KEY" ]] && grep -q "EnvironmentFile=$key_file" "$service_file"; then
+                info "Laya channel key loaded and enforced by this unit — the daemon channel will be AUTHENTICATED."
+            else
+                warn "This Laya deployment does not enforce LAYA_API_KEY — the decision channel is"
+                warn "UNAUTHENTICATED (the daemon config will be set accordingly; the daemon"
+                warn "warns at startup). To enable auth: LAYA_API_KEY=<token> in a 0640"
+                warn "$key_file + 'EnvironmentFile=$key_file' in this unit, then the same"
+                warn "token in laya.api_key of $CONFIG_FILE."
+            fi
             return 0
         fi
     fi
 
+    if ! $DRY_RUN && [[ -z "$LAYA_API_KEY" ]]; then
+        LAYA_API_KEY="$(openssl rand -hex 32)"
+        run sudo mkdir -p /etc/laya
+        run sudo tee "$key_file" >/dev/null <<<"LAYA_API_KEY=${LAYA_API_KEY}"
+        run sudo chown root:"$TARGET_USER" "$key_file"
+        run sudo chmod 640 "$key_file"
+        info "Laya channel key generated → $key_file (0640 root:$TARGET_USER)"
+    fi
+
     if $DRY_RUN; then
         echo -e "${CYAN}[dry-run]${NC} write $service_file (User=$TARGET_USER, MemoryMax=4G, CPUQuota=100%)"
+        if [[ -f "$key_file" ]]; then
+            echo -e "${CYAN}[dry-run]${NC} reuse the Laya channel key from $key_file"
+        else
+            echo -e "${CYAN}[dry-run]${NC} generate the Laya channel key → $key_file (openssl rand -hex 32, 0640 root:$TARGET_USER)"
+        fi
         echo -e "${CYAN}[dry-run]${NC} sudo systemctl enable --now $LAYA_SERVICE_NAME"
         return 0
     fi
@@ -1589,6 +1691,13 @@ Restart=always
 RestartSec=5
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=HOME=$TARGET_HOME
+# Channel auth (CWE-306, v0.3.3): LAYA_API_KEY enables bearer-token
+# authentication on /v1/systemone (401 without a matching token; /health
+# stays open). The file is 0640 root:$TARGET_USER — readable by the
+# service user, not by other local users. '-' prefix: if the file is
+# missing the service still starts (unauthenticated) and the daemon's
+# 401 handling / startup warning surfaces the state.
+EnvironmentFile=-$key_file
 
 # Resources — CPU inference server (~850 MB of weights + runtime)
 MemoryMax=4G
@@ -1662,12 +1771,27 @@ laya_health_up() {
 # would then skip EVERY proposal (its deep_health gate has no fallback).
 # Requires curl (a POST with a body; the /dev/tcp fallback of
 # laya_health_up cannot cover it).
+# CWE-306 (v0.3.3): when the deployment enforces LAYA_API_KEY the probe
+# carries the bearer token, and a 401 (token mismatch) is reported as
+# return code 2 — distinct from a broken decision pipeline (return code 1),
+# so the user is told to fix the keys instead of the model.
 laya_deep_health_up() {
-    local body
-    body="$(curl -sf -m 60 -X POST "http://127.0.0.1:${LAYA_PORT}/v1/systemone" \
-        -H 'Content-Type: application/json' \
-        -d '{"state":"install-deep-health-check","questions":{"action":{"type":"choice","instructions":"Choose the single best action for this PostgreSQL index situation.","criteria":{"0":"Option A: no action needed","1":"Option B: perform a maintenance action"}}}}' 2>/dev/null)" \
+    local -a auth_args=()
+    if [[ -n "${LAYA_API_KEY:-}" ]]; then
+        auth_args+=(-H "Authorization: Bearer ${LAYA_API_KEY}")
+    fi
+    local body http_code
+    body="$(curl -s -m 60 -X POST "http://127.0.0.1:${LAYA_PORT}/v1/systemone" \
+        -H 'Content-Type: application/json' "${auth_args[@]}" \
+        -d '{"state":"install-deep-health-check","questions":{"action":{"type":"choice","instructions":"Choose the single best action for this PostgreSQL index situation.","criteria":{"0":"Option A: no action needed","1":"Option B: perform a maintenance action"}}}}' \
+        -w $'\n%{http_code}' 2>/dev/null)" \
         || return 1
+    http_code="${body##*$'\n'}"
+    body="${body%$'\n'*}"
+    if [[ "$http_code" == "401" ]]; then
+        return 2
+    fi
+    [[ "$http_code" == "200" ]] || return 1
     grep -qE '"choice"[[:space:]]*:[[:space:]]*"(0|1)"' <<<"$body" || return 1
     # Terminator ([^0-9.]|$) after the value: rejects 12 (read as "1"+"2")
     # and 1.5 (read as "1"+".").
@@ -1684,9 +1808,19 @@ laya_report_deep_check() {
         warn "deep_health probe on the first proposal)."
         return 0
     fi
-    if laya_deep_health_up; then
+    local rc=0
+    laya_deep_health_up || rc=$?
+    if [[ "$rc" -eq 0 ]]; then
         info "Laya deep check OK — the decision pipeline answers a real payload (choice + confidence valid)"
         return 0
+    fi
+    if [[ "$rc" -eq 2 ]]; then
+        # CWE-306: the engine answered 401 — a TOKEN mismatch, not a broken
+        # model. Pointing at the model here would misdirect the user.
+        warn "Laya answered 401 to the deep check — the bearer token does not match."
+        warn "Fix: LAYA_API_KEY (Laya service, /etc/laya/laya.env) and the token"
+        warn "sent by the probe/daemon must be the same value."
+        return 1
     fi
     warn "Laya /health is OK but the DECISION pipeline failed the deep check:"
     warn "a real /v1/systemone payload got no valid answer (choice ∈ {0,1},"
